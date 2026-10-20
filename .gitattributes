@@ -1,0 +1,9 @@
+# 保证脚本在任何平台检出都是 LF —— 否则 Linux 上会报 `$'\r': command not found`
+*.sh        text eol=lf
+*.service   text eol=lf
+*.py        text eol=lf
+*.mjs       text eol=lf
+*.js        text eol=lf
+*.md        text eol=lf
+.gitignore  text eol=lf
+*.tar       binary
