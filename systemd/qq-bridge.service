@@ -1,0 +1,30 @@
+[Unit]
+Description=QQ bridge (QQ <-> DSH 桥接, port 3100)
+Documentation=file:///opt/qq-bridge/交接文档.md
+Wants=network-online.target qq-dsh.service
+After=network-online.target qq-dsh.service
+# 依赖 DSH，但用 ExecStartPre 探活即可；不写 Requires 免得 DSH 重启时把桥接一起带走。
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/qq-bridge
+Environment=NODE_ENV=production
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=/bin/sh -c 'test -f /opt/qq-bridge/config.json || { echo "缺少 config.json"; exit 1; }'
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do c=$(curl -s -o /dev/null -w "%{http_code}" -m 3 http://127.0.0.1:3081/ || true); [ "$c" = "401" ] && exit 0; sleep 2; done; echo "DSH 3081 未在 120s 内就绪"; exit 1'
+ExecStart=/usr/bin/node src/bridge.js
+Restart=always
+RestartSec=10
+TimeoutStartSec=150
+TimeoutStopSec=25
+KillMode=mixed
+KillSignal=SIGTERM
+# ⚠️ 日志必须写 /var/log/qqbridge.log：
+#    switch-provider.sh 用「日志行数水位线」统计新增失败，/tmp 会被 tmpfiles 清理，水位线也会错乱。
+StandardOutput=append:/var/log/qqbridge.log
+StandardError=append:/var/log/qqbridge.log
+
+[Install]
+WantedBy=multi-user.target

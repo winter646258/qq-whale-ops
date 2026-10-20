@@ -1,0 +1,29 @@
+[Unit]
+Description=QQ zone watch (空间动态监控/点赞/评论)
+Documentation=file:///opt/qq-bridge/交接文档.md
+Wants=network-online.target qq-user-bridge.service qq-dsh.service
+After=network-online.target qq-user-bridge.service qq-dsh.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/qq-bridge
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# SnowLuma token 从环境文件读，避免写进仓库（文件里写 SNOWLUMA_TOKEN=xxx，权限 600）
+EnvironmentFile=-/etc/qq-bridge.env
+# 就绪条件：SnowLuma 已登录（返回昵称）
+# token 从 /etc/qq-bridge.env 读（SNOWLUMA_TOKEN=...），见 SETUP.md
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do r=$(curl -s -m 5 -X POST http://127.0.0.1:3000/get_login_info -H "authorization: Bearer \$\{SNOWLUMA_TOKEN\}" -H "content-type: application/json" -d "{}" || true); case "$r" in *nickname*) exit 0 ;; esac; sleep 3; done; echo "SnowLuma 未在 180s 内就绪"; exit 1'
+ExecStart=/usr/bin/node qzone-watch.js
+Restart=always
+RestartSec=30
+TimeoutStartSec=200
+TimeoutStopSec=20
+# 重启后自带 5 分钟冷启动保护（代码内置），不会因为重启就乱发评论
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qzone-watch
+
+[Install]
+WantedBy=multi-user.target

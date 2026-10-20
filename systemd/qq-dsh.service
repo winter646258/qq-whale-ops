@@ -1,0 +1,32 @@
+[Unit]
+Description=DSH web (QQ 小鲸鱼 AI 大脑, port 3081)
+Documentation=file:///opt/qq-bridge/交接文档.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+Environment=DSH_HOME=/root/.dsh
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# DEEPSEEK_API_KEY 已在 /root/.dsh/.env（600），DSH 启动时自行加载；这里不再明文写进 unit。
+ExecStartPre=/bin/sh -c 'test -f /root/.dsh/.env || { echo "缺少 /root/.dsh/.env"; exit 1; }'
+ExecStart=/usr/bin/dsh --profile web --no-open --host 127.0.0.1 --port 3081
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=25
+KillMode=mixed
+KillSignal=SIGTERM
+# 软上限：只加压不杀进程，防止 2 GiB 机器被吃爆
+MemoryAccounting=true
+MemoryHigh=768M
+# 2 GiB 小机器上让内核更容易挑中它而不是直接 OOM 全场
+OOMScoreAdjust=200
+StandardOutput=append:/var/log/dsh-web.log
+StandardError=append:/var/log/dsh-web.log
+
+[Install]
+WantedBy=multi-user.target

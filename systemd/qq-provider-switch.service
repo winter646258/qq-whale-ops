@@ -1,0 +1,24 @@
+[Unit]
+Description=QQ provider 自动切换守护（buddy 连续失败 -> deepseek-official）
+Documentation=file:///opt/qq-bridge/交接文档.md
+Wants=qq-user-bridge.service
+After=qq-user-bridge.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/qq-bridge
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=FAIL_THRESHOLD=3
+Environment=INTERVAL=60
+ExecStart=/bin/bash /opt/qq-bridge/switch-provider.sh
+Restart=always
+RestartSec=10
+# 它要执行 systemctl restart qq-bridge.service，所以不能关掉特权
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=provider-switch
+
+[Install]
+WantedBy=multi-user.target
