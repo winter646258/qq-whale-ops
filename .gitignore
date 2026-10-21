@@ -31,3 +31,7 @@ build/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Python 补丁脚本的字节码缓存
+__pycache__/
+*.pyc
