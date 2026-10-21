@@ -38,6 +38,7 @@ CFG=/opt/qq-bridge/config.json
 LOG=/var/log/qqbridge.log
 SWLOG=/var/log/provider-switch.log
 STATE=/opt/qq-bridge/state/provider-switch.json
+BRIDGE_DIR=/opt/qq-bridge
 
 BRIDGE_UNIT=qq-bridge.service
 
@@ -52,8 +53,8 @@ MAX_LOG_BYTES="${MAX_LOG_BYTES:-8388608}"    # 日志轮转大小
 # 失败关键词。2026-10-19 补「限流」；2026-10-21 补渠道白名单相关。
 FAIL_PATTERN="unauthorized|quota|insufficient|balance|rate.?limit|额度不足|余额不足|发送失败|限流|解禁|所有账号|可用账号|AI 反馈.*error|agent 处理出错|Illegal API invocation|unapproved channel"
 
-A_PROVIDER=buddy; A_MODEL=deepseek-v4.1-flash; A_EFFORT=low
-B_PROVIDER=trae;  B_MODEL=deepseek-v4.1-flash; B_EFFORT=high
+A_PROVIDER=loomy; A_MODEL=DeepSeek-V4.1-Flash; A_EFFORT=low
+B_PROVIDER=raccoon; B_MODEL=sn-deepseek-v4-1-flash; B_EFFORT=on
 
 mkdir -p "$(dirname "$STATE")"
 touch "$SWLOG"
@@ -90,6 +91,14 @@ count_recent_failures() {
   local now_epoch window_start mtime base_day_epoch now_day_epoch now_sec
   now_epoch=$(date +%s)
   window_start=$((now_epoch - WINDOW_SEC))
+  # 2026-10-21：窗口起点不早于上次切换时刻 —— 否则新渠道一上来就继承旧渠道的失败数，
+  # 刚切过去就被判"主渠道故障"再切走（12:24 与 12:28 两次回退都是这个原因）。
+  local _lsw _lsw_s
+  _lsw=$(python3 -c "import json;print(json.load(open('$STATE')).get('lastSwitchAt') or 0)" 2>/dev/null || echo 0)
+  if [ "${_lsw:-0}" -gt 0 ] 2>/dev/null; then
+    _lsw_s=$((_lsw / 1000))
+    [ "$_lsw_s" -gt "$window_start" ] && window_start=$_lsw_s
+  fi
 
   mtime=$(stat -c %Y "$LOG" 2>/dev/null || echo "$now_epoch")
   base_day_epoch=$(date -d "$(date -d "@$mtime" '+%F') 00:00:00" '+%s' 2>/dev/null || echo 0)
@@ -206,9 +215,9 @@ PY
 }
 
 record_history() {
-  python3 - "$STATE" "$1" "$2" "$3" <<'PY'
+  python3 - "$STATE" "$1" "$2" "$3" "$A_PROVIDER" <<'PY'
 import json, sys, time
-p, frm, to, reason = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+p, frm, to, reason, main_provider = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 try:
     d = json.load(open(p))
 except Exception:
@@ -220,34 +229,27 @@ d.setdefault('history', []).append({
     'reason': reason,
 })
 d['lastSwitchAt'] = int(time.time() * 1000)
-d['role'] = 'main' if to == 'buddy' else 'fallback'
+d['role'] = 'main' if to == main_provider else 'fallback'
 json.dump(d, open(p, 'w'), ensure_ascii=False, indent=2)
 PY
 }
 
 # ── 探测主渠道是否恢复 ────────────────────────────────────────────────────
-probe_buddy() {
-  local port t resp code
-  port=$(python3 -c "
-import json
-try: print(json.load(open('$CFG')).get('consolePort') or 3100)
-except Exception: print(3100)
-" 2>/dev/null)
-  t=$([ -f /opt/qq-bridge/state/console-token ] && tr -d '\n' < /opt/qq-bridge/state/console-token || echo '')
-  [ -z "$t" ] && { log "探测主渠道：读不到 console-token，判定不可用"; return 1; }
-
-  resp=$(curl -s -m 8 -H "x-console-token: $t" "http://127.0.0.1:${port}/api/dsh/model" 2>/dev/null)
-  code=$?
-  if [ "$code" -ne 0 ] || [ -z "$resp" ]; then
-    log "探测主渠道：接口无响应（curl exit=$code），判定不可用"
-    return 1
+probe_primary() {
+  # 旧实现只 curl 本地 /api/dsh/model 看控制台能不能报出模型，**从未碰过上游**，
+  # 所以主渠道实际还在报错时也会判「已恢复」（实测 09:02:11 判恢复、09:02:14 又失败）。
+  # 现在改成发一次真实的最小请求：只有上游真的回了文本才算可用。
+  local script="$BRIDGE_DIR/scripts/probe-model.mjs"
+  [ -f "$script" ] || { log "探测主渠道：找不到 $script，判定不可用（不冒险切回）"; return 1; }
+  local out rc
+  out=$(cd "$BRIDGE_DIR" && timeout 90 node "$script" "$A_PROVIDER" "$A_MODEL" "$A_EFFORT" 70 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    log "探测主渠道：真实调用成功 -> $A_PROVIDER/$A_MODEL 可用"
+    return 0
   fi
-  if echo "$resp" | grep -qiE '"error"|unauthorized|quota|insufficient|balance|rate.?limit|额度|限流'; then
-    log "探测主渠道：接口返回错误或限流，判定不可用"
-    return 1
-  fi
-  log "探测主渠道：接口正常，判为可用"
-  return 0
+  log "探测主渠道：真实调用失败（exit=$rc）：$(echo "$out" | tail -2 | tr '\n' ' ')"
+  return 1
 }
 
 should_probe() {
@@ -303,7 +305,7 @@ check_once() {
   # 没到阈值
   if [ "$hits" -lt "$FAIL_THRESHOLD" ]; then
     if [ "$cur" = "$B_PROVIDER" ] && should_probe; then
-      if probe_buddy; then
+      if probe_primary; then
         log "主渠道 ${A_PROVIDER} 已恢复 -> 切回（退出兜底）"
         set_provider "$A_PROVIDER" "$A_MODEL" "$A_EFFORT" && record_history "$B_PROVIDER" "$A_PROVIDER" 'recovered'
       fi
@@ -341,7 +343,7 @@ print('已重置探测与切换冷却')
 PY
     exit 0 ;;
   --probe)
-    if probe_buddy; then echo "主渠道 ${A_PROVIDER}: 可用"; exit 0; else echo "主渠道 ${A_PROVIDER}: 不可用"; exit 1; fi ;;
+    if probe_primary; then echo "主渠道 ${A_PROVIDER}: 可用"; exit 0; else echo "主渠道 ${A_PROVIDER}: 不可用"; exit 1; fi ;;
   --count)
     echo "最近 ${WINDOW_SEC}s 内失败数 = $(count_recent_failures)（阈值 ${FAIL_THRESHOLD}）"
     exit 0 ;;
