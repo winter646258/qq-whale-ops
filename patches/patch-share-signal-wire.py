@@ -34,7 +34,8 @@ def ensure(cond, msg):
 
 # ── 1. import ────────────────────────────────────────────────────────────
 IMPORT_ANCHOR = "} from './shared-memory-store.js';"
-IMPORT_ADD = r"""
+IMPORT_ADD = r"""} from './shared-memory-store.js';
+
 // MARKER: share-signal
 // 主动报告：她自己在群里判断「这件事值得跟主人说一句」，再由桥接按冷却与退避
 // 决定什么时候真的说。判断逻辑在 share-signal-store.js，纯逻辑带单测。
@@ -46,13 +47,13 @@ import {
   UNANSWERED_THRESHOLD, MAX_SIGNALS as SHARE_MAX_SIGNALS,
   HARD_MIN_INTERVAL_MS as SHARE_HARD_MIN_INTERVAL_MS,
   HARD_MAX_PER_DAY as SHARE_HARD_MAX_PER_DAY
-} from './share-signal-store.js';
-"""
+} from './share-signal-store.js';"""
 
 # ── 2. 状态文件路径 ──────────────────────────────────────────────────────
 FILE_ANCHOR = "const SHARED_MEMORY_FILE = path.join(STATE_DIR, 'shared-memory.json');"
 FILE_ADD = """
-const SHARE_SIGNAL_FILE = path.join(STATE_DIR, 'share-signal.json');  // MARKER: share-signal-file"""
+const SHARE_SIGNAL_FILE = path.join(STATE_DIR, 'share-signal.json');  // MARKER: share-signal-file
+const SHARED_MEMORY_FILE = path.join(STATE_DIR, 'shared-memory.json');"""
 
 # ── 3. 接线层 ────────────────────────────────────────────────────────────
 WIRE_ANCHOR = "  function v2ToolEnabled(flag) {"
@@ -67,6 +68,8 @@ WIRE_ADD = r"""  // MARKER: share-signal-wire
   let shareStateCache = null;
   let shareSkipLoggedAt = 0;
   let shareSkipLoggedReason = '';
+  // 观察模式下「已经念过哪条」，免得同一条信号每 30 秒刷一次日志。
+  let shareObservedSignalId = '';
 
   // 审计日志独立一份：不占 share-signal.json，也方便主人直接翻。
   const SHARE_SIGNAL_AUDIT_FILE = path.join(STATE_DIR, 'share-signal-audit.jsonl');
@@ -218,6 +221,24 @@ WIRE_ADD = r"""  // MARKER: share-signal-wire
     }
 
     const sig = verdict.signal;
+
+    // 观察模式：判定全跑，但**不记账、不发送** —— 每 6 小时才有一条，
+    // 上线后要盯好几轮才能确认判定对不对。开着它先看日志：
+    //   · 挑中的是不是真值得说的
+    //   · valence 的语气提示合不合适
+    //   · 安静时段/冷却有没有按预期拦
+    // 确认没问题再把 socialV2.share.deliverEnabled 改成 true。
+    if (cfg.socialV2?.share?.deliverEnabled !== true) {
+      // 同一条信号只念一次，别每 30 秒刷一遍。
+      if (shareObservedSignalId !== sig.id || now - shareSkipLoggedAt > 3_600_000) {
+        shareObservedSignalId = sig.id;
+        shareSkipLoggedAt = now;
+        shareSkipLoggedReason = 'observe';
+        log(`[share][观察] 本可以投递（${sig.sourceGroup}，valence ${sig.valence}）：${sig.summary}`);
+      }
+      return;
+    }
+
     const marked = markDelivered(st, { signalId: sig.id, now });
     if (!marked.ok) return;
     persistShareState({
@@ -486,6 +507,13 @@ else:
     changed.append('唤醒优先级')
 
 # ── 最终断言 ─────────────────────────────────────────────────────────────
+# 锚点行的存活断言 —— apply(before=False) 是替换而非插入，漏写锚点就会静默删掉原行。
+# 这个坑第一次踩时，shared-memory 的 import 尾巴和 SHARED_MEMORY_FILE 常量都被删了，
+# 而临时目录里 node --check 因为是 CJS 解析、直接返回 0，看不出任何问题。
+ensure("} from './shared-memory-store.js';" in SRC, 'shared-memory 的 import 尾巴被删了')
+ensure("} from './share-signal-store.js';" in SRC, 'share-signal 的 import 尾巴没写上')
+ensure('const SHARED_MEMORY_FILE = path.join(STATE_DIR,' in SRC, 'SHARED_MEMORY_FILE 常量被删了')
+ensure("const SHARE_SIGNAL_FILE = path.join(STATE_DIR, 'share-signal.json');" in SRC, 'SHARE_SIGNAL_FILE 没写上')
 ensure('reportTickV2();' in SRC, '巡检里没接上 reportTickV2')
 ensure(SRC.count('reportTickV2') == 2, 'reportTickV2 应恰好出现 2 次（定义 + 调用），实际 %d' % SRC.count('reportTickV2'))
 ensure('shareMemoryLine' not in SRC, '写错名字了')

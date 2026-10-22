@@ -74,7 +74,9 @@ const STATE_DIR = path.join(ROOT, 'state');
 const SHARE_SIGNAL_FILE = path.join(STATE_DIR, 'share-signal.json');
 const SHARE_SIGNAL_AUDIT_FILE = path.join(STATE_DIR, 'share-signal-audit.jsonl');
 
-const cfg = { ownerQQ: 1124721191, socialV2: {} };
+// 默认把「实际投递」打开：观察模式（deliverEnabled !== true）默认是关的，
+// 不打开的话下面所有投递用例都会被拦成 observe。观察模式自己有专门用例。
+const cfg = { ownerQQ: 1124721191, socialV2: { share: { deliverEnabled: true } } };
 
 const logs = [];
 function log(...args) { logs.push(args.join(' ')); }
@@ -91,13 +93,15 @@ async function sendWakePromptV2(key, reason) { sent.push({ key, reason }); }
 let shareStateCache = null;
 let shareSkipLoggedAt = 0;
 let shareSkipLoggedReason = '';
+// 观察模式的「已经念过哪条」也是模块级闭包变量，抽函数抽不到。
+let shareObservedSignalId = '';
 
 ${bodies}
 
 // export 列表里不能内联函数定义，先声明再导出。
 function setBusy(keys) { busyKeys = new Set(keys); }
 function setCache(v) { shareStateCache = v; }
-function resetSkipLog() { shareSkipLoggedAt = 0; shareSkipLoggedReason = ''; }
+function resetSkipLog() { shareSkipLoggedAt = 0; shareSkipLoggedReason = ''; shareObservedSignalId = ''; }
 
 export {
   loadShareStateOrNull, getShareState, persistShareState, shareOwnerKey,
@@ -136,6 +140,7 @@ function reset() {
   H.sent.length = 0;
   H.logs.length = 0;
   H.setBusy([]);
+  H.cfg.socialV2 = { share: { deliverEnabled: true } };
   // 日志节流的时间戳是模块级闭包状态，不重置会串用例：
   // 上一个用例刚打过节流日志，本用例就静默了，看起来像「没拦」。
   H.resetSkipLog();
@@ -317,6 +322,47 @@ t('状态文件损坏 → getShareState 返回 null，tick 不炸也不覆盖', 
   assert(H.sent.length === 0, '损坏时不该投递');
   const after = fs.readFileSync(H.SHARE_SIGNAL_FILE, 'utf8');
   assert(before === after, '损坏的文件不该被覆盖成空库');
+});
+
+// ── 观察模式（阶段 4 要用的上线形态）─────────────────────
+t('观察模式（deliverEnabled 不为 true）→ 判定跑完但不发、不消费信号', () => {
+  reset();
+  H.cfg.socialV2 = { share: {} };   // 没写 deliverEnabled
+  const st = H.getShareState();
+  st.signals.push({ id: 's1', eventId: 'e1', sourceGroup: GROUP, summary: '观察这条', valence: 0.3, willingness: 0.9, createdAt: now });
+  H.reportTickV2();
+  assert(H.sent.length === 0, '观察模式不该真发');
+  assert(H.getShareState().signals.length === 1, '观察模式不该消费信号');
+  assert(H.getShareState().lastDeliveredAt === 0, '观察模式不该更新冷却时间');
+  const seen = H.logs.filter((l) => l.includes('[share][观察]'));
+  assert(seen.length === 1, `应恰好一条观察日志，实际 ${seen.length}：${H.logs.join(' | ')}`);
+  assert(seen[0].includes('观察这条'), '观察日志要带摘要');
+});
+
+t('观察模式：同一条信号不会每 30 秒刷一次日志', () => {
+  reset();
+  H.cfg.socialV2 = { share: {} };
+  const st = H.getShareState();
+  st.signals.push({ id: 's1', eventId: 'e1', sourceGroup: GROUP, summary: '只念一次', valence: 0, willingness: 0.9, createdAt: now });
+  H.reportTickV2();
+  H.reportTickV2();
+  H.reportTickV2();
+  const seen = H.logs.filter((l) => l.includes('[share][观察]'));
+  assert(seen.length === 1, `三条 tick 只该念一次，实际 ${seen.length} 条`);
+});
+
+t('观察模式拦在记账之前：信号还在，切回正式后能立刻发出去', () => {
+  reset();
+  H.cfg.socialV2 = { share: {} };
+  const st = H.getShareState();
+  st.signals.push({ id: 's1', eventId: 'e1', sourceGroup: GROUP, summary: '攒着', valence: 0, willingness: 0.9, createdAt: now });
+  H.reportTickV2();
+  assert(H.sent.length === 0, '观察模式不该发');
+  H.cfg.socialV2 = { share: { deliverEnabled: true } };
+  H.resetSkipLog();
+  H.reportTickV2();
+  assert(H.sent.length === 1, '切回正式后应立刻发出去（信号没被观察模式吃掉）');
+  assert(H.sent[0].reason === 'share', 'wakeReason 应是 share');
 });
 
 console.log(`\n=== ${pass} PASS / ${fail} FAIL ===`);
