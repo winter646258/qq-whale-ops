@@ -129,7 +129,11 @@ for (const [key, reason] of cases) {
     console.log('  注入片段:', JSON.stringify(out.slice(idx, idx + 90)));
   }
   if (key === 'private:1124721191') {
-    if (!hasHeader || !out.includes('不喜欢被打断') || hasGroup) { console.log('  FAIL 私聊注入不对'); fail += 1; }
+    // 主人私聊本来就该同时看到 owner_private 层和 shared 层（访问矩阵：
+    // 主人读 shared + owner_private）。真正要防的是反方向——群里不能看到
+    // 主人专属。这里原本写成「私聊也不能有群内容」，
+    // 把隔离当成了双向都断，是测试写错了。
+    if (!hasHeader || !out.includes('不喜欢被打断') || !hasGroup) { console.log('  FAIL 私聊注入不对'); fail += 1; }
   } else if (key === 'group:906710082') {
     if (!hasHeader || !hasGroup || leakPrivate) { console.log('  FAIL 群注入不对'); fail += 1; }
   } else if (key === 'group:910502749') {
