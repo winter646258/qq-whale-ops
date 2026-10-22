@@ -500,6 +500,40 @@ export function formatForPrompt(store, {
   return `【你还记得的事】\n${lines.join('\n')}${tail}`;
 }
 
+/**
+ * 主人**显式点名**查阅某个群的群专属摘要。
+ *
+ * 与注入（formatForPrompt）刻意分开：注入永远不给 owner 带 group:X 条目 ——
+ * 群聊专属内容要进主人私聊，得她自己写一条 shared 摘要，而不是桥接把群聊
+ * 整段递过去。但主人确实有权在问「那个群最近怎么了」时主动翻一眼，
+ * 所以这里留一个只有 owner 能调、必须点名群号、且只能拿摘要的窄口子。
+ *
+ * 群号不合法 / 该群没有任何条目时返回空数组，不抛错。
+ */
+export function listGroupScopeForOwner(store, groupId, { now = Date.now() } = {}) {
+  const gid = String(groupId ?? '').trim();
+  if (!/^\d{1,20}$/.test(gid)) return [];
+  return activeItems(store)
+    .filter((it) => it.scope === `group:${gid}` && !isExpired(it, now))
+    .sort((a, b) => {
+      if (b.importance !== a.importance) return b.importance - a.importance;
+      return (Number(b.lastMentionAt) || 0) - (Number(a.lastMentionAt) || 0);
+    });
+}
+
+/**
+ * 在两个 scope 之外做一次「这条我是不是已经记过」的判定。
+ *
+ * remember 需要它：同一件事从群里听一遍、从私聊又说一遍，不该存成两条。
+ * 只在**同一受众可见**的范围内判重 —— 拿群条目的正文去跟私聊条目比对，
+ * 等于用存在与否泄漏了群里的内容。
+ */
+export function findSimilar(store, { text, reader, now = Date.now() } = {}) {
+  const t = cleanText(text);
+  if (!t) return null;
+  return listItems(store, { reader, now }).find((it) => it.text === t) ?? null;
+}
+
 /** 少量统计，给控制台和工具层用。 */
 export function statsOf(store, { now = Date.now() } = {}) {
   const list = store?.items ?? [];
