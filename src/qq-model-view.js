@@ -51,6 +51,20 @@ export function compactModelMessage(message) {
     if (seenText.has(result[key])) delete result[key];
     else seenText.add(result[key]);
   }
+  // MARKER: image-only-marker
+  // 纯图片消息在给模型的视图里要标明“没点你别接”。原样只有 [图片] 时，
+  // 模型分不清「有人说了话」和「有人丢了张图」，容易硬接一句跟图无关的话。
+  // 只改模型视图；存储、控制台、日志里的原始 text 不动（本文件只压缩模型那一份）。
+  const IMAGE_ONLY_RE = /^(?:\[图片\])+$/;
+  const isPureImageText = (v) => typeof v === 'string' && IMAGE_ONLY_RE.test(v.trim());
+  let markedImageOnly = false;
+  for (const key of ['text', 'plain']) {
+    if (isPureImageText(result[key])) { result[key] = '[图片·没点你别接]'; markedImageOnly = true; }
+  }
+  if (!markedImageOnly && Array.isArray(result.media) && result.media.length > 0
+      && !result.text && !result.plain) {
+    result.text = '[图片·没点你别接]';
+  }
   for (const key of OPTIONAL_FIELDS) {
     if (isEmpty(result[key])) delete result[key];
   }

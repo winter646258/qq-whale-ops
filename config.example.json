@@ -154,21 +154,8 @@
       "recommendedProbability": 0.05,
       "recommendedKeywords": [
         "小鲸鱼",
-        "DeepSeek",
-        "deepseek",
-        "DS",
-        "D老师",
-        "d老师",
-        "D指导",
-        "d指导",
-        "D师傅",
-        "d师傅",
-        "深度求索",
         "大肥鱼",
-        "鲸鱼",
-        "DeepSeek V3",
-        "DeepSeek R1",
-        "R1"
+        "鲸鱼"
       ],
       "recommendedAtMention": true,
       "recommendedNameMention": true,
@@ -250,5 +237,35 @@
       "wakeRecentLimit": 4,
       "wakeMaxChars": 6000
     }
+  },
+  "qzone": {
+    "enabled": false,
+    "intervalMs": 600000,
+    "notify": true,
+    "allowOwn": false,
+    "like": {
+      "enabled": false,
+      "maxPerDay": 5
+    },
+    "comment": {
+      "enabled": false,
+      "maxPerDay": 2,
+      "maxPerRun": 1,
+      "delayMinMs": 30000,
+      "delayMaxMs": 120000,
+      "maxChars": 30,
+      "model": "deepseek-chat"
+    },
+    "post": {
+      "maxPerDay": 3,
+      "minIntervalMs": 3600000
+    },
+    "interactWith": []
+  },
+  "spotify": {
+    "enabled": false,
+    "clientId": "",
+    "clientSecret": "",
+    "redirectUri": "http://127.0.0.1:8888/callback"
   }
 }
