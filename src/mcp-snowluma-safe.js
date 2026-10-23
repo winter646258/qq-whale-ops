@@ -240,6 +240,8 @@ const TOOL_CONFIG_FLAGS = {
   // 两个工具分开登记：关掉「写信号」不影响主人查/改策略。
   qq_share_signal: 'shareSignal',
   qq_set_report_policy: 'reportPolicy',
+  // 发说说/空间动态（MARKER: qzone-tool）
+  qq_qzone: 'qzone',
 };
 const disabledTools = [];
 {
@@ -1048,6 +1050,36 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `收藏表情失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.qzone !== false) {
+  server.tool(
+    'qq_qzone',
+    '发 QQ 说说（空间动态），也能翻自己发过的、删掉某一条。action=post 发一条（content 正文，images 可选图片路径，最多 9 张）；action=list 看自己最近发过什么（含 tid）；action=delete 按 tid 删。注意：① 说说对好友/访客可见，是真正发出去的东西，不是内部笔记——想发再发，别当每日打卡；② 每天最多 3 条、两条之间至少隔 1 小时，超了会直接拒绝；③ 正文一两句话就够，别写成小作文，也别带 Markdown；④ 发完把 tid 记一下，发错了立刻用 action=delete 删。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号（只用于鉴权）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.enum(['post', 'list', 'delete']).default('post').describe('post=发说说，list=看自己发过的，delete=删一条'),
+      content: z.string().optional().describe('post 必填：说说正文，最多 1000 字'),
+      images: z.array(z.string()).optional().describe('post 可选：图片的本地绝对路径（如你刚生成的图 state/images/xxx.png），最多 9 张'),
+      tid: z.string().optional().describe('delete 必填：要删的说说 tid（来自 action=list）'),
+      num: z.number().optional().describe('list 可选：返回条数，默认 10，最多 30'),
+      ugcRight: z.number().optional().describe('post 可选：查看权限（不填用 QQ 默认）')
+    },
+    async ({ key, token, action, content, images, tid, num, ugcRight }) => {
+      try {
+        const data = await agentApi('/api/socialV2/qzone', {
+          method: 'POST',
+          body: JSON.stringify({ key, token: undefined, action, content, images, tid, num, ugcRight }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 180000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `说说工具失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

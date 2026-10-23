@@ -2796,6 +2796,9 @@ async function main() {
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
+  // MARKER: role-card-refresh —— 会话 -> 最近一次已注入的角色卡指纹。
+  // 进程重启后为空，所以每个会话重启后第一次唤醒会重注入一次，属于预期行为。
+  const roleCardInjectSeen = new Map();
   const toolCallNames = new Map(); // sessionId -> Map<callId, toolName>：用于结果日志关联工具名
   const pendingSendToolCalls = new Map(); // sessionId -> Set<callId>：等待 tool/result 的发送类调用
   // reserved2 防“忘记设置唤醒条件”：key -> 当前是否等待 AI 处理唤醒回合 / 本回合已更新唤醒配置 / 连续未设置次数
@@ -5781,7 +5784,7 @@ async function main() {
             }
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'memoryUpdate', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'schedule', 'portrait', 'diary', 'album'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'memoryUpdate', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'schedule', 'portrait', 'diary', 'album', 'qzone'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -6205,6 +6208,90 @@ async function main() {
           sendJson({ ok: true, key, markedCount, unreadCount: st.unread.length, readThroughSeq: readThroughSeqV2(st), wakeGuaranteed: computeWakeSafetyV2(st.wakeConfig).guaranteed, wakeSafety: computeWakeSafetyV2(st.wakeConfig), wakeConfig: st.wakeConfig });
           return;
         }
+        // MARKER: qzone-tool
+        // 发说说/空间动态。send_qzone_msg 是公开可见、删了也会留痕的不可逆动作，
+        // 所以这里自己再兜一层：每日条数上限 + 最小间隔，避免一时兴起刷屏。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/qzone') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const action = String(body.action ?? 'post').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('qzone')) { sendJson({ ok: false, error: '工具未启用：qq_qzone' }, 403); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          const qzoneCall = async (name, params, timeoutMs = 60000) => {
+            const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+            const res = await fetch(`${httpUrl}/${name}`, {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+              },
+              body: JSON.stringify(params),
+              signal: AbortSignal.timeout(timeoutMs)
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || data.status !== 'ok' || (data.retcode !== undefined && data.retcode !== 0)) {
+              throw new Error(`${name} 失败: ${data.wording || data.retcode || res.status}`);
+            }
+            return data.data;
+          };
+          try {
+            if (action === 'list') {
+              const data = await qzoneCall('get_qzone_msg_list', {
+                ...(body.targetUin ? { target_uin: Number(body.targetUin) } : {}),
+                pos: Number.isFinite(Number(body.pos)) ? Number(body.pos) : 0,
+                num: Math.min(30, Math.max(1, Number(body.num) || 10))
+              });
+              sendJson({ ok: true, action: 'list', data });
+              return;
+            }
+            if (action === 'delete') {
+              const tid = String(body.tid ?? '').trim();
+              if (!/^[A-Za-z0-9_-]{4,120}$/.test(tid)) { sendJson({ ok: false, error: 'tid 格式不对（用 action=list 拿到的 tid）' }, 400); return; }
+              await qzoneCall('delete_qzone_msg', { tid });
+              log(`[qzone] 删除说说 tid=${tid}`);
+              sendJson({ ok: true, action: 'delete', tid });
+              return;
+            }
+            if (action !== 'post') { sendJson({ ok: false, error: 'action 只支持 post / list / delete' }, 400); return; }
+            const content = String(body.content ?? '').trim();
+            const images = Array.isArray(body.images) ? body.images.map((v) => String(v ?? '').trim()).filter(Boolean).slice(0, 9) : [];
+            if (!content && !images.length) { sendJson({ ok: false, error: 'content 和 images 不能同时为空' }, 400); return; }
+            if (content.length > 1000) { sendJson({ ok: false, error: '说说正文最多 1000 字' }, 400); return; }
+            const postCfg = cfg.qzone?.post ?? {};
+            const maxPerDay = Math.max(1, Number(postCfg.maxPerDay) || 3);
+            const minIntervalMs = Math.max(0, Number(postCfg.minIntervalMs) || 3600000);
+            const postStatePath = path.join(STATE_DIR, 'qzone-post.json');
+            let postState = { posts: [] };
+            try { postState = JSON.parse(fs.readFileSync(postStatePath, 'utf8')); } catch { postState = { posts: [] }; }
+            const now = Date.now();
+            const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+            const posts = (Array.isArray(postState.posts) ? postState.posts : []).filter((p) => p && now - Number(p.at || 0) < 7 * 86400000);
+            const todayCount = posts.filter((p) => Number(p.at || 0) >= dayStart.getTime()).length;
+            const lastAt = posts.reduce((m, p) => Math.max(m, Number(p.at || 0)), 0);
+            if (todayCount >= maxPerDay) { sendJson({ ok: false, error: `今天已经发过 ${todayCount} 条说说，上限 ${maxPerDay} 条` }, 429); return; }
+            if (lastAt && now - lastAt < minIntervalMs) {
+              sendJson({ ok: false, error: `距离上一条说说才 ${Math.round((now - lastAt) / 60000)} 分钟，至少间隔 ${Math.round(minIntervalMs / 60000)} 分钟` }, 429);
+              return;
+            }
+            const data = await qzoneCall('send_qzone_msg', {
+              content,
+              ...(images.length ? { images } : {}),
+              ...(Number.isFinite(Number(body.ugcRight)) ? { ugc_right: Number(body.ugcRight) } : {})
+            }, 120000);
+            const tid = String(data?.tid ?? data?.unikey ?? '').trim();
+            posts.push({ tid, at: now, content: content.slice(0, 200), images: images.length });
+            try { fs.writeFileSync(postStatePath, JSON.stringify({ posts }, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 }); } catch (error) { log(`[qzone] 写状态失败：${error?.message ?? error}`); }
+            log(`[qzone] 发表说说 成功 tid=${tid || '-'} 字数=${content.length} 图=${images.length}`);
+            sendJson({ ok: true, action: 'post', tid, contentLength: content.length, images: images.length, todayCount: todayCount + 1, maxPerDay, raw: data });
+            return;
+          } catch (error) {
+            log(`[qzone] ${action} 失败：${error?.message ?? error}`);
+            sendJson({ ok: false, action, error: String(error?.message ?? error) }, 502);
+            return;
+          }
+        }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/wake-config') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
@@ -6224,7 +6311,13 @@ async function main() {
             return fallback;
           };
           const rawKeywords = inputTriggers.keywords;
-          const nextKeywords = rawKeywords !== undefined
+          // MARKER: wake-keyword-lock
+          // AI 每次收尾都会把 qq_get_prompt 里那份推荐关键词原样写回来，管理员设的
+          // 关键词会被反复覆盖（10-23 当天实测覆盖 13 次，201188739 的 3 个关键词
+          // 被换回 13 个 DS 相关词）。开关打开后，带 agent token 的调用一律沿用现值；
+          // 控制台/管理端没有 agent token，仍然可以改。
+          const keywordsLocked = cfg.socialV2?.wake?.lockKeywords !== false && !!req.headers['x-agent-token'];
+          const nextKeywords = (!keywordsLocked && rawKeywords !== undefined)
             ? (Array.isArray(rawKeywords)
                 ? rawKeywords.map((k) => String(k ?? '').trim()).filter(Boolean).slice(0, 50).map((k) => k.slice(0, 100))
                 : [])
@@ -12586,7 +12679,26 @@ async function main() {
 
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
-    const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    // MARKER: role-card-refresh
+    // 实测问题：19:03 换了角色卡，她 15 个回合一次 qq_get_prompt 都没调，一直按上下文里
+    // 那份旧卡说话，改卡等于没改。这里改成按「卡内容指纹」判重：指纹变了（或进程刚重启）
+    // 就整段注入一次，同版本不再重复，避免每轮多几千 token。
+    let roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    try {
+      if (roleState.role) {
+        const cardText = currentRoleHintV2();
+        if (cardText) {
+          const cardHash = crypto.createHash('sha1').update(String(cardText)).digest('hex').slice(0, 12);
+          if (roleCardInjectSeen.get(key) !== cardHash) {
+            roleCardInjectSeen.set(key, cardHash);
+            roleLine = `【当前角色】${roleState.role}\n\n${cardText}\n\n【角色卡已更新】以上是你这一版完整的角色卡，从这一轮开始按它说话，之前那套说法作废。不用复述，也不用汇报你看过了。\n\n`;
+            log(`[role-card-refresh] 注入角色卡 ${key} hash=${cardHash}`);
+          }
+        }
+      }
+    } catch (error) {
+      log(`[role-card-refresh] 注入失败 ${key}: ${error?.message ?? error}`);
+    }
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const memoryText = formatMemoryV2(st);
