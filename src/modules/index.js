@@ -20,6 +20,7 @@ import roleConsole from './role-console/index.js';
 import security from './security/index.js';
 import approval from './approval/index.js';
 import preset from './preset/index.js';
+import tokens from './tokens/index.js';
 
 /**
  * @param {object} ctx 由 `bridge.js` 组装的上下文（cfg / log / stateDir / api / 若干纯函数）
@@ -31,6 +32,7 @@ export function defineModules(_ctx) {
     security,
     approval,
     preset,
+    tokens,
   ];
 }
 
