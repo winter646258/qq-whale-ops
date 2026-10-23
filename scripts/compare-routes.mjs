@@ -1,0 +1,45 @@
+#!/usr/bin/env node
+/**
+ * 比对两份黄金快照（scripts/golden-routes.mjs 的产物）。
+ *
+ * 只比「状态码 / 响应键形状 / ok 布尔」这三样，**不比 len**：
+ * 会话数、工具日志条数、token 计量这些是活数据，每次跑都不一样，
+ * 拿它们当回归标准只会天天报假差异。第一版连 len 一起比，13 条「差异」里
+ * 有 11 条是这种噪声，真正要看的信号被埋掉了。
+ *
+ * 用法：node scripts/compare-routes.mjs <baseline.json> <current.json>
+ * 退出码：0 = 无非预期差异；1 = 有
+ */
+import fs from 'node:fs';
+
+const [aPath, bPath] = process.argv.slice(2);
+if (!aPath || !bPath) { console.error('用法: node scripts/compare-routes.mjs <baseline> <current>'); process.exit(2); }
+const a = JSON.parse(fs.readFileSync(aPath, 'utf8')).routes ?? {};
+const b = JSON.parse(fs.readFileSync(bPath, 'utf8')).routes ?? {};
+
+// 已搬到模块、从老 if 链删掉的路由：它们的「缺席」是预期内的。
+// 这里刻意写死历史基线里的已知差异，新增模块时同步加一条，免得每次都要人肉判断。
+const EXPECTED_MOVED = new Set(['/api/presets', '/api/role-mode']);
+// 会随运行时间变化的路由：形状可以比，长度不行。
+const keysOf = (r) => JSON.stringify([r.status, r.shape, r.ok]);
+
+let bad = 0;
+for (const k of Object.keys(a)) {
+  if (!(k in b)) {
+    if (EXPECTED_MOVED.has(k)) { console.log(`· 预期内缺席 ${k}（已搬到模块）`); continue; }
+    console.log(`✗ MISSING ${k}`); bad += 1; continue;
+  }
+  for (const who of ['anon', 'console', 'agent']) {
+    const x = a[k]?.[who], y = b[k]?.[who];
+    if (!x || !y) { console.log(`✗ ${k} ${who} 缺身份`); bad += 1; continue; }
+    if (keysOf(x) !== keysOf(y)) {
+      console.log(`✗ ${k} ${who}\n    old ${keysOf(x)}\n    new ${keysOf(y)}`);
+      bad += 1;
+    }
+  }
+}
+for (const k of Object.keys(b)) {
+  if (!(k in a)) console.log(`+ NEW ${k}${k.startsWith('/api/_') ? '（诊断端点，预期）' : ''}`);
+}
+console.log(`\n比对 ${Object.keys(a).length} → ${Object.keys(b).length} 条；非预期差异 ${bad} 条`);
+process.exit(bad ? 1 : 0);

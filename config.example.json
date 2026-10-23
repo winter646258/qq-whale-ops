@@ -236,6 +236,9 @@
       "wakeMessageLimit": 12,
       "wakeRecentLimit": 4,
       "wakeMaxChars": 6000
+    },
+    "modules": {
+      "enabled": true
     }
   },
   "qzone": {
