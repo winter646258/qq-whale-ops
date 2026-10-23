@@ -29,6 +29,10 @@ const EXPECTED_MOVED = new Set([
   '/api/roles/create', '/api/roles/update', '/api/roles/rename', '/api/roles/delete',
   // 阶段5：preset（仿真提示词管理）
   '/api/preset/sim-prompt', '/api/preset/sim-prompt/backups', '/api/preset/sim-prompt/restore',
+  // 阶段6：tokens（用量账本）。快照里 /api/tokens/ 是前缀探测产生的合成键。
+  '/api/tokens', '/api/tokens/',
+  '/api/tokens/summary', '/api/tokens/series', '/api/tokens/turns',
+  '/api/tokens/recent', '/api/tokens/reset',
 ]);
 // 会随运行时间变化的路由：形状可以比，长度不行。
 const keysOf = (r) => JSON.stringify([r.status, r.shape, r.ok]);
@@ -53,4 +57,5 @@ for (const k of Object.keys(b)) {
 }
 console.log(`\n比对 ${Object.keys(a).length} → ${Object.keys(b).length} 条；非预期差异 ${bad} 条`);
 process.exit(bad ? 1 : 0);
+
 
