@@ -163,6 +163,8 @@ import {
 // MARKER: phone-bridge-import
 import { PhoneBridge } from './phone-bridge.js';
 import { BiliClient, describeBiliResult, describePhoneOffline } from './site-bili.js';
+// MARKER: spotify-import
+import { SpotifyClient, SecretBox } from './spotify-client.js';
 // MARKER: bili-import
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -802,6 +804,10 @@ function loadConfig() {
     // 仅好友档位：私聊场景下任何好友都能发起会话（主动找人仍受 allow 白名单限制）。
     // 必须在这里归一化，否则 cfg.friendOnly 恒为 undefined，allowed() 里的判定永不成立。
     friendOnly: file.friendOnly === true,
+    // MARKER: spotify-cfg
+    // Spotify 只读（搜索/正在播放/歌单/收藏）。loadConfig 是白名单式，未逐项列出的顶层段会被丢弃，
+    // 所以必须显式透传，否则 cfg.spotify 恒为 undefined，spotifyClient() 会一直报「还没配置」。
+    spotify: file.spotify ?? null,
     ackMessage: file.ackMessage ?? '🤔 收到，正在思考…',
     sendDelayMs: file.sendDelayMs ?? 300,
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
@@ -4483,6 +4489,25 @@ async function main() {
   function phoneOnline() {
     return phoneBridge.isOnline();
   }
+
+
+  // MARKER: spotify-client-factory
+  // 单例：token 缓存与刷新都在实例里，每次重建等于每次握手。
+  let spotifyClientCache = null;
+  function spotifyClient() {
+    if (!spotifyClientCache) {
+      const sc = cfg.spotify ?? {};
+      spotifyClientCache = new SpotifyClient({
+        clientId: String(sc.clientId ?? ''),
+        clientSecret: String(sc.clientSecret ?? ''),
+        redirectUri: String(sc.redirectUri ?? 'http://127.0.0.1:8888/callback'),
+        secrets: new SecretBox({ dir: STATE_DIR }),
+        log: (m) => log(m)
+      });
+    }
+    return spotifyClientCache;
+  }
+
   function v2ToolEnabled(flag) {
     return cfg.socialV2?.tools?.[flag] !== false;
   }
@@ -5784,7 +5809,7 @@ async function main() {
             }
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'memoryUpdate', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'schedule', 'portrait', 'diary', 'album', 'qzone'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'memoryUpdate', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'schedule', 'portrait', 'diary', 'album', 'qzone', 'spotify'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -6208,6 +6233,67 @@ async function main() {
           sendJson({ ok: true, key, markedCount, unreadCount: st.unread.length, readThroughSeq: readThroughSeqV2(st), wakeGuaranteed: computeWakeSafetyV2(st.wakeConfig).guaranteed, wakeSafety: computeWakeSafetyV2(st.wakeConfig), wakeConfig: st.wakeConfig });
           return;
         }
+        // MARKER: spotify-route
+        // Spotify 听歌（只读）。
+        //
+        // 为什么 inside bridge：桥接已有 key 鉴权 + agent token 隔离 + 工具开关
+        // 三层闸门，另起 HTTP 服务等于把三层重写一遍还容易漏。
+        //
+        // OAuth 授权不在这里（那要开临时回调端口），见 scripts/spotify-auth.mjs。
+        if (url.pathname === '/api/socialV2/spotify') {
+          try {
+            const body = req.method === 'POST' ? await readBody() : {};
+            const q = url.searchParams;
+            const key = String(body.key ?? q.get('key') ?? '').trim();
+            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+
+            const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
+            if (agentToken && !agentTokenOk(key, agentToken)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (agentToken && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            if (agentToken && !v2ToolEnabled('spotify')) { sendJson({ ok: false, error: '工具未启用：spotify' }, 403); return; }
+
+            const action = String(body.action ?? q.get('action') ?? 'now-playing').trim();
+            const ACTIONS = ['search', 'now-playing', 'playlists', 'playlist-items', 'saved-tracks', 'status'];
+            if (!ACTIONS.includes(action)) {
+              sendJson({ ok: false, error: `action 必须是 ${ACTIONS.join(' / ')}` }, 400);
+              return;
+            }
+
+            const sp = spotifyClient();
+            if (!sp.configured && action !== 'status') {
+              sendJson({ ok: false, error: 'Spotify 还没配置：config.json 里的 spotify.clientId / clientSecret 是空的。' }, 503);
+              return;
+            }
+
+            if (action === 'status') {
+              sendJson({ ok: true, action, configured: sp.configured, authorized: sp.hasRefreshToken(),
+                scope: sp.grantedScope(),
+                remind: sp.hasRefreshToken() ? '' : '还没授权用户级权限：搜索能用，看正在播放/歌单需要主人点一次授权。' });
+              return;
+            }
+            if (action === 'search') {
+              const r = await sp.search(body.keyword ?? body.q, { type: body.type, limit: body.limit });
+              sendJson({ ok: true, action, ...r }); return;
+            }
+            if (action === 'now-playing') {
+              const r = await sp.nowPlaying();
+              sendJson({ ok: true, action, ...r }); return;
+            }
+            if (action === 'playlists') {
+              sendJson({ ok: true, action, items: await sp.myPlaylists(body.limit) }); return;
+            }
+            if (action === 'playlist-items') {
+              sendJson({ ok: true, action, items: await sp.playlistItems(body.playlistId ?? body.id, body.limit) }); return;
+            }
+            sendJson({ ok: true, action, items: await sp.mySavedTracks(body.limit) });
+          } catch (error) {
+            const needsAuth = Boolean(error?.needsAuth);
+            log(`[spotify] 查询失败：${error?.message ?? error}`);
+            sendJson({ ok: false, error: String(error?.message ?? error), needsAuth }, needsAuth ? 401 : 502);
+          }
+          return;
+        }
+
         // MARKER: qzone-tool
         // 发说说/空间动态。send_qzone_msg 是公开可见、删了也会留痕的不可逆动作，
         // 所以这里自己再兜一层：每日条数上限 + 最小间隔，避免一时兴起刷屏。

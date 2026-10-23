@@ -242,6 +242,8 @@ const TOOL_CONFIG_FLAGS = {
   qq_set_report_policy: 'reportPolicy',
   // 发说说/空间动态（MARKER: qzone-tool）
   qq_qzone: 'qzone',
+  // 听歌（MARKER: spotify-flag）
+  qq_spotify: 'spotify',
 };
 const disabledTools = [];
 {
@@ -1050,6 +1052,35 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `收藏表情失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.spotify !== false) {
+  server.tool(
+    'qq_spotify',
+    '听歌相关（Spotify，只读）。action=search 搜歌/歌手/专辑/歌单（不需要授权）；action=now-playing 看主人此刻在听什么；action=playlists 翻主人自己的歌单；action=playlist-items 看某个歌单里有什么（要 playlistId）；action=saved-tracks 看主人收藏的歌；action=status 查有没有配置和授权。注意：① 只读，不能播放/暂停/加歌单；② 涉及「主人自己的东西」的动作需要授权过，没授权会返回 needsAuth，那时跟主人说一句「要你在浏览器点一下授权」，别反复重试；③ 结果要跟主人讲人话（歌名 + 歌手），别把 JSON 原样贴出去。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号（只用于鉴权）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      action: z.enum(['search', 'now-playing', 'playlists', 'playlist-items', 'saved-tracks', 'status']).default('now-playing').describe('要做什么'),
+      keyword: z.string().optional().describe('search 必填：搜什么（歌名/歌手/专辑都行）'),
+      type: z.enum(['track', 'artist', 'album', 'playlist']).optional().describe('search 可选：搜哪一类，默认 track'),
+      playlistId: z.string().optional().describe('playlist-items 必填：歌单 ID（从 playlists 结果里拿）'),
+      limit: z.number().optional().describe('可选：返回条数，默认 10，最多 20（歌单列表最多 50）')
+    },
+    async ({ key, token, action, keyword, type, playlistId, limit }) => {
+      try {
+        const data = await agentApi('/api/socialV2/spotify', {
+          method: 'POST',
+          body: JSON.stringify({ key, action, keyword, type, playlistId, limit }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `听歌工具失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

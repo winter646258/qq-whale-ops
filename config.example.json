@@ -237,5 +237,35 @@
       "wakeRecentLimit": 4,
       "wakeMaxChars": 6000
     }
+  },
+  "qzone": {
+    "enabled": false,
+    "intervalMs": 600000,
+    "notify": true,
+    "allowOwn": false,
+    "like": {
+      "enabled": false,
+      "maxPerDay": 5
+    },
+    "comment": {
+      "enabled": false,
+      "maxPerDay": 2,
+      "maxPerRun": 1,
+      "delayMinMs": 30000,
+      "delayMaxMs": 120000,
+      "maxChars": 30,
+      "model": "deepseek-chat"
+    },
+    "post": {
+      "maxPerDay": 3,
+      "minIntervalMs": 3600000
+    },
+    "interactWith": []
+  },
+  "spotify": {
+    "enabled": false,
+    "clientId": "",
+    "clientSecret": "",
+    "redirectUri": "http://127.0.0.1:8888/callback"
   }
 }
