@@ -17,6 +17,7 @@
 // 回退：`cfg.socialV2.modules.enabled === false` → 一个都不装载，老 if 链接管。
 
 import roleConsole from './role-console/index.js';
+import security from './security/index.js';
 
 /**
  * @param {object} ctx 由 `bridge.js` 组装的上下文（cfg / log / stateDir / api / 若干纯函数）
@@ -25,5 +26,6 @@ import roleConsole from './role-console/index.js';
 export function defineModules(_ctx) {
   return [
     roleConsole,
+    security,
   ];
 }

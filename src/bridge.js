@@ -2799,6 +2799,11 @@ async function main() {
     allowRemote: cfg.dsh.allowRemote === true
   });
 
+  // MARKER: modules-ctx-state
+  // state 是 `let`，运行时会被整体重新赋值（loadState / 保存路径），
+  // 直接 Object.assign 会把旧对象冻住 —— 必须交访问器。
+  Object.defineProperty(moduleCtx, 'state', { get: () => state, enumerable: true, configurable: true });
+
   // MARKER: modules-ctx-api
   Object.assign(moduleCtx, { api });
   // DSH 的模型目录 RPC：0.1.5 是 `session/modelCatalog`。**不能走基类门面**
@@ -4928,25 +4933,6 @@ async function main() {
           sendJson({ ok: true, mode: requestedMode, closedAgentPreset: next.closedAgentPreset, dshSynced });
           return;
         }
-        if (req.method === 'POST' && url.pathname === '/api/role') {
-          const body = await readBody();
-          const rs = readRoleState();
-          if (body.role && typeof body.role === 'string') {
-            const name = sanitizeRoleName(body.role);
-            if (!fs.existsSync(path.join(ROOT, 'roles', name + '.md'))) {
-              sendJson({ ok: false, error: `角色「${name}」不存在（roles/${name}.md）` }, 400);
-              return;
-            }
-            writeRoleState(name, rs.mode);
-            log(`控制台：角色已设置为 ${name}`);
-            sendJson({ ok: true, role: name });
-          } else {
-            writeRoleState(null, rs.mode);
-            log('控制台：角色已清除');
-            sendJson({ ok: true, role: null });
-          }
-          return;
-        }
         // ── 人格管理 ──────────────────────────────────────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/roles') {
           const rs = readRoleState();
@@ -5423,14 +5409,6 @@ async function main() {
           return;
         }
         // ── 会话查看 ──────────────────────────────────────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/sessions') {
-          const list = [];
-          for (const [key, sessionId] of Object.entries(state.sessions)) {
-            list.push({ key, sessionId, owner: key === `private:${String(cfg.ownerQQ ?? '')}` });
-          }
-          sendJson({ sessions: list });
-          return;
-        }
         // ── 挂起审批 / 提问 ───────────────────────────────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/pending') {
           const list = [];
@@ -5555,44 +5533,6 @@ async function main() {
         }
 
         // ── 安全拦截通知设置 ─────────────────────────────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/security') {
-          sendJson({
-            security: cfg.security ?? { interceptNotify: true },
-            // state/ 的 ACL 收紧结果：Windows 上改 ACL 需要管理员权限，未提权时会失败。
-            // 控制台据此显示警告与可复制的命令（而不是让用户以为已经安全）。
-            // 命令必须取自 state-acl 的**安全**版本：把 (OI)(CI) 授权和 /T 混在一句里
-            // 会把子文件 DACL 清空，用户照抄就会把自己的 state/ 弄坏。
-            stateDir: {
-              hardened: stateDirHardened,
-              path: STATE_DIR,
-              manualCommand: process.platform === 'win32'
-                ? manualDirCommand(STATE_DIR)
-                : `chmod 700 "${STATE_DIR}"`
-            }
-          });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/security') {
-          const body = await readBody();
-          // 支持从控制台**重试**收紧 state/ 权限（用户在管理员终端里配好了权限/换了启动方式后）。
-          if (body.rehardenStateDir === true) {
-            stateDirHardened = null;
-            hardenStateDirAcl();
-            sendJson({ ok: stateDirHardened === true, hardened: stateDirHardened, path: STATE_DIR });
-            return;
-          }
-          const configFile = path.join(ROOT, 'config.json');
-          const file = readConfigObject(configFile);
-          const next = { ...(file.security ?? {}), ...body };
-          if (typeof next.interceptNotify === 'boolean') next.interceptNotify = next.interceptNotify;
-          else if (next.interceptNotify !== undefined) next.interceptNotify = Boolean(next.interceptNotify);
-          file.security = next;
-          atomicWriteJson(configFile, file);
-          cfg.security = { ...(cfg.security ?? {}), ...next };
-          log(`控制台：安全拦截通知已更新（interceptNotify=${cfg.security.interceptNotify}）`);
-          sendJson({ ok: true, security: cfg.security });
-          return;
-        }
         // ── 控制台访问令牌（可手动修改/生成随机） ─────────────────────────────
         if (req.method === 'POST' && url.pathname === '/api/console/token') {
           const body = await readBody();
@@ -14771,6 +14711,12 @@ async function main() {
   if (cfg.socialV2?.sticker?.enabled !== false) {
     syncStickerLibrary(true).catch((error) => log('启动预热表情库失败:', error?.message ?? error));
   }
+  // stateDirHardened 是 main() 里的 let，模块要读**和写**它（否则控制台显示旧状态）。
+  // 布尔是值传递，只能交一对访问器，不能交变量本身。
+  Object.assign(moduleCtx, {
+    getStateDirHardened: () => stateDirHardened,
+    setStateDirHardened: (v) => { stateDirHardened = v; },
+  });
   // MARKER: modules-ctx-fns
   // 模块**禁止** import bridge.js（会触发第二次 main()，循环 import）。
   // 主文件里的函数一律从这里显式交付。注意只交**无状态、无副作用**的纯工具。
@@ -14780,6 +14726,14 @@ async function main() {
     readRoleState,   // 读角色状态（role/mode），文件级函数，不依赖 main() 闭包
     writeRoleState,  // 写角色状态
     roleSummaries,   // 人格清单摘要
+    sanitizeRoleName, // 人格名净化（文件级纯函数）
+    // 「roles/<名字>.md 存在吗」——模块不该自己拼 ROOT，交给主文件判断。
+    rolesDirExists: (name) => fs.existsSync(path.join(ROOT, 'roles', name + '.md')),
+    hardenStateDirAcl,   // state/ ACL 收紧（会写 stateDirHardened，配合上面那对访问器）
+    manualDirCommand,    // state-acl 提供的安全版手工命令
+    readConfigObject,    // 读 config.json 为对象
+    atomicWriteJson,     // 原子写 JSON
+    configFile: path.join(ROOT, 'config.json'),
   });
   startDshWatch();
   startSnowlumaWatch();
