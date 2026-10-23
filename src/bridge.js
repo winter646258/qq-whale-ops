@@ -165,6 +165,11 @@ import { PhoneBridge } from './phone-bridge.js';
 import { BiliClient, describeBiliResult, describePhoneOffline } from './site-bili.js';
 // MARKER: spotify-import
 import { SpotifyClient, SecretBox } from './spotify-client.js';
+// MARKER: modules-import
+// 功能模块装载器（阶段 1：只建骨架，模块清单还是空的）。
+// 装载失败不该连累 24/7 主进程，所以装载处用 try 兜住，失败只降级为「没有模块」。
+import { createModuleHost } from './modules/registry.js';
+import { defineModules } from './modules/index.js';
 // MARKER: bili-import
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1495,6 +1500,10 @@ let stateDirHardened = null;
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
   const cfg = loadConfig();
+  // MARKER: modules-helper
+  // 功能模块装载器句柄。null = 没装载（配置关了，或装载失败）→ 请求回调里整段委派跳过。
+  // 放在 main 顶层而不是请求回调里，是为了只建一次、只装载一次。
+  let moduleHost = null;
   fs.mkdirSync(STATE_DIR, { recursive: true });
   hardenStateDirAcl();
   acquireLock();
@@ -4648,6 +4657,41 @@ async function main() {
         res.end();
         return;
       }
+
+      // MARKER: modules-delegate
+      // 功能模块委派（阶段 1）。
+      //
+      // 位置很关键：在 favicon 之后、**第一条业务路由之前**。favicon 之后意味着它已经
+      // 落在全部集中闸门（Host、令牌、智能体隔离）之后 —— 模块没有绕开鉴权的机会，
+      // 它们和后面的 if 链看到的是同一份已经过审的请求。
+      //
+      // 没命中任何模块路由时返回 "unhandled"，继续走下面的老 if 链，行为零变化。
+      if (moduleHost) {
+        let verdict = 'unhandled';
+        try {
+          verdict = await moduleHost.dispatch(req.method, url.pathname, { req, res, url, sendJson, readBody });
+        } catch (error) {
+          log('[modules] 路由处理失败:', error?.message ?? error);
+          sendJson({ ok: false, error: `模块处理失败：${error?.message ?? error}` }, Number(error?.statusCode) || 500);
+          return;
+        }
+        if (verdict === 'handled') return;
+      }
+
+      // MARKER: modules-diagnostics
+      // 模块诊断端点（只读）。只回「装了什么、有没有问题」，不含令牌、聊天内容或文件路径。
+      // 故意的取舍：放在 Host 校验之后（DNS rebinding 那层仍然有效），但放在令牌校验之前 ——
+      // 出问题时最需要「不登录也能一眼看出装载器活没活」。它不泄露任何会话数据。
+      if (req.method === 'GET' && url.pathname === '/api/_modules') {
+        sendJson({
+          ok: true,
+          enabled: cfg.socialV2?.modules?.enabled !== false,
+          loaded: moduleHost !== null,
+          registry: moduleHost ? moduleHost.describe() : null,
+        });
+        return;
+      }
+
       // Host 头校验（DNS rebinding 硬化）：控制台只监听 127.0.0.1，因此合法请求的 Host
       // 只可能是 127.0.0.1 / localhost / [::1] 加本端口。攻击者用一个 TTL=0 的域名解析到
       // 127.0.0.1 时，浏览器会把 evil.com:3100 当作同源，Origin 校验随之失效；卡住 Host
@@ -14739,6 +14783,38 @@ async function main() {
   startDshWatch();
   startSnowlumaWatch();
   startConsoleServer();
+  // ── 功能模块装载（阶段 1：骨架） ────────────────────────────────────────
+  // MARKER: modules-loader
+  //
+  // 只装载一次、只装载声明了的模块。空清单也要建 host：`/api/_modules` 靠它回答
+  // 「装载器是否在工作」。单个模块的装载异常在 host 内部被兜住并记进 problems，
+  // 不会冒到这里 —— 一个模块写坏了不该让桥接起不来。
+  //
+  // `cfg.socialV2.modules.enabled === false` 时不装载（回退开关），
+  // moduleHost 保持 null → 请求回调里那段委派整段跳过。
+  if (cfg.socialV2?.modules?.enabled !== false) {
+    try {
+      moduleHost = createModuleHost({
+        // 注意：sendJson / readBody **不能**放进 ctx。
+        // 它们是请求回调里的局部变量（`src/bridge.js` 内 `const sendJson = ...`），
+        // main() 作用域里根本不存在 —— 第一版写进来直接 ReferenceError，
+        // 装载整个失败。模块需要它们时从 handler 的第一个参数取
+        // （委派时传的是 { req, res, url, sendJson, readBody }）。
+        ctx: {
+          cfg,
+          log: (message) => log(message),
+          stateDir: STATE_DIR,
+        },
+        log: (message) => log(message),
+        onError: (mod, phase, error) => log(`[modules] ${phase} 失败 ${mod?.name ?? "?"}：${error?.message ?? error}`),
+      });
+      await moduleHost.load(defineModules());
+      log(`[modules] 装载完成：${moduleHost.loaded.length} 个模块 / ${moduleHost.describe().routes.length} 条路由`);
+    } catch (error) {
+      moduleHost = null;
+      log('[modules] 装载失败，已降级为无模块：', error?.message ?? error);
+    }
+  }
 
   // MARKER: fix2bugs
   // 启动后补一次黑话研究。为什么不能只靠「提取后」触发：

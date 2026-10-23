@@ -18,6 +18,10 @@ const routes = new Set();
 for (const m of src.matchAll(/url\.pathname\s*===\s*'([^']+)'/g)) routes.add(m[1]);
 for (const m of src.matchAll(/url\.pathname\s*\.startsWith\(\s*'([^']+)'/g)) routes.add(m[1]);
 
+// 模块化装载器新增的诊断端点：它由 registry 的模块路由承接，不在老 if 链里，
+// 正则抽不出来。这里手工补上，否则改造后多出的路由不会被任何回归发现。
+routes.add('/api/_modules');
+
 const IDENTITIES = {
   anon: {},
   console: { 'x-console-token': consoleTok },
