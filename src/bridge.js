@@ -431,7 +431,7 @@ function firstMeaningfulLine(content) {
   return '';
 }
 
-function roleWarnings(content, mode = 'v2') {
+function roleWarnings(content, mode = 'v2', allowCjkSpaces = true) {
   const text = String(content ?? '');
   const warnings = [];
   const stats = roleCharStats(text);
@@ -447,8 +447,10 @@ function roleWarnings(content, mode = 'v2') {
   if (GEN1_ROLE_LINE_RE.test(untagged)) {
     warnings.push('未标记的小节里含一代仿真专用指令（[SILENT] / 空格分句 / 自动转发…），二代下这些行会被兜底过滤——建议把它们移到带 〔一代〕 标记的小节里');
   }
-  if (/回复示例/.test(untagged) && /[\u4e00-\u9fff]\s+[\u4e00-\u9fff]/.test(untagged)) {
-    warnings.push('“回复示例”节里的中文空格会被自动改写成逗号（二代不用空格分条），建议直接写逗号，或把该节标记为 〔一代〕');
+  // 二代已改用工具数组分条，示例里的中文空格只是普通字符；只有显式关掉
+  // 顶层 role.allowCjkSpaces=false 时才会被改写成逗号，这时才值得提醒。
+  if (!allowCjkSpaces && /回复示例/.test(untagged) && /[\u4e00-\u9fff]\s+[\u4e00-\u9fff]/.test(untagged)) {
+    warnings.push('“回复示例”节里的中文空格会被自动改写成逗号（已设 role.allowCjkSpaces=false），建议直接写逗号，或把该节标记为 〔一代〕');
   }
   return warnings;
 }
@@ -4907,7 +4909,7 @@ async function main() {
             content,
             chars: content.length,
             bytes: Buffer.byteLength(content, 'utf8'),
-            warnings: roleWarnings(content),
+            warnings: roleWarnings(content, 'v2', cfg.role?.allowCjkSpaces !== false),
             limits: { injectMaxChars: roleInjectMaxChars },
             stats: roleCharStats(content),
             // 每个小节在各模式下是否会被注入，供控制台预览「这条规则到底生不生效」
@@ -4936,7 +4938,7 @@ async function main() {
           if (fs.existsSync(roleFilePath(name))) { sendJson({ ok: false, error: `人格「${name}」已存在` }, 400); return; }
           writeRoleContent(name, content);
           log(`控制台：创建人格「${name}」（${content.length} 字符）`);
-          sendJson({ ok: true, role: name, warnings: roleWarnings(content) });
+          sendJson({ ok: true, role: name, warnings: roleWarnings(content, 'v2', cfg.role?.allowCjkSpaces !== false) });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/roles/update') {
@@ -4947,7 +4949,7 @@ async function main() {
           if (!fs.existsSync(roleFilePath(name))) { sendJson({ ok: false, error: `人格「${name}」不存在` }, 404); return; }
           writeRoleContent(name, content);
           log(`控制台：更新人格「${name}」（${content.length} 字符）`);
-          sendJson({ ok: true, role: name, chars: content.length, warnings: roleWarnings(content) });
+          sendJson({ ok: true, role: name, chars: content.length, warnings: roleWarnings(content, 'v2', cfg.role?.allowCjkSpaces !== false) });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/roles/rename') {
@@ -11795,6 +11797,9 @@ async function main() {
   // 检测二代发送内容里“中文之间用空格”的不自然写法，用于给 AI 返回软提醒。
   // 只检测空格两侧都是中文/中文标点的情况，避免误伤英文单词间隔（如 DeepSeek V3）。
   function findCjkSpaceWarning(messages) {
+    // 二代靠工具数组分条，单条消息里的中文空格是群聊里常见的停顿写法（实测群友 44% 这么打），
+    // 不再是「该拆成多条」的信号。默认不再提示，免得和人格卡里的「用空格断句」互相打脸。
+    if (cfg.role?.allowCjkSpaces !== false) return null;
     const bad = [];
     for (let i = 0; i < (messages || []).length; i++) {
       const chars = Array.from(String(messages[i] ?? ''));
@@ -11843,6 +11848,9 @@ async function main() {
     // 先按 〔二代〕/〔一代〕 标记筛小节；下面的逐行过滤只是给「没标记的老卡片」兜底。
     const raw = roleHintForMode('v2');
     if (!raw) return '';
+    // 一代靠「中文空格」分条，二代靠工具数组分条，空格在二代只是普通字符。
+    // 默认保留（群里本来就有人用空格断句），设 false 才回退到「改写成逗号」的老行为。
+    const allowCjkSpaces = cfg.role?.allowCjkSpaces !== false;
     // 一代仿真模式专用指令整行过滤，避免污染二代工具协议。
     // 用 role-card.js 导出的那份（文件顶部已 import）：这里原先又抄了一份同源正则，
     // 两份"哪行算一代指令"的安全相关过滤器一旦漂移，就会出现"selectRoleText 认为是二代内容、
@@ -11854,14 +11862,16 @@ async function main() {
       if (/^##\s*.*回复示例/.test(line)) {
         inExampleSection = true;
         // 保留标题，但把“空格代表分条”的一代语义改写成二代语义
-        kept.push(line.replace(/（空格代表前后分两条消息回答）/, '（示例中已用逗号表示停顿；想分多条请用数组）'));
+        kept.push(line.replace(/（空格代表前后分两条消息回答）/, allowCjkSpaces
+          ? '（示例中用空格表示停顿；要分多条请把数组写成多个元素）'
+          : '（示例中已用逗号表示停顿；想分多条请用数组）'));
         continue;
       }
       if (inExampleSection && /^##\s/.test(line)) {
         inExampleSection = false;
       }
       if (inExampleSection) {
-        kept.push(convertExampleSpacesToComma(line));
+        kept.push(allowCjkSpaces ? line : convertExampleSpacesToComma(line));
       } else if (!GEN1_ROLE_LINE_RE.test(line)) {
         kept.push(line);
       }
