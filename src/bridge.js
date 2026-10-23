@@ -7329,6 +7329,14 @@ async function main() {
         // 生图审批的查询与人工处置入口（控制台/管理端用；智能体侧走 QQ 里的
         // 「通过 / 拒绝」，不从这里批）。
         if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/api/socialV2/image-approval') {
+          // MARKER: image-approval-console-only
+          // 审批查询/人工处置是管理端动作：智能体侧走 QQ 里的「通过 / 拒绝」由主人确认，
+          // 不该能读全局统计，更不该能自己批一张图（approve 会真的出图并发送）。
+          // 智能体进程同时持有 x-console-token，上面的控制台令牌闸门挡不住它，这里必须单独拒绝。
+          if (req.headers['x-agent-call'] !== undefined || String(req.headers['x-agent-token'] ?? '') !== '') {
+            sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
+            return;
+          }
           try {
             const q = url.searchParams;
             const body = req.method === 'POST' ? await readBody() : {};
