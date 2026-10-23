@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "鲸鱼刷站助手（B站/小黑盒）",
+  "version": "1.0.0",
+  "description": "替 cloud 上的鲸鱼娘发只读请求：服务器 IP 被 B 站风控，改由这个浏览器代发。不读取、不上传任何 Cookie。",
+  "permissions": ["alarms", "storage"],
+  "host_permissions": [
+    "https://api.bilibili.com/*",
+    "https://www.bilibili.com/*",
+    "https://api.xiaoheihe.cn/*",
+    "https://www.xiaoheihe.cn/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "鲸鱼刷站助手",
+    "default_popup": "popup.html"
+  }
+}

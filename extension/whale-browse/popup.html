@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      width: 340px; margin: 0; padding: 14px;
+      font: 13px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    h1 { font-size: 14px; margin: 0 0 10px; }
+    label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 12px; }
+    input[type=text], input[type=password] {
+      width: 100%; box-sizing: border-box; padding: 6px 8px;
+      border: 1px solid #8884; border-radius: 6px; font: inherit;
+    }
+    .row { display: flex; gap: 8px; margin-top: 12px; }
+    button {
+      flex: 1; padding: 7px 10px; border-radius: 6px; cursor: pointer;
+      border: 1px solid #8884; font: inherit;
+    }
+    button.primary { background: #2b7cd3; color: #fff; border-color: #2b7cd3; }
+    #status { margin-top: 12px; padding: 9px 10px; border-radius: 6px; background: #8881; font-size: 12px; }
+    .k { opacity: .65; }
+    .ok { color: #1a8f4a; font-weight: 600; }
+    .bad { color: #c33; font-weight: 600; }
+    .hint { margin-top: 10px; font-size: 11px; opacity: .6; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>🐋 鲸鱼刷站助手</h1>
+
+  <label for="endpoint">服务器地址</label>
+  <input type="text" id="endpoint" placeholder="http://121.40.52.115:3100">
+
+  <label for="token">访问令牌</label>
+  <input type="password" id="token" placeholder="在服务器上执行 php 命令取">
+  <div class="hint" id="tokenHint">服务器路径：<code>/opt/qq-bridge/state/phone-token</code></div>
+
+  <div class="row">
+    <button id="save" class="primary">保存并启动</button>
+    <button id="stop">停止</button>
+  </div>
+
+  <div id="status">读取中…</div>
+
+  <div class="hint">
+    这个扩展只是代发只读请求。<b>它不读取、不上传任何 Cookie</b>，你的登录态始终只在这台电脑上。
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
