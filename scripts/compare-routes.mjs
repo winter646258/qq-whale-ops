@@ -19,7 +19,17 @@ const b = JSON.parse(fs.readFileSync(bPath, 'utf8')).routes ?? {};
 
 // 已搬到模块、从老 if 链删掉的路由：它们的「缺席」是预期内的。
 // 这里刻意写死历史基线里的已知差异，新增模块时同步加一条，免得每次都要人肉判断。
-const EXPECTED_MOVED = new Set(['/api/presets', '/api/role-mode']);
+// 已搬进模块、从老 if 链删掉的路由 —— 它们在当前快照里「缺席」属预期。
+// 每做完一个阶段就往这里加一条，否则回归会把正常搬家报成故障。
+const EXPECTED_MOVED = new Set([
+  // 阶段2/3：role-console / security
+  '/api/presets', '/api/role-mode', '/api/role', '/api/sessions', '/api/security',
+  // 阶段4：role-console（人格管理）/ approval
+  '/api/pending', '/api/roles', '/api/roles/content', '/api/roles/limit',
+  '/api/roles/create', '/api/roles/update', '/api/roles/rename', '/api/roles/delete',
+  // 阶段5：preset（仿真提示词管理）
+  '/api/preset/sim-prompt', '/api/preset/sim-prompt/backups', '/api/preset/sim-prompt/restore',
+]);
 // 会随运行时间变化的路由：形状可以比，长度不行。
 const keysOf = (r) => JSON.stringify([r.status, r.shape, r.ok]);
 
@@ -43,3 +53,4 @@ for (const k of Object.keys(b)) {
 }
 console.log(`\n比对 ${Object.keys(a).length} → ${Object.keys(b).length} 条；非预期差异 ${bad} 条`);
 process.exit(bad ? 1 : 0);
+
