@@ -1,5 +1,5 @@
 [Unit]
-Description=QQ provider 自动切换守护（buddy 连续失败 -> deepseek-official）
+Description=QQ provider 候选链守护（loomy → trae → raccoon，永不切官方）
 Documentation=file:///opt/qq-bridge/交接文档.md
 Wants=qq-user-bridge.service
 After=qq-user-bridge.service

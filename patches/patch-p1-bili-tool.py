@@ -217,10 +217,7 @@ else:
 
 # ── 工具开关登记
 MARK_FLAG = '// MARKER: bili-flag'
-# 锚点带上 ia-flag 注释：那一行原本就以它结尾，如果只锚到逗号，
-# 新插入的行会把它夹在中间变成 `qq_bili: 'bili', // MARKER: bili-flag  // MARKER: ia-flag`
-# （2026-10-23 线上真出现过，两个标记叠在一行）。
-FLAG_ANCHOR = "  qq_image_approval: 'image', // MARKER: ia-flag"
+FLAG_ANCHOR = "  qq_image_approval: 'image',"
 FLAG_ADD = "  qq_bili: 'bili', // MARKER: bili-flag"
 
 if MARK_FLAG in mcp:

@@ -16,7 +16,7 @@ if (!provider || !model) {
 }
 
 const base = 'http://127.0.0.1:3081';
-const dir = '/tmp/model-bench-' + process.pid;
+const dir = '/tmp/model-bench';
 let sessionId = null;
 let ttftMs = null;
 let startedAt = 0;

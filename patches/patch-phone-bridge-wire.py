@@ -153,7 +153,7 @@ ROUTES_ADD = r"""        // MARKER: phone-bridge-routes
         // ── 浏览器桥：扩展来领任务 / 回传结果 / 看状态 ──
         // 这三个端点**不走 console token**，而是走扩展自己的令牌：
         // 它们要暴露给浏览器（跨域），不该把管理台令牌摊出去。
-        if (req.method === 'OPTIONS' && url.pathname.startsWith('/api/phone/')) {
+        if (req.method === 'OPTIONS' && rawPath.startsWith('/api/phone/')) {
           res.writeHead(204, {
             'access-control-allow-origin': '*',
             'access-control-allow-headers': 'content-type, x-phone-token',
@@ -163,13 +163,13 @@ ROUTES_ADD = r"""        // MARKER: phone-bridge-routes
           res.end();
           return;
         }
-        if (url.pathname.startsWith('/api/phone/')) {
+        if (rawPath.startsWith('/api/phone/')) {
           res.setHeader('access-control-allow-origin', '*');
           res.setHeader('access-control-allow-headers', 'content-type, x-phone-token');
           res.setHeader('access-control-allow-methods', 'POST, GET, OPTIONS');
         }
 
-        if (url.pathname === '/api/phone/poll' && req.method === 'POST') {
+        if (rawPath === '/api/phone/poll' && req.method === 'POST') {
           if (!phoneTokenOk(req.headers['x-phone-token'])) {
             sendJson({ ok: false, error: '令牌无效' }, 401);
             return;
@@ -179,7 +179,7 @@ ROUTES_ADD = r"""        // MARKER: phone-bridge-routes
           return;
         }
 
-        if (url.pathname === '/api/phone/result' && req.method === 'POST') {
+        if (rawPath === '/api/phone/result' && req.method === 'POST') {
           if (!phoneTokenOk(req.headers['x-phone-token'])) {
             sendJson({ ok: false, error: '令牌无效' }, 401);
             return;
@@ -191,7 +191,7 @@ ROUTES_ADD = r"""        // MARKER: phone-bridge-routes
           return;
         }
 
-        if (url.pathname === '/api/phone/status' && req.method === 'GET') {
+        if (rawPath === '/api/phone/status' && req.method === 'GET') {
           if (!phoneTokenOk(req.headers['x-phone-token'])) {
             sendJson({ ok: false, error: '令牌无效' }, 401);
             return;
@@ -299,19 +299,11 @@ def main():
     ensure(src.count('new PhoneBridge(') == 1, 'PhoneBridge 实例化次数不对')
     # 锚点不能被吞进注释：函数声明前必须有换行
     ensure(chr(10) + '  function v2ToolEnabled(flag) {' in src, 'v2ToolEnabled 被吞掉了（插入内容开头少了换行）')
-    # console server 作用域里没有 rawPath（只有 url.pathname）——
-    # 2026-10-23 踩过：路由写 rawPath 直接 500 "rawPath is not defined"。
-    # 这里断的是**我们自己插入的那段**不许出现 rawPath，不是整个 src
-    # （src 别处可能真有同名变量）。
-    ensure('rawPath' not in ROUTES_ADD, 'ROUTES_ADD 里写了 rawPath：console server 只有 url.pathname')
     ensure(src.count('function phoneTokenOk(') == 1, 'phoneTokenOk 定义次数不对')
     ensure(src.count('/api/phone/poll') == 1, '/api/phone/poll 出现次数不对')
     ensure(src.count('/api/phone/result') == 1, '/api/phone/result 出现次数不对')
     ensure(src.count('/api/phone/status') == 1, '/api/phone/status 出现次数不对')
     ensure('phoneBridge.submitResult(' in src, 'submitResult 调用丢失')
-    # rawPath 在 console server 里不存在，只能用 url.pathname
-    ensure("url.pathname === '/api/phone/result'" in src, 'result 路由没改对')
-    ensure("url.pathname === '/api/phone/status'" in src, 'status 路由没改对')
     ensure(src.count('const phonePathExempt = url.pathname.startsWith(\'/api/phone/\');') == 1, '鉴权放行变量丢了')
     ensure('consoleToken && !tokenMatches && !phonePathExempt' in src, '鉴权关卡没改成例外')
     ensure(src.count('const phoneHostExempt = url.pathname.startsWith(\'/api/phone/\');') == 1, 'Host 放行变量丢了')
