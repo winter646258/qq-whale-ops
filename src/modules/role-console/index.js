@@ -1,14 +1,13 @@
-// 模块：人格 / 预设相关的小接口（阶段 2 的第一批试点）
+// 模块：人格 / 预设相关的小接口
 //
-// 为什么从这两条开始：
-//   scripts/classify-routes.mjs 量过——`GET /api/presets` 闭包 0、只碰 `api` 一个句柄；
-//   `POST /api/role-mode` 只调两个文件级函数 readRoleState / writeRoleState。
-//   它们不碰会话状态、不碰消息队列，搬走之后行为可以逐字节比对。
+// 为什么从这几条开始：
+//   scripts/classify-routes.mjs 量过——这四条闭包 0、只碰 cfg/state/RoleState 与 `api`，
+//   不碰会话状态、不碰消息队列，搬走之后行为可以逐字节比对。
 //
-// 这两个接口都是**控制台**用途（AI 不该调），所以模块里再补一道
+// 这些接口都是**控制台**用途（AI 不该调），所以模块里补一道
 // 「带 agent token 就拒绝」——与 adminOnlyV2Paths 同一个先例，纵深防御。
 
-/** 带 agent 凭据的请求一律拒绝（控制台专用接口）。 */
+/** 带 agent 凭据的请求一律拒绝（控制台专用接口）。返回 true 表示已拦下。 */
 function rejectAgent({ req, sendJson }) {
   if (req.headers['x-agent-call'] !== undefined || String(req.headers['x-agent-token'] ?? '') !== '') {
     sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
@@ -20,7 +19,7 @@ function rejectAgent({ req, sendJson }) {
 export default {
   name: 'role-console',
   title: '人格 / 预设（控制台小接口）',
-  inject: ['api', 'unwrap', 'readRoleState', 'writeRoleState'],
+  inject: ['api', 'unwrap', 'state', 'readRoleState', 'writeRoleState', 'sanitizeRoleName', 'rolesDirExists'],
 
   routes: [
     {
@@ -51,10 +50,47 @@ export default {
         sendJson({ ok: true, roleMode: mode });
       },
     },
+    {
+      method: 'POST',
+      kind: 'exact',
+      path: '/api/role',
+      async handler({ req, sendJson, readBody }) {
+        if (rejectAgent({ req, sendJson })) return;
+        const body = await readBody();
+        const rs = this.ctx.readRoleState();
+        if (body.role && typeof body.role === 'string') {
+          const name = this.ctx.sanitizeRoleName(body.role);
+          if (!this.ctx.rolesDirExists(name)) {
+            sendJson({ ok: false, error: `角色「${name}」不存在（roles/${name}.md）` }, 400);
+            return;
+          }
+          this.ctx.writeRoleState(name, rs.mode);
+          this.ctx.log(`控制台：角色已设置为 ${name}`);
+          sendJson({ ok: true, role: name });
+        } else {
+          this.ctx.writeRoleState(null, rs.mode);
+          this.ctx.log('控制台：角色已清除');
+          sendJson({ ok: true, role: null });
+        }
+      },
+    },
+    {
+      method: 'GET',
+      kind: 'exact',
+      path: '/api/sessions',
+      async handler({ req, sendJson }) {
+        if (rejectAgent({ req, sendJson })) return;
+        const list = [];
+        for (const [key, sessionId] of Object.entries(this.ctx.state.sessions)) {
+          list.push({ key, sessionId, owner: key === `private:${String(this.ctx.cfg.ownerQQ ?? '')}` });
+        }
+        sendJson({ sessions: list });
+      },
+    },
   ],
 
   setup(ctx) {
-    // inject 只校验了键存在，这里再确认类型 —— 装载期发现问题好过运行期。
+    // inject 只校验键存在，这里再确认类型 —— 装载期发现问题好过运行期。
     if (typeof ctx.api?.agentPresets?.list !== 'function') {
       throw new Error('ctx.api.agentPresets.list 不可用（DSH 客户端版本不匹配？）');
     }
