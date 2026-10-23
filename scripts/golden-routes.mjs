@@ -55,7 +55,12 @@ for (const p of list) {
   for (const [name, h] of Object.entries(IDENTITIES)) row[name] = await probe(p, h);
   out.routes[p] = row;
 }
-fs.writeFileSync('/tmp/golden-routes.json', JSON.stringify(out, null, 1));
+// 默认落 state/，可用 --out 指定。原来的写死 /tmp 在 systemd ProtectSystem 下
+// 不是 safe 的落点，也容易被误以为「没生成」。
+const outIdx = process.argv.indexOf('--out');
+const outPath = outIdx > 0 ? process.argv[outIdx + 1] : '/opt/qq-bridge/state/golden-routes.json';
+fs.writeFileSync(outPath, JSON.stringify(out, null, 1));
+console.log(`已写 ${outPath}（${Object.keys(out.routes ?? {}).length} 条路由）`);
 console.log('路由数', list.length);
 for (const p of list) {
   const r = out.routes[p];

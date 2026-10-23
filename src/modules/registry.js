@@ -188,7 +188,11 @@ export function createModuleHost({ ctx, log, onError } = {}) {
     const r = match(method, pathname);
     if (!r) return 'unhandled';
     const def = modules.get(r.module);
-    const result = await r.handler.call(def, ...args);
+    // handler 的 this 是「模块定义 + ctx」：模块里写 this.ctx.readRoleState() 才能拿到注入项。
+    // 第一版 only `.call(def)`，handler 里 this.ctx 是 undefined —— 实测 POST /api/role-mode
+    // 直接 500「Cannot read properties of undefined (reading 'readRoleState')」。
+    const receiver = { ...def, ctx };
+    const result = await r.handler.call(receiver, ...args);
     return result === 'unhandled' ? 'unhandled' : 'handled';
   }
 

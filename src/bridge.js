@@ -1506,9 +1506,15 @@ async function main() {
   let moduleHost = null;
   fs.mkdirSync(STATE_DIR, { recursive: true });
   hardenStateDirAcl();
+  // MARKER: modules-ctx
+  // 功能模块共用的句柄容器。**先建空对象，后面逐步 Object.assign 灌满**：
+  // 模块在 setup(ctx) 里拿到的是同一个对象，所以只要句柄在装载前灌好就行。
+  // 不在启动早期一次性算出来 —— api 等句柄要到 main() 中段才建得出来。
+  const moduleCtx = {};
   acquireLock();
   loadState();
 
+  Object.assign(moduleCtx, { cfg, log, stateDir: STATE_DIR });
   // ── 群聊黑话/网络用语学习（slang） ──────────────────────────────────────
   let slangEntries = [];
   // 读失败时（被占用 / 权限 / JSON 损坏）必须**暂停写入**：否则内存里的空数组
@@ -2792,6 +2798,9 @@ async function main() {
     // 默认只允许把 launch token 交给回环地址；远程 DSH 需要显式 opt-in（见 dsh-client.ensureAuth）。
     allowRemote: cfg.dsh.allowRemote === true
   });
+
+  // MARKER: modules-ctx-api
+  Object.assign(moduleCtx, { api });
   // DSH 的模型目录 RPC：0.1.5 是 `session/modelCatalog`。**不能走基类门面**
   // `api.sessions.modelCatalog` —— 桥接钉住的 `@deepseek-ai/dsh-host-apiproxy@0.1.1-rc.2`
   // 的 sessions 门面里根本没有这个方法（只有 `models` → 已下线的 `session/models`），
@@ -4862,15 +4871,6 @@ async function main() {
           });
           return;
         }
-        if (req.method === 'GET' && url.pathname === '/api/presets') {
-          let presets = [];
-          try {
-            const { presets: list } = unwrap(await api.agentPresets.list({}), 'agentPreset.list');
-            presets = list.map((p) => ({ id: p.id, trust: p.trust ?? 'system' }));
-          } catch {}
-          sendJson({ presets });
-          return;
-        }
         if (req.method === 'POST' && url.pathname === '/api/mode') {
           const body = await readBody();
           // 规范名与历史名都接受，落盘的始终是内部拼写（见 MODE_INPUT_ALIASES）。
@@ -4945,15 +4945,6 @@ async function main() {
             log('控制台：角色已清除');
             sendJson({ ok: true, role: null });
           }
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/role-mode') {
-          const body = await readBody();
-          const rs = readRoleState();
-          const mode = body.mode === 'silent' ? 'silent' : 'active';
-          writeRoleState(rs.role, mode);
-          log(`控制台：静默模式 ${mode === 'silent' ? '开启' : '关闭'}`);
-          sendJson({ ok: true, roleMode: mode });
           return;
         }
         // ── 人格管理 ──────────────────────────────────────────────────────────
@@ -14780,6 +14771,16 @@ async function main() {
   if (cfg.socialV2?.sticker?.enabled !== false) {
     syncStickerLibrary(true).catch((error) => log('启动预热表情库失败:', error?.message ?? error));
   }
+  // MARKER: modules-ctx-fns
+  // 模块**禁止** import bridge.js（会触发第二次 main()，循环 import）。
+  // 主文件里的函数一律从这里显式交付。注意只交**无状态、无副作用**的纯工具。
+  // unwrap 是 import 进来的纯工具（来自 dsh-client），模块要在 setup 里拿它。
+  Object.assign(moduleCtx, {
+    unwrap,
+    readRoleState,   // 读角色状态（role/mode），文件级函数，不依赖 main() 闭包
+    writeRoleState,  // 写角色状态
+    roleSummaries,   // 人格清单摘要
+  });
   startDshWatch();
   startSnowlumaWatch();
   startConsoleServer();
@@ -14800,11 +14801,8 @@ async function main() {
         // main() 作用域里根本不存在 —— 第一版写进来直接 ReferenceError，
         // 装载整个失败。模块需要它们时从 handler 的第一个参数取
         // （委派时传的是 { req, res, url, sendJson, readBody }）。
-        ctx: {
-          cfg,
-          log: (message) => log(message),
-          stateDir: STATE_DIR,
-        },
+        // 与模块共用同一个 ctx 对象（bridge.js 逐步 Object.assign 灌满）
+        ctx: moduleCtx,
         log: (message) => log(message),
         onError: (mod, phase, error) => log(`[modules] ${phase} 失败 ${mod?.name ?? "?"}：${error?.message ?? error}`),
       });
