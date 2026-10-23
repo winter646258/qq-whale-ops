@@ -220,8 +220,11 @@ export function normalizeState(raw, now = Date.now()) {
     .filter(Boolean)
     .slice(-MAX_UNDERCURRENT);
 
-  const aff = o.affinity && typeof o.affinity === 'object' ? o.affinity : {};
-  const affAt = Number(aff.updatedAt);
+  // MARKER: affinity-migrate-norm
+  // 好感度不在这里了 —— 它按会话各存一份，落在 state/affinity.json，
+  // 见 affinity-store.js。老文件里的 affinity 字段读进来会被直接丢掉
+  // （normalizeState 只挑认识的键返回，多余的字段不会带出去），
+  // 所以迁移完之后文件里那一段就自然消失了。
   const updatedAt = Number(o.updatedAt);
   const sinceAt = Number(o.since);
   const baseAt = Number(o.baselineUpdatedAt);
@@ -235,12 +238,7 @@ export function normalizeState(raw, now = Date.now()) {
     since: Number.isFinite(sinceAt) && sinceAt > 0 ? sinceAt : (Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : now),
     updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : now,
     baselineUpdatedAt: Number.isFinite(baseAt) && baseAt > 0 ? baseAt : now,
-    undercurrent,
-    affinity: {
-      level: clampLevel(aff.level ?? AFFINITY_MIN),
-      note: cleanNote(aff.note),
-      updatedAt: Number.isFinite(affAt) && affAt > 0 ? affAt : 0
-    }
+    undercurrent
   };
 }
 
@@ -375,30 +373,10 @@ export function undercurrentLoad(state) {
 
 // ── 好感度 ──────────────────────────────────────────────────────────────
 
-/**
- * 改好感度。
- *
- * 注意：数字只是她自己的索引，**注入时永远只给 note**。
- * 工具描述里要写清楚「只在真的觉得关系变了时才改」，不要每轮加一点 ——
- * 加一点就变成自动打分了，那是查表。
- */
-export function setAffinity(state, { level, note, now = Date.now() } = {}) {
-  const s = normalizeState(state, now);
-  let nextLevel = s.affinity.level;
-  if (level !== undefined && level !== null) {
-    const n = Number(level);
-    if (!Number.isFinite(n)) throw new Error('好感度必须是数字');
-    if (n < AFFINITY_MIN || n > AFFINITY_MAX) {
-      throw new Error(`好感度只能是 ${AFFINITY_MIN}~${AFFINITY_MAX}`);
-    }
-    nextLevel = Math.round(n);
-  }
-  const nextNote = note === undefined ? s.affinity.note : cleanNote(note);
-  return {
-    ...s,
-    affinity: { level: nextLevel, note: nextNote, updatedAt: now }
-  };
-}
+// MARKER: affinity-migrate-set
+// setAffinity 已经搬走了 —— 好感度按会话各存一份，写入走 affinity-store.js
+// 的 setAffinity(state.affinities, {key, level, note})，由 bridge.js 的
+// recordAffinityForKey() 调用。这里留一个显式的墓碑，避免有人以为它还在。
 
 // ── 底色 ────────────────────────────────────────────────────────────────
 
@@ -472,8 +450,7 @@ export function effectiveMood(state, now = Date.now()) {
     since,
     durationMs: Math.max(0, now - since),
     undercurrent: s.undercurrent.map((item) => ({ ...item })),
-    undercurrentLoad: undercurrentLoad(s),
-    affinity: { ...s.affinity }
+    undercurrentLoad: undercurrentLoad(s)
   };
 }
 
@@ -531,8 +508,10 @@ export function moodStats(state, now = Date.now()) {
     durationMs: eff.durationMs,
     undercurrentCount: s.undercurrent.length,
     undercurrentLoad: eff.undercurrentLoad,
-    affinityLevel: s.affinity.level,
-    hasNote: Boolean(s.affinity.note),
+    // MARKER: affinity-migrate-stats
+    // 这里原来报 affinityLevel/hasNote，读的是全局那一份。
+    // 全局删了，好感度按会话（state/affinity.json）—— 要看就用
+    // GET /api/socialV2/affinity?key=xxx，别在这里塞一个不属于任何人的数。
     updatedAt: s.updatedAt
   };
 }

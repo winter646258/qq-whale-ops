@@ -11,8 +11,9 @@
 //   2. **保持手动，不由系统自动打分**：只在她长期没动过时提醒一句该看了。
 //      原作者在 mood-store.js 里就写明不做自动打分，理由是「自动打分会把
 //      每次对话都变成算分」，这里沿用同一条哲学。
-//   3. **只注入 note 原文，不注入数字**：图里写的是「好感度：一个大概的秤，
-//      不被数字框住，喜欢谁由她自己判断」。数字给她只会让她在聊天里把分数说出来。
+//   3. **只注入 note 原文和分档语气，不注入数字**：图里写的是「好感度：一个大概的秤，
+//      不被数字框住，喜欢谁由她自己判断」。数字给她只会让她在聊天里把分数说出来；
+//      但只给 note 又会让「关系变了」停在标签上不动 —— 所以补一行分档的说话倾向。
 
 export const AFFINITY_MIN = 1;
 export const AFFINITY_MAX = 10;
@@ -147,10 +148,29 @@ export function shouldNudgeAffinity({ entry, lastNudgedAt = 0, now = Date.now() 
 }
 
 /**
+ * 好感度档位 -> 说话倾向。
+ *
+ * 只给方向，不给分数：数字进 prompt 她会直接在聊天里把分数说出来，
+ * 而「印象 9 分」对说话方式没有任何可执行的指引，一句「该松一点」才有。
+ *
+ * @param {number} level 1~10
+ * @returns {string} 空串表示没有可用信息
+ */
+export function affinityToneFor(level) {
+  const n = clampAffinityLevel(level);
+  if (n === null) return '';
+  if (n <= 2) return '还谈不上亲近，客气、话少，不必热络，也不用主动找话题';
+  if (n <= 4) return '印象一般，正常相处就行，不用刻意亲近';
+  if (n <= 6) return '算熟了，可以放松一点、开开玩笑';
+  if (n <= 8) return '有好感，说话会自然松下来：愿意多聊两句、主动接话，也会顺口问一句对方近况';
+  return '很亲近，说话不设防：会主动搭话、会护着，偶尔说句软话；被冷落会有点在意';
+}
+
+/**
  * 拼进唤醒 prompt 的那一行。
  *
- * 只给 note 原文 —— 不给数字（主人定的第三条）。没有 note 就返回空串，
- * 一个字都不提：她没想好怎么看待这个人时，催她想反而是干扰。
+ * 给 note 原文 + 一行分档语气（不给数字，主人定的第三条）。没有 note 就
+ * 返回空串，一个字都不提：她没想好怎么看待这个人时，催她想反而是干扰。
  *
  * @param {{entry: object|null, key: string, ownerQQ?: string|number}} opts
  * @returns {string}
@@ -158,7 +178,12 @@ export function shouldNudgeAffinity({ entry, lastNudgedAt = 0, now = Date.now() 
 export function formatAffinityLine({ entry, key, ownerQQ } = {}) {
   if (!entry || !entry.note) return '';
   const isOwner = String(key) === `private:${ownerQQ}`;
-  return `【你怎么看${isOwner ? '主人' : '这个人'}】${entry.note}\n\n`;
+  // MARKER: affinity-tone
+  // note 说「我怎么看这个人」，语气行说「因此这话该怎么说」。缺一句，
+  // 好感度就只是个静态标签 —— 关系变了，她说话的松紧也得跟着变。
+  const tone = affinityToneFor(entry.level);
+  const toneLine = tone ? `（语气参考：${tone}）\n` : '';
+  return `【你怎么看${isOwner ? '主人' : '这个人'}】${entry.note}\n${toneLine}\n`;
 }
 
 /**
