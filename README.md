@@ -33,24 +33,43 @@ setup.sh                   一键安装脚本（幂等，可重复跑）
 docs/
   交接文档.md              当前架构、配置、排障、事故记录（权威文档）
   qq-whale-deployment.md    早期部署记录（历史参考）
+  交接文档-YYYYMMDD*.md     每日交接快照（按时间累积，越往后越新）
+  阶段总结-20261023.md      阶段性总结
+  插件化设计交接-20261023.md  「每个功能一个插件」的改造设计（交 codex 执行）
 systemd/
   qq-dsh.service           AI 大脑
   qq-bridge.service        QQ ↔ DSH 桥接
   qq-zone-watch.service    空间动态监控
   qq-provider-switch.service  provider 自动切换
-scripts/
+src/                        上游之外的本地状态模块（被 bridge.js 引用）
+  mood-store.js             情绪 / 底色 / 暗流
+  affinity-store.js         好感度（按会话各存一份，落在 state/affinity.json）
+  portrait-store.js         人物画像
+  schedule-store.js         日程
+  diary-store.js            日记（JSONL）
+  group-digest-store.js     群聊近况（D）
+  shared-memory-store.js    共享记忆
+  share-signal-store.js     「主动分享」信号闸门
+  image-approval-store.js   生图审批
+  phone-bridge.js           手机侧桥接
+  site-bili.js              B 站只读
+  mcp-web-search-safe.js    安全的网页搜索 MCP
+  mood-store.test.mjs       情绪模块单测
+scripts/                    运维与验证脚本（whale-ctl / 验证 / 探测 / 分析）
   whale-ctl.sh             一键暂停/恢复/状态（保命开关）
   switch-provider.sh       provider 自动切换（systemd 适配版）
   import-memes.py          表情包批量导入（aigengtu 源）
   selftest-wake.py         唤醒链路自检
   probe-official-api.py    官方 API 连通性探测
+  verify-*.mjs / test-*.mjs  各模块的在线验证与单测
 patches/                   对上游 qq-bridge 的本地补丁（均有 .bak 备份与验证方法）
-  patch-bridge-friend-refresh.py      好友列表窗口期修复
-  patch-bridge-log-agent-error.py     agent 出错写 stdout（否则自动切换失效）
-  patch-impression-refresh.py         印象定期重写提醒
-  patch-impression-persist.py         上述字段的状态持久化
+                            命名约定：patch-<功能>.py，同一功能的多步补丁加后缀
 persona/
-  roles-小鲸鱼.md          人格卡（3590 字符 / 注入上限 6000）
+  roles-小鲸鱼.md          人格卡（6367 字符 / 注入上限 7000）
+  roles-小鲸鱼.改版前-YYYYMMDD.md  改版前的备份，用于回退与对比
+  roles-小鲸鱼.slimmed-YYYYMMDD.md  历史精简版
+extension/                 浏览器扩展（控制台/调试用）
+assets/                    静态资源
 archive/
   bridge.server-*.js       线上 bridge.js 备份（含全部本地补丁）
   qzone-watch.server-*.js  线上 qzone-watch.js 备份
