@@ -172,6 +172,7 @@ import { SpotifyClient, SecretBox } from './spotify-client.js';
 // 装载失败不该连累 24/7 主进程，所以装载处用 try 兜住，失败只降级为「没有模块」。
 import { createModuleHost } from './modules/registry.js';
 import { defineModules } from './modules/index.js';
+import { initSightings, recordSightings } from './sticker-sightings.js';
 // MARKER: bili-import
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -8554,6 +8555,19 @@ async function main() {
       hasMedia: Array.isArray(media) && media.length > 0,
       time: Date.now()
     });
+    // MARKER: sticker-sightings
+    // 观测层：只把这条消息里的图片 MD5 记一笔，用来观察群里哪些图在反复出现。
+    // 不碰表情库、不发消息、不改提示词；出任何错都静默吞掉，不影响业务。
+    try {
+      if (Array.isArray(media) && media.length) {
+        // 图片消息的 text 恒为「[图片]」，拿它当上下文没有任何信息量。
+        // 本条是纯图时改用上一条的文字 —— 那才是「这张图出现在什么对话里」。
+        const prevLine = arr.length >= 2 ? String(arr[arr.length - 2].plain || arr[arr.length - 2].text || '') : '';
+        const nowPlain = String(textContent ?? '').trim();
+        const ctxText = /^\[图片\]$/.test(nowPlain) ? prevLine : nowPlain;
+        recordSightings(key, media, { sender, text: /^\[图片\]$/.test(ctxText) ? '' : ctxText, messageId: messageRef ? String(messageRef) : '' });
+      }
+    } catch { /* 观测层永不抛 */ }
     const cap = Math.max(50, Number(cfg.social?.contextWindow ?? 15) * 2);
     while (arr.length > cap) arr.shift();
   }
@@ -11900,6 +11914,17 @@ async function main() {
   startSnowlumaWatch();
   startConsoleServer();
   // ── 功能模块装载（阶段 1：骨架） ────────────────────────────────────────
+  // MARKER: sticker-sightings-init
+  // 观测层启动即装载，与模块装配无关（模块全关也不影响它）。
+  if (cfg.socialV2?.sticker?.sightings?.enabled !== false) {
+    try {
+      const sightCount = initSightings(STATE_DIR, cfg.socialV2?.sticker?.sightings ?? {});
+      log(`[sticker-sightings] 观测层已启用，已记录 ${sightCount} 张图`);
+    } catch (error) {
+      log('[sticker-sightings] 装载失败（已跳过）：', error?.message ?? error);
+    }
+  }
+
   // MARKER: modules-loader
   //
   // 只装载一次、只装载声明了的模块。空清单也要建 host：`/api/_modules` 靠它回答

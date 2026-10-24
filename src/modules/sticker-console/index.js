@@ -16,6 +16,8 @@
 //   唯一的例外是配置项 maxListCount：它从 this.ctx.cfg 现读，而 cfg 是 main()
 //   里的 const（只改属性不改引用），所以直接注入即可。
 
+import { readSightings } from '../../sticker-sightings.js';
+
 /** 拒绝智能体调用。返回 true 表示已经响应完毕。（口径与其它模块逐字一致） */
 function rejectAgent({ req, sendJson }) {
   if (req.headers['x-agent-call'] !== undefined || String(req.headers['x-agent-token'] ?? '') !== '') {
@@ -80,6 +82,18 @@ async function remarkSticker({ req, sendJson, readBody }) {
   }
 }
 
+async function sightingStats({ req, url, sendJson }) {
+  if (rejectAgent({ req, sendJson })) return;
+  const minCount = Math.max(1, Number(url.searchParams.get('minCount')) || 1);
+  const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 50));
+  try {
+    const data = readSightings(this.ctx.stateDir, { minCount });
+    sendJson({ ok: true, total: data.total, matched: data.matched, updatedAt: data.updatedAt, items: data.items.slice(0, limit) });
+  } catch (error) {
+    sendJson({ ok: false, error: `读取出场记录失败：${error?.message ?? error}` }, 500);
+  }
+}
+
 const inject = ['cfg', 'log', 'stateDir', 'stickerHelpers'];
 
 const routes = [
@@ -87,6 +101,8 @@ const routes = [
   { method: 'POST', path: '/api/stickers/sync', kind: 'exact', handler: syncStickers },
   { method: 'POST', path: '/api/stickers/note', kind: 'exact', handler: noteSticker },
   { method: 'POST', path: '/api/stickers/remark', kind: 'exact', handler: remarkSticker },
+  // 阶段 1 观测层：群里哪些图在反复出现（只读，供后面决定要不要推荐收藏）
+  { method: 'GET', path: '/api/stickers/sightings', kind: 'exact', handler: sightingStats },
 ];
 
 export default { name: 'sticker-console', title: '表情库管理（控制台）', inject, routes };

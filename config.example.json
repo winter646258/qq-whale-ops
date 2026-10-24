@@ -204,7 +204,12 @@
         "maxPerHour": 10,
         "maxRemarkChars": 20
       },
-      "allowIds": []
+      "allowIds": [],
+      "sightings": {
+        "enabled": true,
+        "max": 500,
+        "ttlDays": 30
+      }
     },
     "voice": {
       "enabled": false,
