@@ -37,6 +37,8 @@ import inspect from './inspect/index.js';
 import reset from './reset/index.js';
 import consoleModule from './console/index.js';
 import messageImage from './message-image/index.js';
+import mode from './mode/index.js';
+import sendLegacy from './send-legacy/index.js';
 
 /**
  * @param {object} ctx 由 `bridge.js` 组装的上下文（cfg / log / stateDir / api / 若干纯函数）
@@ -65,6 +67,8 @@ export function defineModules(_ctx) {
     reset,
     consoleModule,
     messageImage,
+    mode,
+    sendLegacy,
   ];
 }
 

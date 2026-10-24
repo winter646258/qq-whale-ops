@@ -4296,6 +4296,37 @@ async function main() {
     findMessageMedia: (key, messageId) => findMessageMedia(key, messageId),
     fetchMediaData: (media) => fetchMediaData(media),
   });
+  // MARKER: modules-ctx-mode
+  // 阶段23：运行模式切换句柄。currentMode / lastMode / closedAgentPreset 是可变的 let，
+  // 必须用读写句柄，不能交快照值；socialV2 声明在 main() 中段，包箭头。
+  Object.assign(moduleCtx, {
+    normalizeModeInput, VALID_MODES, readJsonSafe, atomicWriteJson,
+    cleanupSocialForModeChange: () => cleanupSocialForModeChange(),
+    clearAllSocialV2Timers: () => clearAllSocialV2Timers(),
+    drainAllPromptQueues: (msg) => drainAllPromptQueues(msg),
+    reconcileSessionPolicies: () => reconcileSessionPolicies(),
+    setupSleepTimerV2: (key) => setupSleepTimerV2(key),
+    scheduleProactiveCheckV2: (key) => scheduleProactiveCheckV2(key),
+    socialV2: () => socialV2,
+    setClosedAgentPreset: (value) => { closedAgentPreset = value; },
+    setMode: (value) => { currentMode = value; lastMode = value; },
+  });
+  // MARKER: modules-ctx-send-legacy
+  // 阶段23：老版发送通道句柄。socialV2 / getSocialV2State / sendMessagesV2 / resolveReplyTargetV2 等
+  // 全部声明在 main() 中段（晚于注入点），一律包箭头；agentTokenOk 在 startConsoleServer() 里。
+  Object.assign(moduleCtx, {
+    SENSITIVE_RE, unquoteJsonString, appendActivity, resolveSendLimitsV2,
+    v2ToolEnabled: (flag) => v2ToolEnabled(flag),
+    modeAllowed: (key, kind, id, c, mode) => modeAllowed(key, kind, id, c, mode),
+    shouldBlockSilentReply: (key) => shouldBlockSilentReply(key),
+    socialV2: () => socialV2,
+    getSocialV2State: (key) => getSocialV2State(key),
+    resolveReplyTargetV2: (st, kind, id, ref) => resolveReplyTargetV2(st, kind, id, ref),
+    sendMessagesV2: (key, msgs, imgs, reply, at) => sendMessagesV2(key, msgs, imgs, reply, at),
+    recordSentMessagesV2: (key, msgs) => recordSentMessagesV2(key, msgs),
+    saveSocialV2State: () => saveSocialV2State(),
+    scheduleReplyCheckV2: (key) => scheduleReplyCheckV2(key),
+  });
   // 好友昵称表（号码 -> 昵称），由 refreshFriends 填。不落盘。
   const friendNames = new Map();
   const IMAGE_APPROVAL_AUDIT_FILE = path.join(STATE_DIR, 'image-approval-audit.jsonl');
@@ -4961,7 +4992,9 @@ async function main() {
       agentTokenOk,
       isLiveAgentToken,
       v2SessionAllowed,                 // = isSessionAllowedInCurrentMode，上一行声明的 const
-      v2ToolEnabled: (flag) => v2ToolEnabled(flag),  // 函数声明在 L4652，交闭包避开 TDZ
+      v2ToolEnabled: (flag) => v2ToolEnabled(flag),
+      agentTokenOk: (key, token) => agentTokenOk(key, token),
+      agentTokenOkOrOwnerDelegate: (key, token) => agentTokenOkOrOwnerDelegate(key, token),  // 函数声明在 L4652，交闭包避开 TDZ
       safeFetchBuffer,                  // 顶层 import 的纯函数（safe-fetch.js），交引用安全
     });
     const server = http.createServer(async (req, res) => {
@@ -5223,63 +5256,6 @@ async function main() {
           } catch {
             res.end('控制台页面缺失：qq-bridge/public/console.html');
           }
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/mode') {
-          const body = await readBody();
-          // 规范名与历史名都接受，落盘的始终是内部拼写（见 MODE_INPUT_ALIASES）。
-          const requestedMode = normalizeModeInput(body.mode);
-          if (!requestedMode) {
-            sendJson({ ok: false, error: `mode 必须是 ${VALID_MODES.join(' / ')}（simulation 为 reserved2 的规范名）` }, 400);
-            return;
-          }
-          const existing = readJsonSafe(path.join(STATE_DIR, 'mode.json'), {});
-          const next = {
-            mode: requestedMode,
-            // 未显式传 preset 时保留原值；原值也没有就留空（= 用 DSH 默认 preset）。
-            ...(body.closedAgentPreset !== undefined
-              ? { closedAgentPreset: String(body.closedAgentPreset ?? '') }
-              : { closedAgentPreset: String(existing.closedAgentPreset ?? '') })
-          };
-          atomicWriteJson(path.join(STATE_DIR, 'mode.json'), next);
-          // 用字符串判断而非真值判断：空串是「显式清空 preset」，也要生效。
-          closedAgentPreset = next.closedAgentPreset;
-          // 写穿到 DSH 设置。refreshMode() 每 5 秒跑一次且以 DSH 的值为准（插件的 base 保证
-          // 该命名空间永远有值），所以只写本地 state/mode.json 会在下一次轮询时被静默回滚。
-          // 写穿的是**内部拼写**（`simulation` 会写成 `reserved2`）：DSH 里那份值会被 refreshMode
-          // 读回来当 `currentMode` 用，存规范名会让下游那些 `=== 'reserved2'` 判断失效。
-          let dshSynced = false;
-          try {
-            // unwrap() 在 result.ok 为 false 时直接抛错，所以能执行到下一行即代表写穿已成功
-            // （不要在这里再判断 updated?.ok —— 解包后的值恒为真，那样的分支是死代码）。
-            unwrap(await api.settings.update({ ns: 'qq-mode', patch: { mode: requestedMode } }), 'settings.update');
-            dshSynced = true;
-          } catch (error) {
-            log(`控制台：模式写穿 DSH 设置失败（${error?.message ?? error}）；本次仅写本地，下次 DSH 轮询会覆盖回滚`);
-          }
-          // 下面这两个判断比较的是「模式真的变了吗」。必须用归一后的值：拿 `body.mode` 比，
-          // 把 `simulation` 与 `reserved2` 当成两种模式，会在模式其实没变时清掉二代定时器与排队投递。
-          if (currentMode === 'reserved' && requestedMode !== 'reserved') {
-            cleanupSocialForModeChange();
-            log('控制台：模式离开一代仿真模式，清理社交状态');
-          }
-          if (currentMode === 'reserved2' && requestedMode !== 'reserved2') {
-            clearAllSocialV2Timers();
-            drainAllPromptQueues('模式切换，已取消排队中的投递');
-            log('控制台：模式离开二代仿真模式，清理 reserved2 定时器与排队投递');
-          }
-          currentMode = requestedMode;
-          lastMode = requestedMode;
-          reconcileSessionPolicies();
-          if (requestedMode === 'reserved2') {
-            for (const key of socialV2.conversations.keys()) {
-              setupSleepTimerV2(key);
-              scheduleProactiveCheckV2(key);
-            }
-            log('控制台：模式进入二代仿真模式，重建有限睡眠定时器');
-          }
-          log(`控制台：模式已设置为 ${requestedMode}${next.closedAgentPreset ? `（closed-agent preset: ${next.closedAgentPreset}）` : ''}${dshSynced ? '' : ' [仅本地，DSH 未同步]'}`);
-          sendJson({ ok: true, mode: requestedMode, closedAgentPreset: next.closedAgentPreset, dshSynced });
           return;
         }
         // ── 人格管理 ──────────────────────────────────────────────────────────
@@ -8045,131 +8021,6 @@ async function main() {
         // ── 图片/表情查询端点（MCP qq_get_message_images 走这里） ────────────
 
         // ── 统一发送端点（MCP 旧发送工具也走这里） ───────────────────────────
-        if (req.method === 'POST' && (url.pathname === '/api/send/group' || url.pathname === '/api/send/private' || url.pathname === '/api/send/reply')) {
-          const body = await readBody();
-          const token = String(body.token ?? '').trim();
-          const isPrivate = url.pathname === '/api/send/private';
-          const isReply = url.pathname === '/api/send/reply';
-          const targetId = isPrivate ? String(body.userId ?? '').trim() : String(body.groupId ?? '').trim();
-          const message = unquoteJsonString(String(body.message ?? '').trim());
-          // 引用 id 与端点无关：/api/send/reply 与另两个端点都允许带（是否真的引用由下游按 id 判断）。
-          // 旧写法 `isReply ? body.replyToMessageId : body.replyToMessageId` 两个分支一模一样，
-          // 保留 isReply 变量只是为了下面的端点语义判断，别再让人以为这里有过分支逻辑。
-          const replyToMessageId = body.replyToMessageId;
-          const atUserId = body.atUserId ?? null;
-          const key = isPrivate ? `private:${targetId}` : `group:${targetId}`;
-          // 安全边界：发送工具只允许在 closed-agent（管理员私聊）或 reserved2（二代 AI 带会话令牌）下使用；
-          // chat/reserved 的自动转发已覆盖正常回复，MCP 发送工具不应成为 prompt injection 的越权出口。
-          if (currentMode === 'chat' || currentMode === 'reserved') {
-            sendJson({ ok: false, error: '发送工具仅限 closed-agent / reserved2 模式使用' }, 403);
-            return;
-          }
-          if (socialV2.paused && token) {
-            sendJson({ ok: false, error: 'AI 已暂停，当前不允许执行发送工具' }, 403);
-            return;
-          }
-          if (!targetId || !message) { sendJson({ ok: false, error: '目标 id 和 message 不能为空' }, 400); return; }
-          if (isPrivate && atUserId) { sendJson({ ok: false, error: '私聊不需要 @' }, 400); return; }
-          if (isReply && (replyToMessageId === undefined || replyToMessageId === null || String(replyToMessageId).trim() === '')) {
-            sendJson({ ok: false, error: 'replyToMessageId 不能为空' }, 400);
-            return;
-          }
-          if (currentMode === 'reserved2' && !token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
-          // MARKER: legacy-send-delegate
-          // 旧版 /api/send/* 也要认主人私聊代发。
-          // 原来这里是严格的 agentTokenOk，导致 qq_send_private_message
-          // 在主人私聊里代发好友会报「agent token 无效」—— 令牌其实是对的，
-          // 只是这条路没跟着 10-22 那次代发改动一起开。
-          // 边界由 ownerDelegateTokenOk 兜底：只放行「私聊 + 好友 + 过准入」，
-          // 群发送仍然只能用自己的会话令牌。
-          if (token && !agentTokenOkOrOwnerDelegate(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          // MARKER: legacy-send-self-guard
-          // 上面那行对「主人令牌发给自己」是放行的：主人私聊本来就是自己的会话，
-          // agentTokenOk 第一层就过，ownerDelegateTokenOk 里那句
-          // `if (id === ownerQQ) return false` 根本没机会执行。
-          // 而 /api/send/* 这一段没有 modeAllowed 复查，消息会直接落到
-          // sendMessagesV2 真发出去（2026-10-23 07:19:21 日志里确实发过一条）。
-          // 代发这条路只用来发**给别人**，发自己的会话请用 qq_send_message。
-          if (token && key === `private:${String(cfg.ownerQQ ?? '')}` && !agentTokenOk(key, token)) {
-            sendJson({ ok: false, error: '不能代发到主人自己的会话：直接用自己的令牌走 qq_send_message' }, 403);
-            return;
-          }
-          const flag = isPrivate ? 'sendPrivate' : (isReply ? 'reply' : 'sendGroup');
-          if (token && !v2ToolEnabled(flag)) { sendJson({ ok: false, error: `工具未启用：${flag}` }, 403); return; }
-          if (shouldBlockSilentReply(key)) {
-            sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403);
-            return;
-          }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
-          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式无效' }, 400); return; }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
-            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
-            return;
-          }
-          if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '' && !/^-?[1-9]\d*$/.test(String(replyToMessageId).trim())) {
-            sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数（消息 id 可能为负数）' }, 400);
-            return;
-          }
-          let quotedInfo = null;
-          let actualReplyToMessageId = replyToMessageId;
-          if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
-            const stForReply = getSocialV2State(key);
-            const resolved = await resolveReplyTargetV2(stForReply, kind, id, String(replyToMessageId).trim());
-            if (!resolved) {
-              sendJson({ ok: false, error: '无法解析被引用消息，请确认 message id 正确且属于当前会话（可用 qq_get_message_detail 查看）' }, 400);
-              return;
-            }
-            quotedInfo = resolved.info;
-            actualReplyToMessageId = resolved.messageId;
-          }
-          const sendCfg = cfg.socialV2?.send ?? {};
-          const maxChars = Math.max(1, Number(sendCfg.maxMessageChars) || 500);
-          if (message.length > maxChars) { sendJson({ ok: false, error: `单条消息不能超过 ${maxChars} 字` }, 400); return; }
-          if (SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
-          try {
-            const st = getSocialV2State(key);
-            const now = Date.now();
-            const __lim = resolveSendLimitsV2(key, sendCfg);
-            const maxPerMinute = __lim.maxPerMinute;
-            const maxPerHour = __lim.maxPerHour;
-            const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-            const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-            if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
-              sendJson({ ok: false, error: '发送频率超限。⚠️ 不要在本轮重试这条内容——重试只会继续失败；先 qq_wait_for_messages 等下一批消息，或直接结束本轮，等下次唤醒再说。' }, 429);
-              return;
-            }
-            st.sendTimes.push(now);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
-            const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages);
-            st.lastAiReplyAt = now;
-            st.lastActionAt = now;
-            st.wakeConfig.noActionCount = 0;
-            saveSocialV2State();
-            log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/1 条`);
-            appendActivity(`${key} [send] 成功 ${sentMessages.length}/1 条：${message.slice(0, 80)}`);
-            if (sentMessages.length > 0) scheduleReplyCheckV2(key);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
-          } catch (error) {
-            if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent);
-              log(`[send] ${url.pathname} ${key} 部分成功 ${error.sent.length}/1 条，已记录已发消息`);
-            }
-            // 失败/未发出的消息回滚预占的发送额度，避免假 429。
-            const sentCount = Array.isArray(error?.sent) ? error.sent.length : 0;
-            const failedCount = Math.max(0, 1 - sentCount);
-            for (let i = 0; i < failedCount; i++) {
-              const idx = st.sendTimes.indexOf(now);
-              if (idx >= 0) st.sendTimes.splice(idx, 1);
-            }
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
-            saveSocialV2State();
-            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
-          }
-          return;
-        }
         // ── 重启桥接（守护模式下 5 秒后自动拉起） ──────────────────────────────
         sendJson({ ok: false, error: 'not found' }, 404);
       } catch (error) {
