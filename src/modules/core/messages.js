@@ -68,7 +68,7 @@ async function markRead({ req, sendJson, readBody }) {
   // 当前已经是「潜水」配置、且最近还有对话/刚被唤醒时，不允许用 mark_read 直接回到潜水：
   // 必须先等够沉睡前观察窗口，否则就是「聊两句又去潜水」。
   if (h.isSleepingConfig(st.wakeConfig) && h.preSleepWaitBlocked(st)) {
-    const preSleepMs = Math.max(0, Number(this.ctx.cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
+    const preSleepMs = Math.max(0, Number(this.ctx.cfg.socialV2?.wake?.preSleepWaitMs) || 90000);
     const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
     const remainMin = Math.ceil(remaining / 60000);
     sendJson({

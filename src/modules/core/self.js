@@ -248,7 +248,7 @@ async function setWakeConfig({ req, sendJson, readBody }) {
   }
   // 沉睡前强制观察窗口：除非对方明确结束、或已安静够久，否则不许聊两句就睡。
   if (h.isSleepingConfig(next) && h.preSleepWaitBlocked(st)) {
-    const preSleepMs = Math.max(0, Number(this.ctx.cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
+    const preSleepMs = Math.max(0, Number(this.ctx.cfg.socialV2?.wake?.preSleepWaitMs) || 90000);
     const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
     const remainMin = Math.ceil(remaining / 60000);
     sendJson({

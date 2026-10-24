@@ -9787,16 +9787,32 @@ async function main() {
     return readThroughSeqV2(st);
   }
 
+  // MARKER: read-through-clamp
+  // throughSeq 的两种错法要分开处理：
+  //   ①根本不是非负安全整数 —— 调用方写错了，继续 400。
+  //   ②是个合法数字但超过系统认可的连续水位 —— 以前也 400，这是个坑。
+  //      原因：modelSeenSeqs 只是一份内存回执，桥接一重启就清空；而她记得的
+  //      「我看到 1872 了」经常大于 readThroughSeqV2 认可的连续水位（那 30 条
+  //      没被 noteModelMessages 记过账的未读会把它卡住）。于是她每一次收尾都被
+  //      打回，未读越积越多，readThroughSeq 永远推不上去。
+  //      现在改成夹到水位：不报错、收尾能成功，由响应里的 readThroughSeq 和
+  //      markedCount 校正她的认知；要真的标到最新，仍然得先 qq_get_unread_messages。
   function requestedReadThroughSeqV2(st, body, isAgent) {
     if (!Object.prototype.hasOwnProperty.call(body, 'throughSeq')) return null;
-    const seq = body.throughSeq;
-    const max = isAgent ? readThroughSeqV2(st) : st.lastUnreadSeq;
-    if (!Number.isSafeInteger(seq) || seq < 0 || seq > max || seq > st.lastUnreadSeq) {
-      const error = new Error('throughSeq 必须是不超过已展示连续消息水位的非负安全整数；请先读取未读消息并使用返回的 readThroughSeq');
+    const raw = body.throughSeq;
+    if (!Number.isSafeInteger(raw) || raw < 0) {
+      const error = new Error('throughSeq 必须是非负安全整数；不知道传什么就先调 qq_get_unread_messages，用它返回的 readThroughSeq');
       error.statusCode = 400;
       throw error;
     }
-    return seq;
+    const lastUnread = Number.isSafeInteger(st.lastUnreadSeq) && st.lastUnreadSeq > 0 ? st.lastUnreadSeq : 0;
+    const watermark = isAgent ? readThroughSeqV2(st) : lastUnread;
+    const cap = Math.max(0, Math.min(Number.isSafeInteger(watermark) ? watermark : 0, lastUnread));
+    if (raw > cap) {
+      log(`[read-through] throughSeq ${raw} 超过连续水位 ${cap}，已夹取（isAgent=${isAgent}）`);
+      return cap;
+    }
+    return raw;
   }
 
   function acknowledgeMessagesV2(st, throughSeq) {
