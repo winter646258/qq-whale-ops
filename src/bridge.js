@@ -4154,6 +4154,16 @@ async function main() {
 
   /** 审批状态的内存缓存。改盘上的 json 不会立刻生效，要重启（踩过一次）。 */
   let imageApprovalCache = null;
+  // MARKER: modules-ctx-memory
+  // 阶段19：记忆读写模块要用的句柄。五个函数全部声明在注入点之后 ⇒ 只能包箭头，
+  // 绝不能直接放进对象字面量的值位置（那会立即求值并撞上 TDZ）。
+  Object.assign(moduleCtx, {
+    redactKnownTokensOnly: (text) => redactKnownTokensOnly(text),
+    getSocialV2State: (key) => getSocialV2State(key),
+    appendMemoryV2: (st, category, content, extra) => appendMemoryV2(st, category, content, extra),
+    formatMemoryV2: (st) => formatMemoryV2(st),
+    saveSocialV2State: () => saveSocialV2State(),
+  });
   // MARKER: modules-ctx-social
   // 阶段18：旧社交引擎（仿真群友模式）搬进 social 模块要用的句柄。
   // social 是 L9556 的 const 对象（Map 内容可变、引用不变）⇒ 直交；
@@ -8023,158 +8033,6 @@ async function main() {
             sendJson({ ok: false, error: `共享记忆操作失败：${error?.message ?? error}` }, 500);
             return;
           }
-        }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-append') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const category = String(body.category ?? '').trim();
-          const content = String(body.content ?? '').trim();
-          const extra = body.extra && typeof body.extra === 'object' ? body.extra : {};
-          if (!key || !category || !content) { sendJson({ ok: false, error: 'key/category/content 不能为空' }, 400); return; }
-          if (!['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
-          if (category === 'memberImpression' && !String(extra.target || '').trim()) { sendJson({ ok: false, error: 'memberImpression 需要 extra.target 指定群友名字' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_append' }, 403); return; }
-          const st = getSocialV2State(key);
-          appendMemoryV2(st, category, content, extra);
-          sendJson({ ok: true, key, category, content, memory: formatMemoryV2(st) });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-update') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const category = String(body.category ?? '').trim();
-          const oldContent = String(body.oldContent ?? '').trim();
-          const target = redactKnownTokensOnly(String(body.target ?? '').trim());
-          const newContent = body.newContent !== undefined && body.newContent !== null ? redactKnownTokensOnly(String(body.newContent).trim()) : undefined;
-          const newExtra = body.newExtra && typeof body.newExtra === 'object' && !Array.isArray(body.newExtra) ? body.newExtra : {};
-          const redactExtra = (v) => redactKnownTokensOnly(String(v ?? '')).trim();
-          const cleanNewExtra = {
-            ...newExtra,
-            pendingQuestion: newExtra.pendingQuestion !== undefined ? redactExtra(newExtra.pendingQuestion) : undefined,
-            participants: Array.isArray(newExtra.participants) ? newExtra.participants.map((p) => redactExtra(p)) : undefined,
-            motivation: newExtra.motivation !== undefined ? redactExtra(newExtra.motivation) : undefined,
-            target: newExtra.target !== undefined ? redactExtra(newExtra.target) : undefined
-          };
-          if (!key || !category) { sendJson({ ok: false, error: 'key/category 不能为空' }, 400); return; }
-          if (!['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
-          if (category === 'memberImpression' && !target) { sendJson({ ok: false, error: 'memberImpression 需要 target 指定原群友名字' }, 400); return; }
-          if (category !== 'memberImpression' && !oldContent) { sendJson({ ok: false, error: '该类别需要 oldContent 指定要编辑的记忆内容' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_*' }, 403); return; }
-          // MARKER: ghosttool
-          // update 单独一个开关：它比 append 危险（会覆盖已有印象），要能单独掐掉。
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('memoryUpdate')) { sendJson({ ok: false, error: '工具未启用：qq_memory_update' }, 403); return; }
-          const st = getSocialV2State(key);
-          if (category === 'activeTopic' && Array.isArray(st.activeTopics)) {
-            const idx = st.activeTopics.findIndex((t) => String(t?.text ?? '') === oldContent);
-            if (idx < 0) { sendJson({ ok: false, error: '找不到要编辑的 activeTopic' }, 404); return; }
-            if (newContent !== undefined) st.activeTopics[idx].text = newContent.slice(0, 200);
-            if (cleanNewExtra.pendingQuestion !== undefined) st.activeTopics[idx].pendingQuestion = String(cleanNewExtra.pendingQuestion).slice(0, 200);
-            if (Array.isArray(cleanNewExtra.participants)) st.activeTopics[idx].participants = cleanNewExtra.participants.map(String).slice(0, 10);
-          } else if (category === 'pendingThought' && Array.isArray(st.pendingThoughts)) {
-            const idx = st.pendingThoughts.findIndex((t) => String(t?.text ?? '') === oldContent);
-            if (idx < 0) { sendJson({ ok: false, error: '找不到要编辑的 pendingThought' }, 404); return; }
-            if (newContent !== undefined) st.pendingThoughts[idx].text = newContent.slice(0, 200);
-            if (cleanNewExtra.motivation !== undefined) st.pendingThoughts[idx].motivation = String(cleanNewExtra.motivation).slice(0, 50);
-            if (cleanNewExtra.expiresAtMs !== undefined) st.pendingThoughts[idx].expiresAt = Date.now() + Math.max(0, Number(cleanNewExtra.expiresAtMs) || 0);
-          } else if (category === 'memberImpression' && st.memberImpressions && typeof st.memberImpressions === 'object') {
-            const oldTarget = target;
-            if (['__proto__', 'constructor', 'prototype'].includes(oldTarget)) { sendJson({ ok: false, error: '非法的群友名字' }, 400); return; }
-            const im = st.memberImpressions[oldTarget] || {};
-            const newTarget = String(cleanNewExtra.target || oldTarget).trim();
-            if (!newTarget || ['__proto__', 'constructor', 'prototype'].includes(newTarget)) { sendJson({ ok: false, error: '非法的群友名字' }, 400); return; }
-            if (newContent !== undefined) {
-              // MARKER: ghosttool
-              // 单标签也要限长。原来只限条数（20 条）不限长度，
-              // 于是长出过 144 字的「印象」——那是小作文，不是印象。
-              // 实测那条：私聊的这位爱叫人大肥鱼，自己说"随便你取"…
-              im.traits = newContent.split(/[,，、]/)
-                .map((s) => s.trim())
-                .filter(Boolean)
-                .map((s) => s.slice(0, 40))
-                .slice(0, 20);
-            }
-            if (cleanNewExtra.interactionCount !== undefined) im.interactionCount = Math.max(0, Number(cleanNewExtra.interactionCount) || 0);
-            if (newTarget !== oldTarget) delete st.memberImpressions[oldTarget];
-            st.memberImpressions[newTarget] = im;
-            // 她真的动手重写了印象 ⇒ 重置维护计时（提醒随之消失）
-            st.lastImpressionRefreshAt = Date.now();
-          }
-          saveSocialV2State();
-          sendJson({ ok: true, key, category, memory: formatMemoryV2(st) });
-          return;
-        }
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/memory') {
-          const key = String(url.searchParams.get('key') ?? '').trim();
-          const category = String(url.searchParams.get('category') ?? '').trim();
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_query' }, 403); return; }
-          const st = getSocialV2State(key);
-          const raw = {
-            activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-20) : [],
-            pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => !t.expiresAt || Date.now() < t.expiresAt).slice(-20) : [],
-            memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {}
-          };
-          if (category === 'activeTopic') {
-            raw.pendingThoughts = [];
-            raw.memberImpressions = {};
-          } else if (category === 'pendingThought') {
-            raw.activeTopics = [];
-            raw.memberImpressions = {};
-          } else if (category === 'memberImpression') {
-            raw.activeTopics = [];
-            raw.pendingThoughts = [];
-          }
-          sendJson({ ok: true, key, category, formatted: formatMemoryV2({ ...st, ...raw }), raw });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-remove') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const category = String(body.category ?? '').trim();
-          const content = String(body.content ?? '').trim();
-          const target = String(body.target ?? '').trim();
-          if (!key || !category) { sendJson({ ok: false, error: 'key/category 不能为空' }, 400); return; }
-          if (!['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
-          if (category === 'memberImpression' && !target) { sendJson({ ok: false, error: 'memberImpression 需要 target 指定群友名字' }, 400); return; }
-          if (category === 'memberImpression' && ['__proto__', 'constructor', 'prototype'].includes(target)) { sendJson({ ok: false, error: '非法的群友名字' }, 400); return; }
-          if (category !== 'memberImpression' && !content) { sendJson({ ok: false, error: '该类别需要 content 指定要删除的记忆内容' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_remove' }, 403); return; }
-          const st = getSocialV2State(key);
-          if (category === 'activeTopic' && Array.isArray(st.activeTopics)) {
-            st.activeTopics = st.activeTopics.filter((t) => String(t?.text ?? '') !== content);
-          } else if (category === 'pendingThought' && Array.isArray(st.pendingThoughts)) {
-            st.pendingThoughts = st.pendingThoughts.filter((t) => String(t?.text ?? '') !== content);
-          } else if (category === 'memberImpression' && st.memberImpressions && typeof st.memberImpressions === 'object') {
-            delete st.memberImpressions[target];
-          }
-          saveSocialV2State();
-          sendJson({ ok: true, key, category, memory: formatMemoryV2(st) });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-clear') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const category = String(body.category ?? '').trim();
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (category && !['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_clear' }, 403); return; }
-          const st = getSocialV2State(key);
-          if (!category || category === 'activeTopic') st.activeTopics = [];
-          if (!category || category === 'pendingThought') st.pendingThoughts = [];
-          if (!category || category === 'memberImpression') st.memberImpressions = {};
-          saveSocialV2State();
-          sendJson({ ok: true, key, category: category || 'all', memory: formatMemoryV2(st) });
-          return;
         }
         // ── 二代黑话学习（reserved2）：AI 查询/提交黑话候选 ─────────────────
         if (req.method === 'GET' && url.pathname === '/api/socialV2/slang/query') {

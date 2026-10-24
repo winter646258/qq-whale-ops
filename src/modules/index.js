@@ -32,6 +32,7 @@ import slang from './slang/index.js';
 import image from './image/index.js';
 import whitelist from './whitelist/index.js';
 import social from './social/index.js';
+import memory from './memory/index.js';
 
 /**
  * @param {object} ctx 由 `bridge.js` 组装的上下文（cfg / log / stateDir / api / 若干纯函数）
@@ -55,6 +56,7 @@ export function defineModules(_ctx) {
     image,
     whitelist,
     social,
+    memory,
   ];
 }
 
