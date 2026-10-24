@@ -62,14 +62,28 @@ const EXPECTED_MOVED = new Set([
   '/api/phone/poll',
   '/api/phone/result',
   '/api/phone/status',
+// 阶段27：v2:core（会话状态/唤醒配置/控制台管理面/消息读取）
+  // 注意 activity 原来是「一条 if 同时吃 GET 与 POST」，搬家后快照按 GET 探变成 404
+  // （POST 仍 200），属正常分支消失。
+  '/api/socialV2/config', '/api/socialV2/state', '/api/socialV2/prompt',
+  '/api/socialV2/wake-config', '/api/socialV2/activity', '/api/socialV2/states',
+  '/api/socialV2/reset', '/api/socialV2/wake', '/api/socialV2/unread',
+  '/api/socialV2/recent', '/api/socialV2/mark-read', '/api/socialV2/message-detail',
+  // 下面 14 条是 mcp-snowluma-safe.js 里的调用字符串，被老正则误抽成路由，
+  // 快照里从来就是 404（现已只扫 bridge.js + src/modules/）。登记成已知缺席。
+  '/api/socialV2/album', '/api/socialV2/check-send', '/api/socialV2/collect-sticker',
+  '/api/socialV2/diary', '/api/socialV2/portrait', '/api/socialV2/qzone',
+  '/api/socialV2/record-sent', '/api/socialV2/schedule', '/api/socialV2/send-burst',
+  '/api/socialV2/send-message', '/api/socialV2/send-poke', '/api/socialV2/send-sticker',
+  '/api/socialV2/send-voice', '/api/socialV2/wait',
   // 阶段14：slang（黑话库管理）
   '/api/slang', '/api/slang/', '/api/slang/clear', '/api/slang/batch-delete',
   '/api/slang/batch-confirm', '/api/slang/batch-reject', '/api/slang/extract',
   '/api/slang/research', '/api/slang/config',
   // 阶段15：voice（操作者发送通道 + 别名）
   '/api/voice/send', '/api/send/voice',
-  '/api/session/reset',
-  '/api/workspace/reset',
+  // 阶段21 搬走的两条（老基线是模块化之前拍的，所以只按「新增」报，不按「缺席」报）
+  '/api/session/reset', '/api/workspace/reset',
   '/api/console/token',
   '/api/console/notify-ai',
   '/api/images/message',
@@ -99,13 +113,24 @@ for (const k of Object.keys(a)) {
     const x = a[k]?.[who], y = b[k]?.[who];
     if (!x || !y) { console.log(`✗ ${k} ${who} 缺身份`); bad += 1; continue; }
     if (keysOf(x) !== keysOf(y)) {
+      // activity 这类「一条 if 同时吃 GET 与 POST」的端点，搬家后快照按 GET 探会从
+      // 200 变 404（POST 仍 200）。已在 EXPECTED_MOVED 登记的按已知变化处理。
+      if (EXPECTED_MOVED.has(k) && who === 'console' && y.status === 404) {
+        console.log(`· 预期内变化 ${k} ${who}（${x.status} → 404，GET 分支已随模块搬走）`);
+        continue;
+      }
       console.log(`✗ ${k} ${who}\n    old ${keysOf(x)}\n    new ${keysOf(y)}`);
       bad += 1;
     }
   }
 }
 for (const k of Object.keys(b)) {
-  if (!(k in a)) console.log(`+ NEW ${k}${k.startsWith('/api/_') ? '（诊断端点，预期）' : ''}`);
+  if (!(k in a)) {
+    // 老基线（模块化之前拍的）不含后来才搬进模块的路径，它们只会以 NEW 出现。
+    // 已在 EXPECTED_MOVED 里登记过的不再算差异，否则每次搬家都会剩一条「+ NEW」。
+    if (EXPECTED_MOVED.has(k)) continue;
+    console.log(`+ NEW ${k}${k.startsWith('/api/_') ? '（诊断端点，预期）' : ''}`);
+  }
 }
 console.log(`\n比对 ${Object.keys(a).length} → ${Object.keys(b).length} 条；非预期差异 ${bad} 条`);
 process.exit(bad ? 1 : 0);

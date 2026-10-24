@@ -13,9 +13,31 @@ const convs = st.conversations || {};
 const agentTok = convs['group:906710082']?.agentToken || '';
 
 // 从源码抽出全部路由路径（复用 audit 思路），只为列清单，不判对错
-const src = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+// 老 if 链（bridge.js）+ 模块路由表（src/modules/**）一起抽。
+// 只看 bridge.js 会漏掉已搬进模块的路由，快照会随阶段推进一路缩水。
+// 只读 bridge.js 与 modules/：不能把 src/ 整个递归进去 —— mcp-snowluma-safe.js 里有
+// 十几条 `agentApi('/api/socialV2/diary')` 这样的调用字符串，会被抽成根本不存在的路由，
+// 快照里凭空多出一批 404「路由」（阶段27 实测多出 14 条）。
+const srcFiles = [path.join(ROOT, 'src', 'bridge.js')].concat(walk(path.join(ROOT, 'src', 'modules')));
+const src = srcFiles.map((f) => fs.readFileSync(f, 'utf8')).join('\n');
+function walk(dir) {
+  const out = [];
+  let entries = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...walk(full));
+    else if (e.name.endsWith('.js')) out.push(full);
+  }
+  return out;
+}
 const routes = new Set();
 for (const m of src.matchAll(/url\.pathname\s*===\s*'([^']+)'/g)) routes.add(m[1]);
+
+// 模块路由表里全是 `path: '/api/...'`（有些还配 kind），老 if 链搬走后只剩这一份，
+// 不抽就等于把已搬走的路由从回归里删掉。
+for (const m of src.matchAll(/\bpath:\s*'(\/api\/[^']+)'/g)) routes.add(m[1]);
+for (const m of src.matchAll(/\broute(?:Match|s)?\??\.path\s*===\s*'(\/api\/[^']+)'/g)) routes.add(m[1]);
 for (const m of src.matchAll(/url\.pathname\s*\.startsWith\(\s*'([^']+)'/g)) routes.add(m[1]);
 
 // 模块化装载器新增的诊断端点：它由 registry 的模块路由承接，不在老 if 链里，
