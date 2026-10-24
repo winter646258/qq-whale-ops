@@ -4154,6 +4154,16 @@ async function main() {
 
   /** 审批状态的内存缓存。改盘上的 json 不会立刻生效，要重启（踩过一次）。 */
   let imageApprovalCache = null;
+  // MARKER: modules-ctx-whitelist
+  // 阶段17：白名单模块要用的句柄。四个函数都在注入点之前声明（顶层三个 +
+  // main 内的 reconcileSessionPolicies），直交引用安全；cfg 是对象，改它的属性
+  // 立刻对所有持有者可见，不需要访问器。
+  Object.assign(moduleCtx, {
+    readConfigObject,
+    atomicWriteJson,
+    normalizeOwnerQQ,
+    reconcileSessionPolicies: () => reconcileSessionPolicies(),
+  });
   // MARKER: modules-ctx-image
   // 阶段16：生图/审批/画像搬进 image 模块后要用的句柄。
   // imageAllowedNow(L10013) / generateImageNow(L10055) 比这里晚得多，必须包闭包；
@@ -5169,48 +5179,6 @@ async function main() {
         // ── 黑话库管理 ──────────────────────────────────────────────────────
         // ── 会话查看 ──────────────────────────────────────────────────────────
         // ── 挂起审批 / 提问 ───────────────────────────────────────────────────
-        // ── 白名单可视化编辑（写 config.json + 热更新内存） ───────────────────
-        if (req.method === 'GET' && url.pathname === '/api/whitelist') {
-          sendJson({ allow: cfg.allow ?? { private: [], groups: [] }, deny: cfg.deny ?? { private: [], groups: [] }, ownerQQ: cfg.ownerQQ ?? null });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/whitelist') {
-          const body = await readBody();
-          const toNum = (arr) => Array.isArray(arr) ? [...new Set(arr.map((x) => Number(String(x).trim())).filter((n) => Number.isFinite(n)))] : undefined;
-          const configFile = path.join(ROOT, 'config.json');
-          // fail-fast：配置文件损坏时直接 500，绝不回写，避免把整个配置清成只剩 allow/deny/ownerQQ
-          const file = readConfigObject(configFile);
-          const allow = {
-            private: toNum(body.allow?.private) ?? (file.allow?.private ?? []),
-            groups: toNum(body.allow?.groups) ?? (file.allow?.groups ?? [])
-          };
-          const deny = {
-            private: toNum(body.deny?.private) ?? (file.deny?.private ?? []),
-            groups: toNum(body.deny?.groups) ?? (file.deny?.groups ?? [])
-          };
-          // 管理员 QQ 可在控制台输入；空值=清除管理员（fail-closed），非法值拒绝写入。
-          let ownerQQ = cfg.ownerQQ ?? null;
-          if (body.ownerQQ !== undefined) {
-            try {
-              ownerQQ = normalizeOwnerQQ(body.ownerQQ);
-            } catch (error) {
-              sendJson({ ok: false, error: error?.message ?? 'ownerQQ 无效' }, 400);
-              return;
-            }
-          }
-          file.allow = allow;
-          file.deny = deny;
-          file.ownerQQ = ownerQQ;
-          atomicWriteJson(configFile, file);
-          cfg.allow = { private: allow.private, groups: allow.groups };
-          cfg.deny = { private: deny.private, groups: deny.groups };
-          cfg.ownerQQ = ownerQQ;
-          reconcileSessionPolicies();
-          log(`控制台：白名单已更新（群: ${allow.groups.join(',') || '无'}，私聊: ${allow.private.join(',') || '无'}，管理员: ${ownerQQ ?? '未设置'}）`);
-          sendJson({ ok: true, allow, deny, ownerQQ });
-          return;
-        }
-
         // ── DSH 模型与思考强度 ───────────────────────────────────────────────
 
         // ── 安全拦截通知设置 ─────────────────────────────────────────────────
