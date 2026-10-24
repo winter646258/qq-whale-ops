@@ -2858,6 +2858,37 @@ async function main() {
   // 调用会抛 “api.sessions.modelCatalog is not a function”，让思考强度档位静默退回内置清单。
   // 这里直接用桥接自己覆写的 callUnary（它本来就是为「不依赖旧版客户端域方法」而存在的），
   // 并保留一次 `session/models` 回落以兼容更老的 DSH。
+        // MARKER: modules-ctx-ops
+        Object.assign(moduleCtx, {
+          dshHelpers: {
+            effortOptions: REASONING_EFFORT_OPTIONS,
+            effortDefault: REASONING_EFFORT_DEFAULT,
+            normalizeEffort: normalizeReasoningEffort,
+            configFile: path.join(ROOT, 'config.json'),
+            readConfigObject,
+            atomicWriteJson,
+            loadModelCatalog: async () => {
+              // 复用同一个在飞请求 + 3 秒兜底：控制台每次刷新都会打这条接口。
+              if (!modelCatalogInFlight) {
+                modelCatalogInFlight = withTimeout(fetchModelCatalog(), 3000, 'session/modelCatalog')
+                  .finally(() => { modelCatalogInFlight = null; });
+              }
+              return unwrap(await modelCatalogInFlight, 'session.modelCatalog');
+            },
+            noteCatalogFailure: (error) => {
+              const reason = String(error?.message ?? error);
+              if (modelCatalogErrorLogged.has(reason)) return;
+              modelCatalogErrorLogged.add(reason);
+              log(`读取 DSH 模型能力失败，思考强度暂用内置清单：${reason}`);
+            },
+            bumpModelSelectionEpoch: () => { modelSelectionEpoch += 1; },
+            modeAllowed,
+            currentMode: () => currentMode,
+            saveState,
+            saveSocialV2State,
+            releaseLock,
+          },
+        });
   const modelCatalogErrorLogged = new Set();
   async function fetchModelCatalog() {
     try {
@@ -4640,6 +4671,10 @@ async function main() {
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
+    // MARKER: modules-ctx-ops-token
+    // 把鉴权原语交到 main() 作用域：它们是 startConsoleServer() 的局部 const，
+    // ops 模块的 /api/authorize/read 要用，但模块拿不到那个闭包。
+    Object.assign(moduleCtx, { agentTokenOk, isLiveAgentToken });
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -5299,70 +5334,6 @@ async function main() {
         }
 
         // ── DSH 模型与思考强度 ───────────────────────────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/dsh/model') {
-          const provider = String(cfg.dsh?.provider || 'deepseek-official');
-          const model = String(cfg.dsh?.model || 'deepseek-flash');
-          // 档位优先取 DSH 实际公布的能力（DSH 换档位词汇或换 provider 时自动跟随），失败退回内置白名单。
-          let options = REASONING_EFFORT_OPTIONS.slice();
-          let labels = {};
-          let providerDefault = null;
-          let catalogSource = 'fallback';
-          try {
-            if (!modelCatalogInFlight) {
-              modelCatalogInFlight = withTimeout(fetchModelCatalog(), 3000, 'session/modelCatalog')
-                .finally(() => { modelCatalogInFlight = null; });
-            }
-            const catalog = unwrap(await modelCatalogInFlight, 'session.modelCatalog');
-            const group = (catalog?.groups ?? []).find((g) => g?.id === provider);
-            const entry = (group?.models ?? []).find((m) => m?.id === model);
-            const efforts = entry?.reasoning?.efforts ?? [];
-            const advertised = efforts.map((e) => String(e?.id ?? '')).filter((id) => REASONING_EFFORT_OPTIONS.includes(id));
-            if (advertised.length) {
-              options = advertised;
-              labels = Object.fromEntries(efforts.map((e) => [String(e.id), { name: e.name ?? '', description: e.description ?? '' }]));
-              providerDefault = entry.reasoning.defaultEffort ?? null;
-              catalogSource = 'dsh';
-            }
-          } catch (error) {
-            // 同一条失败原因只记一次：控制台每次刷新都会打这条接口，否则日志会被刷爆。
-            const reason = String(error?.message ?? error);
-            if (!modelCatalogErrorLogged.has(reason)) {
-              modelCatalogErrorLogged.add(reason);
-              log(`读取 DSH 模型能力失败，思考强度暂用内置清单：${reason}`);
-            }
-          }
-          sendJson({
-            provider,
-            model,
-            reasoningEffort: String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT),
-            options,
-            labels,
-            default: REASONING_EFFORT_DEFAULT,
-            providerDefault,
-            catalogSource,
-            // selectModel 会同时写会话级与 DSH 全局默认（~/.dsh/settings.yaml 的 agent-default-model），
-            // 控制台要把这点明确告诉管理员，避免「只想调 QQ 助手却改了 Web GUI 新会话默认」的意外。
-            globalSideEffect: true,
-          });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/dsh/effort') {
-          const body = await readBody();
-          let effort;
-          try { effort = normalizeReasoningEffort(body.reasoningEffort); }
-          catch (error) { sendJson({ ok: false, error: error?.message ?? '思考强度无效' }, 400); return; }
-          const configFile = path.join(ROOT, 'config.json');
-          // fail-fast：配置损坏时直接 500，绝不回写（与白名单接口同语义）
-          const file = readConfigObject(configFile);
-          file.dsh = { ...(file.dsh ?? {}), reasoningEffort: effort };
-          atomicWriteJson(configFile, file);
-          cfg.dsh = { ...(cfg.dsh ?? {}), reasoningEffort: effort };
-          // 递增代号：已在运行的会话在下一条消息会重新 selectModel（无需重启桥接或 DSH）
-          modelSelectionEpoch += 1;
-          log(`控制台：DSH 思考强度已设为 ${effort}（对已有会话于下一条消息生效）`);
-          sendJson({ ok: true, reasoningEffort: effort });
-          return;
-        }
 
         // ── 安全拦截通知设置 ─────────────────────────────────────────────────
         // ── 控制台访问令牌（可手动修改/生成随机） ─────────────────────────────
@@ -9063,28 +9034,6 @@ async function main() {
           sendJson({ ok: true, entry: publicSlangEntry(entry) });
           return;
         }
-        if (req.method === 'POST' && url.pathname === '/api/authorize/read') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const token = String(body.token ?? '').trim();
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
-          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          if (!token || !agentTokenOk(key, token)) {
-            // 空 token 一律拒绝：该端点对 agent 流量开放（见 startConsoleServer 里的
-            // agent 白名单），而 MCP 的 agentApi 总是带着真实控制台令牌，
-            // 所以「不传 token 就跳过校验」等于把它变成免鉴权端点。
-            sendJson({ ok: false, error: token ? 'agent token 无效' : '缺少会话令牌；旧只读工具在需要令牌的模式下不可用，请改用带会话令牌的 v2 读工具' }, 403);
-            return;
-          }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
-            sendJson({ ok: false, error: '当前模式不允许读取该会话' }, 403);
-            return;
-          }
-          sendJson({ ok: true, key });
-          return;
-        }
         // ── 图片/表情查询端点（MCP qq_get_message_images 走这里） ────────────
         if (req.method === 'GET' && url.pathname === '/api/images/message') {
           const key = String(url.searchParams.get('key') ?? '').trim();
@@ -9383,19 +9332,6 @@ async function main() {
           return;
         }
         // ── 重启桥接（守护模式下 5 秒后自动拉起） ──────────────────────────────
-        if (req.method === 'POST' && url.pathname === '/api/restart') {
-          sendJson({ ok: true, message: '正在重启桥接（若由守护窗口启动，5 秒后自动恢复）…' });
-          setTimeout(() => {
-            log('控制台：重启桥接');
-            // 退出前落盘：SIGINT/SIGTERM 的收尾路径会 saveState()/saveSocialV2State()，
-            // 而重启这条路径以前直接 process.exit，500ms 窗口内改动的唤醒配置/计数器会丢。
-            try { saveState(); } catch (error) { log('重启前保存会话映射失败:', error?.message ?? error); }
-            try { saveSocialV2State(); } catch (error) { log('重启前保存二代会话状态失败:', error?.message ?? error); }
-            releaseLock();
-            process.exit(0);
-          }, 500);
-          return;
-        }
         sendJson({ ok: false, error: 'not found' }, 404);
       } catch (error) {
         const status = Number(error?.statusCode) || 500;

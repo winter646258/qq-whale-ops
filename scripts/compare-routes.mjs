@@ -27,6 +27,8 @@ const EXPECTED_MOVED = new Set([
   // 阶段4：role-console（人格管理）/ approval
   '/api/pending', '/api/roles', '/api/roles/content', '/api/roles/limit',
   '/api/roles/create', '/api/roles/update', '/api/roles/rename', '/api/roles/delete',
+  // 阶段7：ops（DSH 连接 / 思考强度 / 读取授权 / 重启）
+  '/api/dsh/model', '/api/dsh/effort', '/api/authorize/read', '/api/restart',
   // 阶段5：preset（仿真提示词管理）
   '/api/preset/sim-prompt', '/api/preset/sim-prompt/backups', '/api/preset/sim-prompt/restore',
   // 阶段6：tokens（用量账本）。快照里 /api/tokens/ 是前缀探测产生的合成键。
