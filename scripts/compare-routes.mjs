@@ -50,6 +50,10 @@ const EXPECTED_MOVED = new Set([
   '/api/phone/poll',
   '/api/phone/result',
   '/api/phone/status',
+  // 阶段14：slang（黑话库管理）
+  '/api/slang', '/api/slang/', '/api/slang/clear', '/api/slang/batch-delete',
+  '/api/slang/batch-confirm', '/api/slang/batch-reject', '/api/slang/extract',
+  '/api/slang/research', '/api/slang/config',
 ]);
 // 会随运行时间变化的路由：形状可以比，长度不行。
 const keysOf = (r) => JSON.stringify([r.status, r.shape, r.ok]);
