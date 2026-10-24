@@ -960,7 +960,14 @@ function loadConfig() {
         maxGapMs: 10000,
         gapBaseMs: 800,
         gapPerCharMs: 20,
-        recommendedHint: '普通闲聊建议一次 1~3 条，条间 1~3 秒；讲故事/回忆可以 5~10 秒间隔；不要连续刷屏。'
+        recommendedHint: '普通闲聊建议一次 1~3 条，条间 1~3 秒；讲故事/回忆可以 5~10 秒间隔；不要连续刷屏。',
+        // 每轮都注入的断句硬规则（不只走 qq_get_prompt）。
+        // 2026-10-24 实测：角色卡里那条「断句用半角空格」只有 atMention/nameMention/private
+        // 三类唤醒会注入正文，question/probability/replyCheck/bootstrap 只给「请调用 qq_get_prompt」
+        // 的指针，所以她 40 条样本里仍是 90% 逗号、5% 空格。
+        // recommendedHint 同理——它只出现在 qq_get_prompt 的 recommended.send 里，不进唤醒提示词。
+        // 空字符串 = 关闭这段注入。
+        styleHint: '分句用半角空格，不用逗号串长句；一条消息控制在两句以内。'
       },
       wait: {
         defaultMs: 30000,
@@ -9947,7 +9954,13 @@ async function main() {
     const groupDigestLine = buildGroupDigestLineFor(key);
     // 睡眠整合：4 点后第一次醒来时回顾今天（会落盘记账，当天只念一次）。
     const sleepReviewLine = buildSleepReviewLineFor(key);
-    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine;
+    // MARKER: style-hint
+    // 每轮都念的断句硬规则。放在 base 末尾：紧跟 reason 之外的最后一段，注意力权重最高。
+    // 之所以单独占一段而不并进角色卡：角色卡正文只在部分唤醒里注入，这条必须每轮都在。
+    let styleLine = '';
+    const styleHint = String(cfg.socialV2?.send?.styleHint ?? '').trim();
+    if (styleHint) styleLine = `【断句】${styleHint}\n\n`;
+    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
