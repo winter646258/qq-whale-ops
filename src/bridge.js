@@ -3120,6 +3120,17 @@ async function main() {
   // DSH 可用性探活 + 重启容错队列：
   // DSH 重启期间收到的 QQ 消息先入队（不丢），DSH 恢复后按序补投。
   let dshReady = false;
+  // MARKER: modules-ctx-status
+  // /api/status 的依赖：前五个是「会被重新赋值 / 字段会被就地改写」的状态，
+  // 一律交访问器；readActivityTail 是顶层函数目录里的纯读函数，直接交引用。
+  Object.assign(moduleCtx, {
+    currentMode: () => currentMode,
+    dshReady: () => dshReady,
+    closedAgentPreset: () => closedAgentPreset,
+    socialV2: () => socialV2,
+    readActivityTail: (n) => readActivityTail(n),
+    snowlumaHealthSnapshot: () => snowlumaHealthSnapshot(),
+  });
   let dshCheckStarted = false;
   let snowlumaWatchStarted = false; // SnowLuma 上游健康探测只启动一次（见 startSnowlumaWatch）
   let currentMode = 'chat'; // chat | closed-agent | reserved（仿真模式，由 DSH settings / state/mode.json 驱动）
@@ -4995,42 +5006,6 @@ async function main() {
           } catch {
             res.end('控制台页面缺失：qq-bridge/public/console.html');
           }
-          return;
-        }
-        if (req.method === 'GET' && url.pathname === '/api/status') {
-          const rs = readRoleState();
-          // 带 agent token 的调用来自 QQ 群里的 AI：只能拿到它自己该知道的运行状态。
-          // activity 是**全局**收发摘要（含其它群的发言片段与告警），ownerQQ/白名单属于管理信息，
-          // 都不能给到会话级主体，否则 A 群的 AI 能读到 B 群的内容。
-          // 判定「是不是智能体调用」必须同时看 x-agent-call：无令牌的智能体调用
-          // （旧只读工具的模式探测）不带 x-agent-token，但它同样**绝不能**拿到管理端字段
-          // —— ownerQQ / 白名单 / activity（含其它群的发言片段）是跨群管理信息。
-          // 只认 token 会让这类请求落到下面的完整对象上，等于把 A 群的 AI 变成管理端。
-          if (req.headers['x-agent-token'] || req.headers['x-agent-call'] !== undefined) {
-            sendJson({
-              mode: currentMode,
-              role: rs.role ?? null,
-              roleMode: rs.mode ?? 'active',
-              dshReady,
-              socialV2Paused: socialV2.paused,
-            });
-            return;
-          }
-          sendJson({
-            mode: currentMode,
-            closedAgentPreset,
-            role: rs.role ?? null,
-            roleMode: rs.mode ?? 'active',
-            dshReady,
-            ownerQQ: cfg.ownerQQ ?? null,
-            allowGroups: cfg.allow?.groups ?? [],
-            allowPrivate: cfg.allow?.private ?? [],
-            socialV2Paused: socialV2.paused,
-            // 上游健康只给操作者看：它包含网关诊断信息（good/hint），
-            // 属于管理侧观测，不该进 QQ 会话里那个受限的智能体视图。
-            snowluma: snowlumaHealthSnapshot(),
-            activity: readActivityTail(100)
-          });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/mode') {
