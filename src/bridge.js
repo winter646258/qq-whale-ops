@@ -1514,7 +1514,9 @@ async function main() {
   acquireLock();
   loadState();
 
-  Object.assign(moduleCtx, { cfg, log, stateDir: STATE_DIR });
+  // fs / path 也交出去：模块自己 import 当然也行，但统一走 ctx 之后，
+  // 想换实现（比如换成带沙箱的包装）只有这一个地方要改。
+  Object.assign(moduleCtx, { cfg, log, stateDir: STATE_DIR, fs, path });
   // ── 群聊黑话/网络用语学习（slang） ──────────────────────────────────────
   let slangEntries = [];
   // 读失败时（被占用 / 权限 / JSON 损坏）必须**暂停写入**：否则内存里的空数组

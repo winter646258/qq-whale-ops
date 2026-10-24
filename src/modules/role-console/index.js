@@ -8,6 +8,17 @@
 // 「带 agent token 就拒绝」——与 adminOnlyV2Paths 同一个先例，纵深防御。
 
 /** 带 agent 凭据的请求一律拒绝（控制台专用接口）。返回 true 表示已拦下。 */
+/**
+ * 拒绝智能体调用。返回 true 表示已经响应完毕。
+ *
+ * 口径与 bridge.js 里 image-approval 那处**逐字一致**：只要带了 `x-agent-call`，
+ * 或者 `x-agent-token` 是非空串，就认定是智能体调用。
+ *
+ * 为什么不能只判 `x-agent-token === undefined`：MCP 端在缺令牌时会带
+ * `x-agent-call: 1` + 空串令牌（详见 bridge.js 里 x-agent-call 闸门的注释）。
+ * 只判 undefined 会把这种调用当成控制台，**漏令牌 = 升级成全权**，
+ * 正是那个闸门要堵的 confused deputy。
+ */
 function rejectAgent({ req, sendJson }) {
   if (req.headers['x-agent-call'] !== undefined || String(req.headers['x-agent-token'] ?? '') !== '') {
     sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);

@@ -21,14 +21,38 @@ const routes = [
 ];
 
 /** 拒绝智能体调用。返回 true 表示已经响应完毕。 */
-function rejectAgent(req, sendJson) {
-  if (req.headers['x-agent-token'] === undefined) return false;
-  sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
-  return true;
+/**
+ * 拒绝智能体调用。返回 true 表示已经响应完毕。
+ *
+ * 口径与 bridge.js 里 image-approval 那处**逐字一致**：只要带了 `x-agent-call`，
+ * 或者 `x-agent-token` 是非空串，就认定是智能体调用。
+ *
+ * 为什么不能只判 `x-agent-token === undefined`：MCP 端在缺令牌时会带
+ * `x-agent-call: 1` + 空串令牌（详见 bridge.js 里 x-agent-call 闸门的注释）。
+ * 只判 undefined 会把这种调用当成控制台，**漏令牌 = 升级成全权**，
+ * 正是那个闸门要堵的 confused deputy。
+ */
+/**
+ * 拒绝智能体调用。返回 true 表示已经响应完毕。
+ *
+ * 口径与 bridge.js 里 image-approval 那处**逐字一致**：只要带了 `x-agent-call`，
+ * 或者 `x-agent-token` 是非空串，就认定是智能体调用。
+ *
+ * 为什么不能只判 `x-agent-token === undefined`：MCP 端在缺令牌时会带
+ * `x-agent-call: 1` + 空串令牌（详见 bridge.js 里 x-agent-call 闸门的注释）。
+ * 只判 undefined 会把这种调用当成控制台，**漏令牌 = 升级成全权**，
+ * 正是那个闸门要堵的 confused deputy。
+ */
+function rejectAgent({ req, sendJson }) {
+  if (req.headers['x-agent-call'] !== undefined || String(req.headers['x-agent-token'] ?? '') !== '') {
+    sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
+    return true;
+  }
+  return false;
 }
 
 async function dshModel({ req, sendJson }) {
-  if (rejectAgent(req, sendJson)) return;
+  if (rejectAgent({ req, sendJson })) return;
   const h = this.ctx.dshHelpers;
   const cfg = this.ctx.cfg;
   const provider = String(cfg.dsh?.provider || 'deepseek-official');
@@ -70,7 +94,7 @@ async function dshModel({ req, sendJson }) {
 }
 
 async function dshEffort({ req, sendJson, readBody }) {
-  if (rejectAgent(req, sendJson)) return;
+  if (rejectAgent({ req, sendJson })) return;
   const h = this.ctx.dshHelpers;
   const cfg = this.ctx.cfg;
   const body = await readBody();
@@ -113,7 +137,7 @@ async function authorizeRead({ sendJson, readBody }) {
 }
 
 function restart({ req, sendJson }) {
-  if (rejectAgent(req, sendJson)) return;
+  if (rejectAgent({ req, sendJson })) return;
   const h = this.ctx.dshHelpers;
   sendJson({ ok: true, message: '正在重启桥接（若由守护窗口启动，5 秒后自动恢复）…' });
   setTimeout(() => {
