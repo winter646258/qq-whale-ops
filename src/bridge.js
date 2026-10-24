@@ -4154,6 +4154,18 @@ async function main() {
 
   /** 审批状态的内存缓存。改盘上的 json 不会立刻生效，要重启（踩过一次）。 */
   let imageApprovalCache = null;
+  // MARKER: modules-ctx-social
+  // 阶段18：旧社交引擎（仿真群友模式）搬进 social 模块要用的句柄。
+  // social 是 L9556 的 const 对象（Map 内容可变、引用不变）⇒ 直交；
+  // enterActive/leaveActive/flushSummaries 都声明在注入点之后 ⇒ 只能包箭头。
+  Object.assign(moduleCtx, {
+    social: () => social,
+    socialHelpers: {
+      enterActive: (key) => enterActive(key),
+      leaveActive: (key) => leaveActive(key),
+      flushSummaries: (key) => flushSummaries(key),
+    },
+  });
   // MARKER: modules-ctx-whitelist
   // 阶段17：白名单模块要用的句柄。四个函数都在注入点之前声明（顶层三个 +
   // main 内的 reconcileSessionPolicies），直交引用安全；cfg 是对象，改它的属性
@@ -5212,91 +5224,6 @@ async function main() {
           consoleToken = newToken;
           log(`控制台：访问令牌已${generated ? '重新生成' : '手动修改'}（不记录完整值）`);
           sendJson({ ok: true, token: newToken, generated });
-          return;
-        }
-        // ── 测试发送消息（强制走白名单校验） ───────────────────────────────────
-        if (req.method === 'POST' && url.pathname === '/api/social/state') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          const phase = body.phase;
-          if (phase === 'active') {
-            // 手动进入活跃：相当于第四种触发方式，之后按正常活跃流程跑
-            enterActive(key);
-            log(`控制台：手动将 ${key} 设为活跃`);
-            sendJson({ ok: true, key, phase: 'active' });
-          } else if (phase === 'idle') {
-            leaveActive(key);
-            log(`控制台：手动将 ${key} 设为观望`);
-            sendJson({ ok: true, key, phase: 'idle' });
-          } else {
-            sendJson({ ok: false, error: 'phase 必须是 active 或 idle' }, 400);
-          }
-          return;
-        }
-        // ── 仿真群友模式（社交引擎）配置 ──────────────────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/social') {
-          const stats = {};
-          for (const [k, e] of social.pendingSummaries.entries()) stats[k] = e.items.length;
-          const states = {};
-          const keys = new Set([...social.states.keys(), ...social.recentMessages.keys()]);
-          for (const k of keys) {
-            const st = social.states.get(k);
-            states[k] = { phase: st?.phase ?? 'idle' };
-          }
-          sendJson({ config: cfg.social, pendingSummaries: stats, states });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/social') {
-          const body = await readBody();
-          const configFile = path.join(ROOT, 'config.json');
-          // fail-fast：配置文件损坏时直接 500，绝不回写，避免把整个配置清成只剩 social
-          const file = readConfigObject(configFile);
-          const merged = { ...(file.social ?? {}), ...body };
-          // 新分句逻辑不再使用旧字段：保存时统一清理，避免旧配置残留
-          for (const k of ['burstProbability', 'burstMaxMessages', 'followUpEnabled', 'followUpProbability', 'followUpDelayMinMs', 'followUpDelayMaxMs', 'followUpCooldownMs']) {
-            delete merged[k];
-          }
-          for (const k of ['triggerProbability', 'activeCheckMinMs', 'activeCheckMaxMs', 'activeReplyDelayMinMs', 'activeReplyDelayMaxMs', 'activeDurationMinMs', 'activeDurationMaxMs', 'idleWindowMs', 'idleRetryProbability', 'idleRetryWaitMs', 'proactiveIdleThresholdMs', 'proactiveCheckMinMs', 'proactiveCheckMaxMs', 'proactiveProbability', 'maxReplyChars', 'contextWindow', 'burstIntervalMinMs', 'burstIntervalMaxMs', 'longGapMinMs', 'longGapMaxMs']) {
-            if (merged[k] !== undefined) {
-              const n = Number(merged[k]);
-              if (Number.isFinite(n) && n >= 0) merged[k] = n;
-            }
-          }
-          // 分条间隔 clamp 到非负
-          for (const k of ['burstIntervalMinMs', 'burstIntervalMaxMs', 'longGapMinMs', 'longGapMaxMs']) {
-            if (merged[k] !== undefined) merged[k] = Math.max(0, Number(merged[k]) || 0);
-          }
-          // 概率字段 clamp 到 0~1
-          for (const k of ['triggerProbability', 'idleRetryProbability', 'proactiveProbability', 'skipProbability', 'surrenderProbability', 'longGapProbability']) {
-            if (merged[k] !== undefined) merged[k] = Math.min(1, Math.max(0, Number(merged[k])));
-          }
-          // contextWindow 限制 1~100
-          if (merged.contextWindow !== undefined) {
-            merged.contextWindow = Math.min(100, Math.max(1, Math.round(Number(merged.contextWindow))));
-          }
-          // 布尔字段
-          for (const k of ['activeDurationEnabled', 'proactiveEnabled', 'burstEnabled']) {
-            if (merged[k] !== undefined) merged[k] = Boolean(merged[k]);
-          }
-          // 范围字段保证 min <= max
-          for (const [minK, maxK] of [['activeCheckMinMs', 'activeCheckMaxMs'], ['activeReplyDelayMinMs', 'activeReplyDelayMaxMs'], ['activeDurationMinMs', 'activeDurationMaxMs'], ['proactiveCheckMinMs', 'proactiveCheckMaxMs'], ['burstIntervalMinMs', 'burstIntervalMaxMs'], ['longGapMinMs', 'longGapMaxMs']]) {
-            if (merged[minK] !== undefined && merged[maxK] !== undefined && Number(merged[minK]) > Number(merged[maxK])) {
-              [merged[minK], merged[maxK]] = [merged[maxK], merged[minK]];
-            }
-          }
-          if (Array.isArray(body.mustReplyKeywords)) merged.mustReplyKeywords = body.mustReplyKeywords.map(String);
-          file.social = merged;
-          atomicWriteJson(configFile, file);
-          cfg.social = { ...cfg.social, ...merged };
-          log('控制台：社交配置已更新');
-          sendJson({ ok: true, config: cfg.social });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/social/flush') {
-          const body = await readBody();
-          await flushSummaries(body.key || null);
-          sendJson({ ok: true });
           return;
         }
         // ── 后台控制端引导：向指定会话的 DSH agent 投递提醒 ──────────────────

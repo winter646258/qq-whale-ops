@@ -29,6 +29,8 @@ const EXPECTED_MOVED = new Set([
   '/api/roles/create', '/api/roles/update', '/api/roles/rename', '/api/roles/delete',
   // 阶段7：ops（DSH 连接 / 思考强度 / 读取授权 / 重启）
   '/api/dsh/model', '/api/dsh/effort', '/api/authorize/read', '/api/restart',
+  // 阶段18：social（仿真群友模式配置/手动状态/摘要落盘）
+  '/api/social', '/api/social/flush', '/api/social/state',
   // 阶段17：whitelist（白名单与管理员）
   '/api/whitelist',
   // 阶段16：image（生图 / 审批 / 画像）
