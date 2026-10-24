@@ -4616,6 +4616,12 @@ async function main() {
   const phoneBridge = new PhoneBridge({
     log: (msg) => log(msg)
   });
+  // MARKER: modules-ctx-phone
+  // 浏览器桥：phoneBridge 只建一次（交引用），phoneTokenOk 交闭包。
+  Object.assign(moduleCtx, {
+    phoneBridge,
+    phoneTokenOk: (token) => phoneTokenOk(token),
+  });
 
   let phoneTokenCache = { value: '', mtimeMs: 0 };
 
@@ -7115,56 +7121,6 @@ async function main() {
           return;
         }
 
-        // MARKER: phone-bridge-routes
-        // ── 浏览器桥：扩展来领任务 / 回传结果 / 看状态 ──
-        // 这三个端点**不走 console token**，而是走扩展自己的令牌：
-        // 它们要暴露给浏览器（跨域），不该把管理台令牌摊出去。
-        if (req.method === 'OPTIONS' && url.pathname.startsWith('/api/phone/')) {
-          res.writeHead(204, {
-            'access-control-allow-origin': '*',
-            'access-control-allow-headers': 'content-type, x-phone-token',
-            'access-control-allow-methods': 'POST, GET, OPTIONS',
-            'access-control-max-age': '600'
-          });
-          res.end();
-          return;
-        }
-        if (url.pathname.startsWith('/api/phone/')) {
-          res.setHeader('access-control-allow-origin', '*');
-          res.setHeader('access-control-allow-headers', 'content-type, x-phone-token');
-          res.setHeader('access-control-allow-methods', 'POST, GET, OPTIONS');
-        }
-
-        if (url.pathname === '/api/phone/poll' && req.method === 'POST') {
-          if (!phoneTokenOk(req.headers['x-phone-token'])) {
-            sendJson({ ok: false, error: '令牌无效' }, 401);
-            return;
-          }
-          const task = await phoneBridge.poll();
-          sendJson({ ok: true, task });
-          return;
-        }
-
-        if (url.pathname === '/api/phone/result' && req.method === 'POST') {
-          if (!phoneTokenOk(req.headers['x-phone-token'])) {
-            sendJson({ ok: false, error: '令牌无效' }, 401);
-            return;
-          }
-          // 注意：console server 里没有全局 body —— 每个路由都自己 readBody()。
-          const resultBody = await readBody();
-          const r = phoneBridge.submitResult(resultBody ?? {});
-          sendJson(r, r.ok ? 200 : 400);
-          return;
-        }
-
-        if (url.pathname === '/api/phone/status' && req.method === 'GET') {
-          if (!phoneTokenOk(req.headers['x-phone-token'])) {
-            sendJson({ ok: false, error: '令牌无效' }, 401);
-            return;
-          }
-          sendJson({ ok: true, ...phoneBridge.status() });
-          return;
-        }
 
         // ── 日程 / 画像：角色的短期记忆与长期认识 ──────────────────────────
         // 规格三条原则的落点：

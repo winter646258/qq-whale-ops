@@ -76,7 +76,7 @@ export function createModuleHost({ ctx, log, onError } = {}) {
       }
       if (typeof r.handler !== 'function') return `路由 ${r.path} 缺少 handler`;
       if (r.kind !== 'exact' && r.kind !== 'prefix') return `路由 ${r.path} 的 kind 必须是 exact / prefix`;
-      if (r.method !== undefined && !/^(GET|POST|PUT|DELETE|PATCH)$/.test(r.method)) {
+      if (r.method !== undefined && !/^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)$/.test(r.method)) {
         return `路由 ${r.path} 的 method 非法：${r.method}`;
       }
     }
@@ -136,7 +136,7 @@ export function createModuleHost({ ctx, log, onError } = {}) {
     for (const def of settled) {
       for (const r of def.routes ?? []) {
         routes.push({
-          method: r.method ?? null,
+          method: r.method === undefined ? null : r.method,
           path: r.path,
           kind: r.kind,
           module: def.name,
@@ -149,10 +149,21 @@ export function createModuleHost({ ctx, log, onError } = {}) {
 
     // 前缀路由互相遮蔽检查：/a 与 /a/b 同时存在时，/a 会先吃掉 /a/b。
     // 这不是错误（老代码里就有这种分层），但要显式记下来，免得以后误改顺序。
+    //
+    // 只对 **method 通配** 的前缀报：`OPTIONS /a/` 只吃 OPTIONS，
+    // `GET /a/b` 的 GET 请求根本不会命中去，两者不构成遮蔽。
+    // 浏览器桥的 CORS 预检就是「OPTIONS 前缀 + 三条 exact」这种写法，
+    // 按旧口径会报 6 条假告警，把真问题淹掉。
+    // 判定口径：**只有 method 为空（通配）的前缀才算遮蔽**。
+    // 登记时 `method: r.method ?? null` 会把省略 method 的路由记成 null；
+    // 判定用 `typeof a.method === 'string' && a.method.length > 0` 显式排除带方法的前缀，
+    // 不依赖 `!== null`（`undefined` 会让它失灵，踩过一次）。
     for (const a of routes) {
       if (a.kind !== 'prefix') continue;
+      if (typeof a.method === 'string' && a.method.length > 0) continue;
       for (const b of routes) {
         if (a === b) continue;
+        if (b.kind !== 'exact') continue;
         if (b.path.length > a.path.length && b.path.startsWith(a.path)) {
           problems.push({
             module: a.module, phase: 'route-shadow',
