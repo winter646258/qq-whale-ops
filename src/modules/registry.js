@@ -111,6 +111,17 @@ export function createModuleHost({ ctx, log, onError } = {}) {
     // ── 2. setup ──
     const settled = [];
     for (const def of ready) {
+      // validate 在 load() 第一步就把缺依赖的模块挡掉了，能走到这里的都该是齐的。
+      // 但 modules.set() 发生在 validate 之后、这里之前 —— 中途万一有人动了 ctx
+      // （比如某个模块的 setup 顺手删了键），必须在**启用之前**再确认一次。
+      // 少了这一步，坏模块会以「半死」状态留在 loaded 里：/api/_modules 看上去
+      // 「10 个模块全在」，实际少一个在干活 —— 阶段12 就是这么被瞒过去的。
+      const stillMissing = (def.inject ?? []).filter((k) => k !== 'cfg' && !(k in ctx));
+      if (stillMissing.length) {
+        fail(def, 'inject', `启用前复核发现 ctx 缺少依赖：${stillMissing.join(', ')}`);
+        modules.delete(def.name);
+        continue;
+      }
       try {
         if (typeof def.setup === 'function') await def.setup(ctx);
         settled.push(def);

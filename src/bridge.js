@@ -1840,6 +1840,8 @@ async function main() {
       path,
       listAudioFiles: (dir) => listAudioFiles(dir),
       inspectAudio: (file, opts) => inspectAudio(file, opts),
+      escapeCqText: (value) => escapeCqText(value),
+      text: (value) => text(value),
       describeAudio: (info) => describeAudio(info),
     },
   });
@@ -3120,6 +3122,18 @@ async function main() {
   // DSH 可用性探活 + 重启容错队列：
   // DSH 重启期间收到的 QQ 消息先入队（不丢），DSH 恢复后按序补投。
   let dshReady = false;
+  // MARKER: modules-ctx-test-send
+  // /api/test-send 的依赖：modeAllowed / redactKnownTokensOnly 是本作用域里
+  // 后文才声明的函数，只能写在箭头函数体里（对象字面量位置会触发 TDZ）；
+  // bot 在 L14045 才 new 出来，必须走访问器读实时值。
+  Object.assign(moduleCtx, {
+    allowed: (kind, id, config) => allowed(kind, id, config),
+    modeAllowed: (key, kind, id, config, mode) => modeAllowed(key, kind, id, config, mode),
+    redactKnownTokensOnly: (value) => redactKnownTokensOnly(value),
+    bot: () => bot,
+    SENSITIVE_RE,
+    escapeCqText: (value) => escapeCqText(value),
+  });
   // MARKER: modules-ctx-status
   // /api/status 的依赖：前五个是「会被重新赋值 / 字段会被就地改写」的状态，
   // 一律交访问器；readActivityTail 是顶层函数目录里的纯读函数，直接交引用。
@@ -5416,28 +5430,6 @@ async function main() {
           return;
         }
         // ── 测试发送消息（强制走白名单校验） ───────────────────────────────────
-        if (req.method === 'POST' && url.pathname === '/api/test-send') {
-          const body = await readBody();
-          const kind = body.kind === 'private' ? 'private' : 'group';
-          const id = Number(body.id);
-          const message = String(body.message ?? '').trim();
-          if (!Number.isFinite(id) || id <= 0) { sendJson({ ok: false, error: '目标 id 无效' }, 400); return; }
-          if (!message) { sendJson({ ok: false, error: '消息不能为空' }, 400); return; }
-          if (SENSITIVE_RE.test(message)) { sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403); return; }
-          if (!allowed(kind, id, cfg)) { sendJson({ ok: false, error: `目标不在白名单内（${kind} ${id}），请先加入白名单` }, 403); return; }
-          if (!modeAllowed(`${kind}:${id}`, kind, id, cfg, currentMode)) { sendJson({ ok: false, error: `当前模式（${currentMode}）不允许向 ${kind}:${id} 发送测试消息` }, 403); return; }
-          try {
-            const safeMessage = escapeCqText(redactKnownTokensOnly(message));
-            const result = kind === 'private'
-              ? await bot.sendPrivateMessage(id, text(safeMessage))
-              : await bot.sendGroupMessage(id, text(safeMessage));
-            log(`控制台：测试发送 ${kind}:${id} 成功`);
-            sendJson({ ok: true, kind, id, message_id: result?.message_id ?? result });
-          } catch (error) {
-            sendJson({ ok: false, error: `发送失败: ${error?.message ?? error}` }, 500);
-          }
-          return;
-        }
         if (req.method === 'POST' && url.pathname === '/api/social/state') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();

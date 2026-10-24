@@ -46,6 +46,7 @@ const EXPECTED_MOVED = new Set([
   '/api/socialV2/voices',
   '/api/voice/list',
   '/api/status',
+  '/api/test-send',
 ]);
 // 会随运行时间变化的路由：形状可以比，长度不行。
 const keysOf = (r) => JSON.stringify([r.status, r.shape, r.ok]);
