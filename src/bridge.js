@@ -4829,31 +4829,6 @@ async function main() {
         }
         return;
       }
-      // MARKER: modules-delegate
-      // 功能模块委派（阶段 1）。
-      //
-      // 位置很关键：**在控制台令牌闸门闭合之后**。
-      //
-      // 阶段 8 修正：原先放在 favicon 之后（= 令牌闸门之前），对照黄金快照才发现
-      // `GET /api/stickers` 的 anon 身份从 401 变成了 200 —— 能匿名读到 2179 条表情元数据。
-      // 根因是 /api/stickers 在老 if 链里就位于令牌闸门之后，而模块委派点比它靠前。
-      // 现在挪到闸门之后：模块与老 if 链看到的是同一份「已过令牌校验」的请求。
-      // （原注释写的「favicon 之后 = 全部闸门之后」是错的：favicon 处理在 4636 行左右，
-      //   令牌闸门在 4843 行，两者之间还隔着整个鉴权段。）
-      //
-      // 没命中任何模块路由时返回 "unhandled"，继续走下面的老 if 链，行为零变化。
-      if (moduleHost) {
-        let verdict = 'unhandled';
-        try {
-          verdict = await moduleHost.dispatch(req.method, url.pathname, { req, res, url, sendJson, readBody });
-        } catch (error) {
-          log('[modules] 路由处理失败:', error?.message ?? error);
-          sendJson({ ok: false, error: `模块处理失败：${error?.message ?? error}` }, Number(error?.statusCode) || 500);
-          return;
-        }
-        if (verdict === 'handled') return;
-      }
-
       // 智能体调用隔离（集中关卡）。
       //
       // 背景：控制台令牌是「管理端全权」，会话令牌是「只能动自己这个会话」。MCP 工具进程
@@ -4922,6 +4897,37 @@ async function main() {
           sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
           return;
         }
+      // MARKER: modules-delegate
+      // 功能模块委派（阶段 1）。
+      //
+      // 位置很关键：**在控制台令牌闸门与全部智能体闸门闭合之后**。
+      //
+      // 阶段 8 修正：原先放在 favicon 之后（= 令牌闸门之前），对照黄金快照才发现
+      // `GET /api/stickers` 的 anon 身份从 401 变成了 200 —— 能匿名读到 2179 条表情元数据。
+      // 根因是 /api/stickers 在老 if 链里就位于令牌闸门之后，而模块委派点比它靠前。
+      // 现在挪到闸门之后：模块与老 if 链看到的是同一份「已过令牌校验」的请求。
+      //
+      // 第二次修正（同一天）：令牌闸门之后还有一整段**智能体隔离闸门**（空令牌拒绝、
+      // 暂停/停用、reserved2 模式、adminOnly、表情库仅控制台）。这些是缩进 8 的前缀 if，
+      // 位置本来就比老路由靠前；但委派点如果放在它们中间，模块路由就会跳过它们。
+      // 已实测到「agent token 打在 /api/stickers 上由 403 变 200」。
+      // 所以委派点最终定在**表情库闸门之后、第一条普通业务路由之前**。
+      // （原注释写的「favicon 之后 = 全部闸门之后」是错的：favicon 处理在 4636 行左右，
+      //   令牌闸门在 4843 行，两者之间还隔着整个鉴权段。）
+      //
+      // 没命中任何模块路由时返回 "unhandled"，继续走下面的老 if 链，行为零变化。
+      if (moduleHost) {
+        let verdict = 'unhandled';
+        try {
+          verdict = await moduleHost.dispatch(req.method, url.pathname, { req, res, url, sendJson, readBody });
+        } catch (error) {
+          log('[modules] 路由处理失败:', error?.message ?? error);
+          sendJson({ ok: false, error: `模块处理失败：${error?.message ?? error}` }, Number(error?.statusCode) || 500);
+          return;
+        }
+        if (verdict === 'handled') return;
+      }
+
         // agent token 默认拒绝：MCP 的 v2 工具同时携带 x-console-token 与 x-agent-token，
         // 因此仅靠控制台令牌挡不住 AI。这里改成白名单：只有 AI 真正需要的面放行，
         // 其余（人格/提示词/思考强度/白名单/重启…）一律 403——避免以后新增管理端点时忘记拉黑。
