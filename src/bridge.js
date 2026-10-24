@@ -9621,8 +9621,15 @@ async function main() {
     // 判定下沉到 isDirectedAtOthers：普通段、合并转发、引用原消息、all/陌生人 全扫一遍。
     if (isDirectedAtOthers(event)) return null;
     if (tr.nameMention && selfNickname) {
-      const lower = String(textContent ?? '').toLowerCase();
-      if (lower.includes('@' + selfNickname.toLowerCase()) || lower.includes(selfNickname.toLowerCase())) return 'nameMention';
+      // MARKER: name-mention-plain —— 两个修正，和 keywords 分支对齐：
+      // 1) 用 plainContent 而不是 textContent。textContent 带着「[引用 谁：……]」前缀，
+      //    群友引用「大肥鱼-赵依仙爱吃大白饭」的话时，那个昵称会被当成在叫她（实测群里就有这种）。
+      // 2) 走撞名掩码。有人昵称本身含「大肥鱼」（「超大肥鱼」「大肥鱼-赵依仙爱吃大白饭」），
+      //    正文提到这些名字不该算点名。掩码只挖「含关键词且不等于关键词」的他人昵称，
+      //    完全同名的不挖（纯文本没法区分，那种情况留给 at 段判定）。
+      const nick = selfNickname.toLowerCase();
+      const lowerPlain = maskOtherMemberNamesV2(st, String(plainContent ?? '').toLowerCase(), nick);
+      if (lowerPlain.includes(nick)) return 'nameMention';
     }
     // MARKER: skip-synthetic-keyword —— 只挡关键词，不动 question/speaker/probability。
     // 「[拍一拍] 小鲸鱼 拍了拍 761403447」是 QQ 生成的模板，昵称出现是构造使然，
