@@ -1,3 +1,5 @@
+import { voiceSendRoutes } from './send.js';
+
 // ── 语音库列表：GET /api/socialV2/voices（别名 GET /api/voice/list）────
 //
 // 原来是 if 链里一条 44 行、挂两个路径的 if。它的鉴权是**双通道**，和别的族不一样，
@@ -60,11 +62,17 @@ async function listVoices({ req, url, sendJson }) {
   }
 }
 
-const inject = ['cfg', 'log', 'voiceCfg', 'voiceHelpers', 'agentTokenOk', 'v2SessionAllowed', 'v2ToolEnabled'];
+const inject = [
+  'cfg', 'log', 'voiceCfg', 'voiceHelpers', 'agentTokenOk', 'v2SessionAllowed', 'v2ToolEnabled',
+  // 阶段15：发送通道（send.js）额外要的
+  'path', 'appendActivity', 'voiceSendHelpers',
+];
 
 const routes = [
   { method: 'GET', path: '/api/socialV2/voices', kind: 'exact', handler: listVoices },
   { method: 'GET', path: '/api/voice/list', kind: 'exact', handler: listVoices },
+  // 阶段15：操作者通道的语音发送 + /api/send/voice 别名，见 send.js
+  ...voiceSendRoutes,
 ];
 
-export default { name: 'voice', title: '语音库列表（双通道）', inject, routes };
+export default { name: 'voice', title: '语音库列表 + 操作者发送', inject, routes };

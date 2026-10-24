@@ -1890,6 +1890,30 @@ async function main() {
     };
   }
 
+
+
+
+  // MARKER: modules-ctx-voice-send
+  // 阶段15：语音发送（操作者通道）用到的 main() 内函数。
+  // 它们全部排在 voiceCfg() 之后（resolveVoicePathForOperator@L1998、
+  // voiceBudget*@L2017、sendVoiceV2@L2045、verifyVoiceMessageSent@L2160、modeAllowed@L3265），
+  // 所以注入块必须摆在 voiceCfg() 收尾之后：对象字面量的值位置会立即求值，
+  // 摆前面就撞 TDZ。一律交箭头/闭包，不交快照值。
+  Object.assign(moduleCtx, {
+    voiceSendHelpers: {
+      modeAllowed: (key, kind, id, cfgArg, modeArg) => modeAllowed(key, kind, id, cfgArg, modeArg),
+      currentMode: () => currentMode,
+      resolveVoicePathForOperator: (input) => resolveVoicePathForOperator(input),
+      voiceBudgetCheck: (scopeKey, cfgV) => voiceBudgetCheck(scopeKey, cfgV),
+      voiceBudgetCommit: (scopeKey, at) => voiceBudgetCommit(scopeKey, at),
+      sendVoiceV2: (key, filePath, opts) => sendVoiceV2(key, filePath, opts),
+      verifyVoiceMessageSent: (messageId) => verifyVoiceMessageSent(messageId),
+      // send-voice-lib.js 的纯函数：顶层 import 进来的名字不在 moduleCtx 上，必须显式交。
+      parseTargetKey: (value) => parseTargetKey(value),
+      resolveAudioProcessing: (opts) => resolveAudioProcessing(opts),
+    },
+    appendActivity: (line) => appendActivity(line),
+  });
   function voiceLibrary() {
     const dir = voiceCfg().dir;
     const files = listAudioFiles(dir);
@@ -6553,118 +6577,6 @@ async function main() {
         //
         // 与 /api/send/* 的 agent 通道分开：操作者可能不在任何 QQ 会话里，
         // 所以不套「会话/模式」闸门，但白名单 + 语音限流 + 文件名审计一个都不少。
-        if (req.method === 'POST' && (url.pathname === '/api/voice/send' || url.pathname === '/api/send/voice')) {
-          const body = await readBody();
-          const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
-          const voice = voiceCfg();
-          // 注意：这里是**操作者通道**（CLI / 控制台面板 / 图形界面），由控制台令牌鉴权。
-          // socialV2.voice.enabled 是「AI 能不能发语音」的总闸，不该连你手动试发一起关掉——
-          // 否则"默认不启用"会变成"谁都发不了"，连放音频试一下都做不到。
-          // AI 通道的开关在 /api/socialV2/send-voice 里单独判定。
-          // /api/send/voice 是 AI 工具入口：带 agent token 时一律按 agent 规则走，
-          // 避免 AI 借用操作者通道绕过「只能发自己会话」的限制。
-          if (url.pathname === '/api/send/voice' && agentToken) {
-            sendJson({
-              ok: false,
-              error: 'AI 请改用 /api/socialV2/send-voice（带 key + token）'
-            }, 403);
-            return;
-          }
-          const key = String(body.target ?? body.key ?? '').trim();
-          const parsedTarget = parseTargetKey(key);
-          if (!parsedTarget) { sendJson({ ok: false, error: 'target 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          if (!modeAllowed(key, parsedTarget.kind, Number(parsedTarget.id), cfg, currentMode)) {
-            const a = cfg.allow ?? {};
-            sendJson({
-              ok: false,
-              error: `目标 ${key} 不在白名单内（config.json allow.groups / allow.private：群 ${(a.groups ?? []).join(', ') || '空'}；私聊 ${(a.private ?? []).join(', ') || '空'}）`
-            }, 403);
-            return;
-          }
-          let resolved;
-          try {
-            resolved = resolveVoicePathForOperator(body.file ?? body.path ?? '');
-          } catch (error) {
-            sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
-            return;
-          }
-          // 音量参数先校验（写错了当场告诉你，不要等到发的时候才炸）
-          try {
-            resolveAudioProcessing({
-              volume: body.volume ?? voice.defaultVolume,
-              normalize: body.normalize === true,
-              loudness: body.loudness ?? voice.loudness
-            });
-          } catch (error) {
-            sendJson({ ok: false, error: error.message }, 400);
-            return;
-          }
-          const probe = await inspectAudio(resolved.path, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds });
-          if (!probe.ok) { sendJson({ ok: false, error: probe.error }, 400); return; }
-          const preview = {
-            key,
-            file: resolved.path,
-            via: resolved.via,
-            bytes: probe.size,
-            duration: probe.duration,
-            codec: probe.codec,
-            detail: describeAudio(probe),
-            warnings: probe.warnings ?? [],
-            limits: { maxSeconds: voice.maxSeconds, maxBytes: voice.maxBytes, maxPerMinute: voice.maxPerMinute, maxPerHour: voice.maxPerHour }
-          };
-          if (body.dryRun === true) { sendJson({ ok: true, dryRun: true, ...preview }); return; }
-          const now = Date.now();
-          try {
-            voiceBudgetCheck('operator:cli', voice);
-            const sent = await sendVoiceV2(key, resolved.path, {
-              guard: false,
-              audit: true,
-              audio: {
-                volume: body.volume ?? voice.defaultVolume,
-                normalize: body.normalize === true,
-                loudness: body.loudness ?? voice.loudness
-              }
-            });
-            voiceBudgetCommit('operator:cli', now);
-            log(`[voice] (操作者) ${key} 已发送语音 ${path.basename(resolved.path)} (${sent.detail}${sent.audioMode === 'original' ? '' : '，' + sent.audioProcessing}, messageId=${sent.messageId ?? '?'})`);
-            appendActivity(`${key} [voice] (操作者) 发送语音 ${path.basename(resolved.path)} (${sent.detail})`);
-            // CLI 默认要落地校验（--verify 之外也能给出可信证据）；readback 仅在做"收到的语音"实验时用。
-            const verification = body.verify === false ? null : await verifyVoiceMessageSent(sent.messageId);
-            let readbackText = null;
-            if (body.readback === true && sent.messageId) {
-              try {
-                const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-                const res = await fetch(`${httpUrl}/fetch_ptt_text`, {
-                  method: 'POST',
-                  headers: {
-                    'content-type': 'application/json',
-                    ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
-                  },
-                  body: JSON.stringify({ message_id: String(sent.messageId) }),
-                  signal: AbortSignal.timeout(30000)
-                });
-                const rb = await res.json().catch(() => ({}));
-                if (res.ok && rb.status === 'ok' && rb.retcode === 0) readbackText = rb.data?.text ?? '';
-              } catch (error) {
-                log(`[voice] 转写回读失败：${error?.message ?? error}`);
-              }
-            }
-            sendJson({
-              ok: true,
-              ...preview,
-              messageId: sent.messageId,
-              verified: verification?.confirmed === true,
-              readback: readbackText,
-              audioProcessing: sent.audioProcessing,
-              volume: sent.volume,
-              loudness: sent.loudness
-            });
-          } catch (error) {
-            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
-          }
-          return;
-        }
-
         // ── 情绪：此刻的心情、长期底色、压着没说的事 ────────────────────────
         // 数值（PAD 三点 + 好感度）只用来算衰减和阈值，对外一律给模糊文本 ——
         // 她自己看到的是「【此刻】有点烦 · 因为xxx」，不是 pleasure=-0.4。
