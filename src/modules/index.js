@@ -22,6 +22,7 @@ import approval from './approval/index.js';
 import preset from './preset/index.js';
 import tokens from './tokens/index.js';
 import ops from './ops/index.js';
+import stickerConsole from './sticker-console/index.js';
 
 /**
  * @param {object} ctx 由 `bridge.js` 组装的上下文（cfg / log / stateDir / api / 若干纯函数）
@@ -35,6 +36,7 @@ export function defineModules(_ctx) {
     preset,
     tokens,
     ops,
+    stickerConsole,
   ];
 }
 

@@ -1641,6 +1641,19 @@ async function main() {
     log(`⚠️ 表情库读取失败，已降级为「只读不写」（不会覆盖原文件）：${error?.message ?? error}`);
   }
   let stickerSyncedAt = 0; // 上次从 SnowLuma 拉取收藏表情的时间戳（毫秒）
+  // MARKER: modules-ctx-stickers
+  // 表情库：stickerEntries / stickerSyncedAt 会被 syncStickerLibrary 整体换成新数组，
+  // 所以只交访问器；三个改动函数是 main() 内的声明，包一层即可保持原闭包。
+  Object.assign(moduleCtx, {
+    stickerHelpers: {
+      entries: () => stickerEntries,
+      syncedAt: () => stickerSyncedAt,
+      syncStickerLibrary,
+      formatStickerList,
+      applyStickerNoteV2,
+      setStickerRemarkV2,
+    },
+  });
   let lastForcedAgentStickerSync = 0; // AI 强制刷新表情库的最小间隔保护
 
   function stickerEnabled() {
@@ -4759,26 +4772,6 @@ async function main() {
         return;
       }
 
-      // MARKER: modules-delegate
-      // 功能模块委派（阶段 1）。
-      //
-      // 位置很关键：在 favicon 之后、**第一条业务路由之前**。favicon 之后意味着它已经
-      // 落在全部集中闸门（Host、令牌、智能体隔离）之后 —— 模块没有绕开鉴权的机会，
-      // 它们和后面的 if 链看到的是同一份已经过审的请求。
-      //
-      // 没命中任何模块路由时返回 "unhandled"，继续走下面的老 if 链，行为零变化。
-      if (moduleHost) {
-        let verdict = 'unhandled';
-        try {
-          verdict = await moduleHost.dispatch(req.method, url.pathname, { req, res, url, sendJson, readBody });
-        } catch (error) {
-          log('[modules] 路由处理失败:', error?.message ?? error);
-          sendJson({ ok: false, error: `模块处理失败：${error?.message ?? error}` }, Number(error?.statusCode) || 500);
-          return;
-        }
-        if (verdict === 'handled') return;
-      }
-
       // MARKER: modules-diagnostics
       // 模块诊断端点（只读）。只回「装了什么、有没有问题」，不含令牌、聊天内容或文件路径。
       // 故意的取舍：放在 Host 校验之后（DNS rebinding 那层仍然有效），但放在令牌校验之前 ——
@@ -4836,6 +4829,31 @@ async function main() {
         }
         return;
       }
+      // MARKER: modules-delegate
+      // 功能模块委派（阶段 1）。
+      //
+      // 位置很关键：**在控制台令牌闸门闭合之后**。
+      //
+      // 阶段 8 修正：原先放在 favicon 之后（= 令牌闸门之前），对照黄金快照才发现
+      // `GET /api/stickers` 的 anon 身份从 401 变成了 200 —— 能匿名读到 2179 条表情元数据。
+      // 根因是 /api/stickers 在老 if 链里就位于令牌闸门之后，而模块委派点比它靠前。
+      // 现在挪到闸门之后：模块与老 if 链看到的是同一份「已过令牌校验」的请求。
+      // （原注释写的「favicon 之后 = 全部闸门之后」是错的：favicon 处理在 4636 行左右，
+      //   令牌闸门在 4843 行，两者之间还隔着整个鉴权段。）
+      //
+      // 没命中任何模块路由时返回 "unhandled"，继续走下面的老 if 链，行为零变化。
+      if (moduleHost) {
+        let verdict = 'unhandled';
+        try {
+          verdict = await moduleHost.dispatch(req.method, url.pathname, { req, res, url, sendJson, readBody });
+        } catch (error) {
+          log('[modules] 路由处理失败:', error?.message ?? error);
+          sendJson({ ok: false, error: `模块处理失败：${error?.message ?? error}` }, Number(error?.statusCode) || 500);
+          return;
+        }
+        if (verdict === 'handled') return;
+      }
+
       // 智能体调用隔离（集中关卡）。
       //
       // 背景：控制台令牌是「管理端全权」，会话令牌是「只能动自己这个会话」。MCP 工具进程
@@ -7869,53 +7887,6 @@ async function main() {
           return;
         }
         // 管理端表情库接口（控制台）
-        if (req.method === 'GET' && url.pathname === '/api/stickers') {
-          const query = String(url.searchParams.get('query') ?? '').trim();
-          const maxCount = Math.max(1, Number(cfg.socialV2?.sticker?.maxListCount) || 100);
-          const count = Math.min(500, Math.max(1, Math.min(Number(url.searchParams.get('count')) || 48, maxCount)));
-          // GET 不再触发强制同步（写副作用不能挂在读接口上）：请用 POST /api/stickers/sync。
-          try {
-            const synced = await syncStickerLibrary(false);
-            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
-            sendJson({ ok: true, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
-          } catch (error) {
-            sendJson({ ok: false, error: `获取表情失败：${error?.message ?? error}` }, 500);
-          }
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/stickers/sync') {
-          try {
-            const synced = await syncStickerLibrary(true);
-            sendJson({ ok: true, total: synced?.entries?.length ?? stickerEntries.length, syncedAt: synced?.syncedAt ?? stickerSyncedAt });
-          } catch (error) {
-            sendJson({ ok: false, error: `同步表情失败：${error?.message ?? error}` }, 500);
-          }
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/stickers/note') {
-          const body = await readBody();
-          const stickerId = String(body.stickerId ?? '').trim();
-          const note = body.note !== undefined && body.note !== null ? String(body.note).trim().slice(0, 200) : undefined;
-          const tags = body.tags !== undefined && body.tags !== null ? (Array.isArray(body.tags) ? body.tags.map(String).map((s) => s.trim()).filter(Boolean).slice(0, 20) : []) : undefined;
-          const usage = body.usage !== undefined && body.usage !== null ? String(body.usage).trim().slice(0, 200) : undefined;
-          if (!stickerId) { sendJson({ ok: false, error: 'stickerId 不能为空' }, 400); return; }
-          const entry = applyStickerNoteV2(stickerId, note, tags, usage);
-          if (!entry) { sendJson({ ok: false, error: `找不到表情 ${stickerId}` }, 404); return; }
-          sendJson({ ok: true, sticker: entry });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/stickers/remark') {
-          const body = await readBody();
-          const stickerId = String(body.stickerId ?? '').trim();
-          if (!stickerId) { sendJson({ ok: false, error: 'stickerId 不能为空' }, 400); return; }
-          try {
-            const entry = await setStickerRemarkV2(stickerId, String(body.remark ?? ''));
-            sendJson({ ok: true, sticker: entry });
-          } catch (error) {
-            sendJson({ ok: false, error: `修改备注失败：${error?.message ?? error}` }, 500);
-          }
-          return;
-        }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/wait') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
