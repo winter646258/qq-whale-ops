@@ -29,6 +29,9 @@ const EXPECTED_MOVED = new Set([
   '/api/roles/create', '/api/roles/update', '/api/roles/rename', '/api/roles/delete',
   // 阶段7：ops（DSH 连接 / 思考强度 / 读取授权 / 重启）
   '/api/dsh/model', '/api/dsh/effort', '/api/authorize/read', '/api/restart',
+  // 阶段20：inspect（工具日志/反馈/我的最近/活跃成员 6 条）
+  '/api/socialV2/tool-log', '/api/socialV2/tool-log/clear', '/api/socialV2/feedback',
+  '/api/socialV2/feedback-clear', '/api/socialV2/my-recent', '/api/socialV2/active-members',
   // 阶段19：memory（记忆读写 5 条）
   '/api/socialV2/memory', '/api/socialV2/memory-append', '/api/socialV2/memory-update',
   '/api/socialV2/memory-remove', '/api/socialV2/memory-clear',

@@ -4154,6 +4154,16 @@ async function main() {
 
   /** 审批状态的内存缓存。改盘上的 json 不会立刻生效，要重启（踩过一次）。 */
   let imageApprovalCache = null;
+  // MARKER: modules-ctx-inspect
+  // 阶段20：巡检小族的句柄。getSocialV2State / readThroughSeqV2 声明在注入点之后 ⇒ 包箭头。
+  Object.assign(moduleCtx, {
+    readToolLog: (limit) => readToolLog(limit),
+    readFeedbackEntries: () => readFeedbackEntries(),
+    toolLogFile: TOOL_LOG_FILE,
+    feedbackFile: FEEDBACK_FILE,
+    getSocialV2State: (key) => getSocialV2State(key),
+    readThroughSeqV2: (st) => readThroughSeqV2(st),
+  });
   // MARKER: modules-ctx-memory
   // 阶段19：记忆读写模块要用的句柄。五个函数全部声明在注入点之后 ⇒ 只能包箭头，
   // 绝不能直接放进对象字面量的值位置（那会立即求值并撞上 TDZ）。
@@ -7357,30 +7367,7 @@ async function main() {
         // QQ 侧 AI 是放行的（见上方 agentAllowed 白名单），而跨群花费属于管理信息，
         // 不应让某个群里的 AI 读到别的群烧了多少钱。这里再显式拒绝一次做双保险。
         // ── 工具调用日志 ─────────────────────────────────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/tool-log') {
-          const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200));
-          sendJson({ ok: true, entries: readToolLog(limit) });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/tool-log/clear') {
-          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
-          try { fs.writeFileSync(TOOL_LOG_FILE, '', 'utf8'); } catch {}
-          log('控制台：工具调用日志已清空');
-          sendJson({ ok: true });
-          return;
-        }
         // ── 反馈 / 自己消息 / 消息详情 / 活跃成员 ────────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/feedback') {
-          sendJson({ ok: true, entries: readFeedbackEntries() });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/feedback-clear') {
-          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
-          atomicWriteJson(FEEDBACK_FILE, []);
-          log('控制台：清空 AI 反馈');
-          sendJson({ ok: true });
-          return;
-        }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/feedback') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
@@ -7410,18 +7397,6 @@ async function main() {
             log(`[reserved2] 错误级反馈，可通知 owner ${cfg.ownerQQ}（当前仅记录日志）`);
           }
           sendJson({ ok: true, key, level, message });
-          return;
-        }
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/my-recent') {
-          const key = String(url.searchParams.get('key') ?? '').trim();
-          const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit')) || 10));
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getMyRecent')) { sendJson({ ok: false, error: '工具未启用：qq_get_my_recent_messages' }, 403); return; }
-          const st = getSocialV2State(key);
-          const mine = st.recentMessages.filter((m) => m.isSelf).slice(-limit);
-          sendJson({ ok: true, key, messages: mine, readThroughSeq: readThroughSeqV2(st) });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/record-sent') {
@@ -7589,30 +7564,6 @@ async function main() {
             log(`转发媒体读取失败 ${key}:`, error?.message ?? error);
             sendJson({ ok: false, error: `转发媒体读取失败：${error?.message ?? error}` }, 500);
           }
-          return;
-        }
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/active-members') {
-          const key = String(url.searchParams.get('key') ?? '').trim();
-          const limit = Math.min(20, Math.max(1, Number(url.searchParams.get('limit')) || 10));
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getActiveMembers')) { sendJson({ ok: false, error: '工具未启用：qq_get_active_members' }, 403); return; }
-          const st = getSocialV2State(key);
-          const map = new Map();
-          for (const m of st.recentMessages) {
-            if (!m || m.isSelf) continue;
-            const uid = m.userId ? String(m.userId) : '';
-            const key2 = uid || String(m.sender || '未知');
-            const cur = map.get(key2) || { sender: m.sender || key2, userId: uid || undefined, count: 0, lastTime: 0, isOwner: !!m.isOwner };
-            if (!cur.userId && uid) cur.userId = uid;
-            cur.count += 1;
-            if (m.time > cur.lastTime) cur.lastTime = m.time;
-            if (m.isOwner) cur.isOwner = true;
-            map.set(key2, cur);
-          }
-          const members = [...map.values()].sort((a, b) => b.count - a.count || b.lastTime - a.lastTime).slice(0, limit);
-          sendJson({ ok: true, key, members });
           return;
         }
         // MARKER: bili-route
