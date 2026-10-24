@@ -68,6 +68,8 @@ const EXPECTED_MOVED = new Set([
   '/api/slang/research', '/api/slang/config',
   // 阶段15：voice（操作者发送通道 + 别名）
   '/api/voice/send', '/api/send/voice',
+  '/api/session/reset',
+  '/api/workspace/reset',
 ]);
 // 会随运行时间变化的路由：形状可以比，长度不行。
 const keysOf = (r) => JSON.stringify([r.status, r.shape, r.ok]);

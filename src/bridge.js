@@ -4222,6 +4222,53 @@ async function main() {
       ttlMs: () => IMAGE_APPROVAL_TTL_MS,
     },
   });
+
+  // MARKER: modules-ctx-reset
+  // 阶段21：清除上下文 / 清空工作区。声明在注入点之前的直接交引用；
+  // 声明在其之后的（sessionEpoch / pending / 各种 Map / 函数）一律包箭头或访问器，
+  // 绝不能把晚期名字放进对象字面量的值位置 —— 那会立即求值并撞 TDZ。
+  Object.assign(moduleCtx, {
+    unwrap,
+    ACTIVITY_LOG,
+    CONVERSATION_TOKENS,
+    KNOWN_AGENT_TOKENS,
+    forgetAgentToken,
+    saveState,
+    slangWindows,
+    slangExtractionCooldowns,
+    slangSubmitTimes,
+    pendingWakeKeys,
+    wakeConfigUpdatedKeys,
+    markReadCalledKeys,
+    wakeConfigMissCount,
+    collectors,
+    sendToolSucceededSessions,
+    v2TurnStartAt,
+    toolCallNames,
+    pendingSendToolCalls,
+    reverse,
+    sessionPromises,
+    queued,
+    queuedHintAt,
+    resetHelpers: {
+      getState: () => state,
+      bumpEpoch: () => { sessionEpoch += 1; },
+      pending: () => pending,
+      modelAppliedSessions: () => modelAppliedSessions,
+      social: () => social,
+      socialV2: () => socialV2,
+      messageMediaStore: () => messageMediaStore,
+      seenForwardIds: () => seenForwardIds,
+      saveSocialV2State: () => saveSocialV2State(),
+      cancelSocialTimers: (key) => cancelSocialTimers(key),
+      cancelAllSocialTimers: () => cancelAllSocialTimers(),
+      clearSocialV2Timers: (key) => clearSocialV2Timers(key),
+      clearAllSocialV2Timers: () => clearAllSocialV2Timers(),
+      drainPromptQueue: (key, msg) => drainPromptQueue(key, msg),
+      drainAllPromptQueues: (msg) => drainAllPromptQueues(msg),
+      cancelPendingEntry: (entry) => cancelPendingEntry(entry),
+    },
+  });
   // 好友昵称表（号码 -> 昵称），由 refreshFriends 填。不落盘。
   const friendNames = new Map();
   const IMAGE_APPROVAL_AUDIT_FILE = path.join(STATE_DIR, 'image-approval-audit.jsonl');
@@ -8239,128 +8286,6 @@ async function main() {
             saveSocialV2State();
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
-          return;
-        }
-        // ── 清除上下文 / 清空工作区 ──────────────────────────────────────────
-        if (req.method === 'POST' && url.pathname === '/api/session/reset') {
-          const body = await readBody();
-          const key = String(body.key ?? '');
-          if (!key || !state.sessions[key]) { sendJson({ ok: false, error: '会话不存在' }, 404); return; }
-          sessionEpoch++;
-          const oldSessionId = state.sessions[key];
-          delete state.sessions[key];
-          modelAppliedSessions.delete(oldSessionId);
-          // 权限元数据必须与映射一起删除，否则会永久残留在 sessions.json 里。
-          delete state.sessionPolicies[key];
-          reverse.delete(oldSessionId);
-          collectors.delete(oldSessionId);
-          sendToolSucceededSessions.delete(oldSessionId);
-          pendingSendToolCalls.delete(oldSessionId);
-          v2TurnStartAt.delete(oldSessionId);
-          toolCallNames.delete(oldSessionId);
-          const pe = pending.get(key);
-          if (pe) {
-            clearTimeout(pe.timer);
-            cancelPendingEntry(pe).catch(() => {});
-          }
-          pending.delete(key);
-          queued.delete(key);
-          queuedHintAt.delete(key);
-          sessionPromises.delete(key);
-          drainPromptQueue(key, '会话已重置');
-          social.recentMessages.delete(key);
-          messageMediaStore.delete(key);
-          social.pendingSummaries.delete(key);
-          social.states.delete(key);
-          social.silentContext.delete(key);
-          social.silentTurns.delete(oldSessionId);
-          social.exitingSessions.delete(oldSessionId);
-          slangWindows.delete(key);
-          slangExtractionCooldowns.delete(key);
-          slangSubmitTimes.delete(key);
-          cancelSocialTimers(key);
-          clearSocialV2Timers(key);
-          pendingWakeKeys.delete(key);
-          wakeConfigUpdatedKeys.delete(key);
-          markReadCalledKeys.delete(key);
-          wakeConfigMissCount.delete(key);
-          forgetAgentToken(key);
-          socialV2.conversations.delete(key);
-          seenForwardIds.delete(key);
-          saveSocialV2State();
-          saveState();
-          // 归档只隐藏会话，不终止 DSH 侧排队的工作；先清队列并取消当前回合。
-          try { await api.stopSessionWork(oldSessionId); }
-          catch (error) { log(`⚠️ 停止旧会话失败 ${key}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
-          try { await api.workspace.archiveSession({ sessionId: oldSessionId }); } catch {}
-          log(`控制台：已清除会话上下文 ${key}（旧会话 ${oldSessionId} 已停止并归档）`);
-          sendJson({ ok: true, key, archived: oldSessionId });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/workspace/reset') {
-          sessionEpoch++;
-          let archivedCount = 0;
-          let stoppedCount = 0;
-          try {
-            // 新版 DSH 不再提供 workspace.list；改为扫描本桥接创建的会话目录并归档。
-            // 只处理 cwd 位于 qq-bridge state/ 下的根会话；子代理会话由父会话管理，不能误归档。
-            const list = unwrap(await api.sessions.list({}), 'session.list');
-            const stateDir = path.resolve(STATE_DIR);
-            const statePrefix = path.normalize(stateDir + path.sep);
-            const normPath = (p) => path.normalize(String(p ?? '').replace(/\//g, path.sep));
-            const isUnderState = (cwd) => process.platform === 'win32'
-              ? cwd.toLowerCase().startsWith(statePrefix.toLowerCase())
-              : cwd.startsWith(statePrefix);
-            for (const item of list.items ?? []) {
-              if (item.origin === 'subagent' || item.parentSessionId) continue;
-              const cwd = normPath(item.cwd);
-              if (isUnderState(cwd)) {
-                // 归档只隐藏会话；必须先把 DSH 侧排队的工作清掉并取消当前回合。
-                try { await api.stopSessionWork(item.sessionId); stoppedCount += 1; }
-                catch (error) { log(`⚠️ 停止旧会话失败 ${item.sessionId}：${error?.message ?? error}；请在 DSH 检查旧任务`); }
-                try { await api.workspace.archiveSession({ sessionId: item.sessionId }); archivedCount += 1; } catch {}
-              }
-            }
-          } catch {}
-          for (const entry of pending.values()) {
-            clearTimeout(entry.timer);
-            cancelPendingEntry(entry).catch(() => {});
-          }
-          pending.clear();
-          queued.clear();
-          queuedHintAt.clear();
-          sessionPromises.clear();
-          drainAllPromptQueues('工作区已清空');
-          social.states.clear();
-          social.recentMessages.clear();
-          messageMediaStore.clear();
-          seenForwardIds.clear();
-          social.pendingSummaries.clear();
-          social.silentContext.clear();
-          social.silentTurns.clear();
-          social.exitingSessions.clear();
-          slangWindows.clear();
-          slangExtractionCooldowns.clear();
-          slangSubmitTimes.clear();
-          cancelAllSocialTimers();
-          clearAllSocialV2Timers();
-          // 清空工作区 = 所有会话连同 token 一起作废，两张表整体清掉（比逐会话摘除更不容易漏）。
-          socialV2.conversations.clear();
-          CONVERSATION_TOKENS.clear();
-          KNOWN_AGENT_TOKENS.clear();
-          saveSocialV2State();
-          state.sessions = {};
-          state.sessionPolicies = {};
-          reverse.clear();
-          collectors.clear();
-          sendToolSucceededSessions.clear();
-          pendingSendToolCalls.clear();
-          v2TurnStartAt.clear();
-          toolCallNames.clear();
-          saveState();
-          try { fs.writeFileSync(ACTIVITY_LOG, ''); } catch {}
-          log(`控制台：已清空 QQ 聊天工作区（停止 ${stoppedCount} 个、归档 ${archivedCount} 个会话，映射与活动日志已清空）`);
-          sendJson({ ok: true, archivedCount, stoppedCount });
           return;
         }
         // ── 重启桥接（守护模式下 5 秒后自动拉起） ──────────────────────────────
