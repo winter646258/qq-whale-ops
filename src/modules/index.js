@@ -24,6 +24,7 @@ import tokens from './tokens/index.js';
 import ops from './ops/index.js';
 import stickerConsole from './sticker-console/index.js';
 import sticker from './sticker/index.js';
+import voice from './voice/index.js';
 
 /**
  * @param {object} ctx 由 `bridge.js` 组装的上下文（cfg / log / stateDir / api / 若干纯函数）
@@ -39,6 +40,7 @@ export function defineModules(_ctx) {
     ops,
     stickerConsole,
     sticker,
+    voice,
   ];
 }
 
