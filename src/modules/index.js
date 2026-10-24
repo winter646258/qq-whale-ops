@@ -1,3 +1,4 @@
+import biliModule from './bili/index.js';
 // 功能模块清单。
 //
 // 这个文件是**唯一的接入点**：`bridge.js` 只认 `defineModules(ctx)` 的返回值，
@@ -75,6 +76,7 @@ export function defineModules(_ctx) {
     share,
     aiExtras,
     coreModule,
+    biliModule,
   ];
 }
 

@@ -5016,6 +5016,18 @@ async function main() {
     return biliClientCache;
   }
 
+// MARKER: modules-ctx-bili
+  // B 站浏览模块用的句柄。biliClient 懒建一次后复用（内部持有唯一的 PhoneBridge 订阅），
+  // 所以交工厂而不是交实例 —— 注入这一刻它还是 null。
+  Object.assign(moduleCtx, {
+    biliHelpers: {
+      biliClient: () => biliClient(),
+      phoneOnline: () => phoneOnline(),
+      describePhoneOffline,
+      describeBiliResult,
+    },
+  });
+
   /** 给别的模块用：现在能不能刷站（扩展在线吗）。 */
   function phoneOnline() {
     return phoneBridge.isOnline();
@@ -5504,95 +5516,6 @@ async function main() {
         // 桥接只负责排队、等结果、把 JSON 掰成人话。
         //
         // 只读：四个 action 全是 GET，没有点赞/投币/收藏/评论/发弹幕的代码路径。
-        if (url.pathname === '/api/socialV2/bili' && req.method === 'POST') {
-          try {
-            const body = await readBody();
-            const key = String(body.key ?? '').trim();
-            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-
-            const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
-            if (agentToken && !agentTokenOk(key, agentToken)) {
-              sendJson({ ok: false, error: 'agent token 无效' }, 403);
-              return;
-            }
-            if (agentToken && !v2SessionAllowed(key)) {
-              sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
-              return;
-            }
-            if (agentToken && !v2ToolEnabled('bili')) {
-              sendJson({ ok: false, error: '工具未启用：bili' }, 403);
-              return;
-            }
-            if (cfg.socialV2?.bili?.enabled === false) {
-              sendJson({ ok: false, error: 'B 站浏览已在配置里关闭（socialV2.bili.enabled=false）' }, 403);
-              return;
-            }
-
-            const action = String(body.action ?? '').trim();
-            if (!['recommend', 'video', 'comments', 'search'].includes(action)) {
-              sendJson({ ok: false, error: 'action 必须是 recommend / video / comments / search' }, 400);
-              return;
-            }
-
-            // 参数校验要排在「桥在不在线」之前：扩展没开的时候，
-            // 也应当能看出是自己把 action/keyword 写错了，而不是一句「离线」盖掉。
-            if (action === 'search' && !String(body.keyword ?? '').trim()) {
-              sendJson({ ok: false, error: '搜索要带 keyword' }, 400);
-              return;
-            }
-            if ((action === 'video' || action === 'comments') && !String(body.bvid ?? '').trim() && !body.aid) {
-              sendJson({ ok: false, error: action + ' 要带 bvid（评论也可以直接给 aid）' }, 400);
-              return;
-            }
-
-            // 桥不在线就说清楚原因，别让模型以为 B 站挂了、然后反复重试。
-            if (!phoneOnline()) {
-              sendJson({ ok: false, error: describePhoneOffline(), offline: true }, 503);
-              return;
-            }
-
-            const limit = Math.min(30, Math.max(1, Number(body.limit) || 10));
-            const client = biliClient();
-            let data;
-            let text;
-            if (action === 'recommend') {
-              data = await client.recommend(limit);
-              text = describeBiliResult('recommend', data);
-            } else if (action === 'video') {
-              data = await client.videoDetail(body.bvid);
-              text = describeBiliResult('video', data);
-            } else if (action === 'comments') {
-              // 只给了 bvid 时要先换出 aid：/x/v2/reply 只认 aid（数字），
-              // 传 undefined 会被 B 站当非法参数。详情接口在本机 IP 上会被 -412 挡，
-              // 但 /x/web-interface/view 换成 aid 这条路在正常网络（扩展端）是通的。
-              let aid = Number(body.aid) || 0;
-              if (!aid) {
-                if (!String(body.bvid ?? '').trim()) {
-                  sendJson({ ok: false, error: '评论要看哪个视频？给 bvid 或 aid' }, 400);
-                  return;
-                }
-                const detail = await client.videoDetail(body.bvid);
-                aid = Number(detail?.aid) || 0;
-                if (!aid) {
-                  sendJson({ ok: false, error: '拿不到这个视频的 aid，换个 BV 号试试' }, 502);
-                  return;
-                }
-              }
-              data = await client.comments(aid, { ps: limit });
-              text = describeBiliResult('comments', data);
-            } else {
-              const kw = String(body.keyword ?? '').trim();
-              data = await client.search(kw, { page: 1, ps: limit });
-              text = describeBiliResult('search', { list: data, keyword: kw });
-            }
-
-            sendJson({ ok: true, action, text, data });
-          } catch (error) {
-            sendJson({ ok: false, error: 'B 站查询失败：' + (error?.message ?? error) }, 500);
-          }
-          return;
-        }
-
         // MARKER: share-signal-route
         // 主动报告（MCP qq_share_signal / qq_set_report_policy 走这里）。
         //   action=signal  角色在群里判断「这事值得跟主人说」→ 写一条待报信号

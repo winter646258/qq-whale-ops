@@ -76,6 +76,8 @@ const EXPECTED_MOVED = new Set([
   '/api/socialV2/record-sent', '/api/socialV2/schedule', '/api/socialV2/send-burst',
   '/api/socialV2/send-message', '/api/socialV2/send-poke', '/api/socialV2/send-sticker',
   '/api/socialV2/send-voice', '/api/socialV2/wait',
+  // 阶段28：bili（B 站浏览）
+  '/api/socialV2/bili',
   // 阶段14：slang（黑话库管理）
   '/api/slang', '/api/slang/', '/api/slang/clear', '/api/slang/batch-delete',
   '/api/slang/batch-confirm', '/api/slang/batch-reject', '/api/slang/extract',
