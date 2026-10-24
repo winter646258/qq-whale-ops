@@ -4269,6 +4269,33 @@ async function main() {
       cancelPendingEntry: (entry) => cancelPendingEntry(entry),
     },
   });
+  // MARKER: modules-ctx-console
+  // 阶段22：console 族句柄。
+  Object.assign(moduleCtx, {
+    crypto, readConfigObject, atomicWriteJson, atomicWriteText, readRoleState,
+    getSocialV2State: (key) => getSocialV2State(key),
+    deliverPrompt: (key, text, opts) => deliverPrompt(key, text, opts),
+    appendActivity: (line) => appendActivity(line),
+    ensureSession: (key) => ensureSession(key),
+    modeAllowed: (key, kind, id, c, mode) => modeAllowed(key, kind, id, c, mode),
+    allowed: (kind, id, c) => allowed(kind, id, c),
+    helpers: {
+      state: () => state,
+      social: () => social,
+    },
+    dshReady: () => dshReady,
+    currentMode: () => currentMode,
+  });
+  // MARKER: modules-ctx-message-image
+  // 阶段22：消息图片族句柄。前四个在 startConsoleServer() 里，后两个声明于 main() 中段 —— 全部包箭头。
+  Object.assign(moduleCtx, {
+    currentMode: () => currentMode,
+    agentTokenOk: (key, token) => agentTokenOk(key, token),
+    v2ToolEnabled: (flag) => v2ToolEnabled(flag),
+    modeAllowed: (key, kind, id, c, mode) => modeAllowed(key, kind, id, c, mode),
+    findMessageMedia: (key, messageId) => findMessageMedia(key, messageId),
+    fetchMediaData: (media) => fetchMediaData(media),
+  });
   // 好友昵称表（号码 -> 昵称），由 refreshFriends 填。不落盘。
   const friendNames = new Map();
   const IMAGE_APPROVAL_AUDIT_FILE = path.join(STATE_DIR, 'image-approval-audit.jsonl');
@@ -4876,6 +4903,9 @@ async function main() {
     const configuredToken = String(cfg.consoleToken ?? '').trim();
     const tokenValid = configuredToken.length >= 16 && configuredToken.length <= 128 && /^[A-Za-z0-9_-]+$/.test(configuredToken);
     let consoleToken = tokenValid ? configuredToken : loadOrCreateConsoleToken();
+  // MARKER: modules-ctx-console-token
+  // consoleToken 是本函数的局部 let，模块改令牌后必须靠这个句柄写回。
+  Object.assign(moduleCtx, { consoleTokenSet: (value) => { consoleToken = value; } });
     // 令牌必须非空才继续。下面鉴权处原来的写法是「令牌为空 ⇒ return true（放行）」，
     // 注释写着"启动时已自动生成并持久化"—— 等于承认那一行不可达，可它是一条**失败开放**的分支：
     // 一旦真的空了（写盘异常被吞、以后新增"关闭鉴权"之类的配置），控制台上那些
@@ -5262,107 +5292,6 @@ async function main() {
 
         // ── 安全拦截通知设置 ─────────────────────────────────────────────────
         // ── 控制台访问令牌（可手动修改/生成随机） ─────────────────────────────
-        if (req.method === 'POST' && url.pathname === '/api/console/token') {
-          const body = await readBody();
-          let newToken = String(body.token ?? '').trim();
-          const generated = !newToken;
-          if (generated) {
-            newToken = crypto.randomBytes(24).toString('hex');
-          }
-          if (newToken.length < 16) {
-            sendJson({ ok: false, error: '控制台访问令牌至少需要 16 位；留空可生成随机令牌' }, 400);
-            return;
-          }
-          if (newToken.length > 128) {
-            sendJson({ ok: false, error: '控制台访问令牌不能超过 128 位' }, 400);
-            return;
-          }
-          if (!/^[A-Za-z0-9_-]+$/.test(newToken)) {
-            sendJson({ ok: false, error: '控制台访问令牌只能包含字母、数字、下划线或短横线' }, 400);
-            return;
-          }
-          const configFile = path.join(ROOT, 'config.json');
-          const file = readConfigObject(configFile);
-          // 手动令牌写入 config.json（用户可见、可再改）；随机令牌写入 state/console-token 并清空 config 中的手动值。
-          file.consoleToken = generated ? '' : newToken;
-          atomicWriteJson(configFile, file);
-          cfg.consoleToken = generated ? '' : newToken;
-          atomicWriteText(path.join(STATE_DIR, 'console-token'), newToken);
-          consoleToken = newToken;
-          log(`控制台：访问令牌已${generated ? '重新生成' : '手动修改'}（不记录完整值）`);
-          sendJson({ ok: true, token: newToken, generated });
-          return;
-        }
-        // ── 后台控制端引导：向指定会话的 DSH agent 投递提醒 ──────────────────
-        if (req.method === 'POST' && url.pathname === '/api/console/notify-ai') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const message = String(body.message ?? '').trim();
-          if (!key || !message) {
-            sendJson({ ok: false, error: 'key 和 message 不能为空' }, 400);
-            return;
-          }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
-          if (!keyMatch) {
-            sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400);
-            return;
-          }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0) {
-            sendJson({ ok: false, error: 'id 无效' }, 400);
-            return;
-          }
-          if (!modeAllowed(key, kind, id, cfg, currentMode)) {
-            sendJson({ ok: false, error: `该会话不在当前模式（${currentMode}）允许范围内` }, 403);
-            return;
-          }
-          if (!state.sessions[key] && !allowed(kind, id, cfg)) {
-            sendJson({ ok: false, error: '该会话不在白名单内，且尚未创建' }, 403);
-            return;
-          }
-          if (!dshReady) {
-            sendJson({ ok: false, error: 'DSH 当前不可用，请稍后再试' }, 503);
-            return;
-          }
-          const isV2 = currentMode === 'reserved2';
-          const roleState = readRoleState();
-          const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
-          // 二代必须带会话令牌，否则 AI 调用任何 MCP 状态/发送工具都会被拒。
-          let tokenLine = '';
-          if (isV2) {
-            const stV2 = getSocialV2State(key);
-            tokenLine = `【会话令牌】${stV2.agentToken}（调用二代状态/发送工具时请在参数中带上此令牌）\n\n`;
-          }
-          const promptText = `${roleLine}${tokenLine}【后台控制端提醒】（来自控制台/管理端，不是群友消息）\n${message}\n\n这是后台给你的引导或提醒，请据此调整你的行为。绝对不要复述、转发或原样发送这条后台提醒，也不要发送其中的会话令牌；它只用于你内部调整行为。${isV2 ? '当前是二代仿真模式：你的文本输出不会自动发送到 QQ；如果需要在群里发言，请使用发送工具（qq_send_message / qq_reply）。如果不需要发言，可以 qq_mark_read 或 qq_set_wake_config 收尾。' : '如果不需要在群里发言，请不要输出会发到 QQ 的内容。'}`;
-          let sessionId = null;
-          let popSilent = null;
-          try {
-            sessionId = await ensureSession(key);
-            const silentId = Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-            const arr = social.silentTurns.get(sessionId) ?? [];
-            social.silentTurns.set(sessionId, [...arr, { id: silentId, ts: Date.now() }]);
-            popSilent = () => {
-              const list = social.silentTurns.get(sessionId) ?? [];
-              const next = list.filter((x) => x.id !== silentId);
-              if (next.length > 0) social.silentTurns.set(sessionId, next);
-              else social.silentTurns.delete(sessionId);
-            };
-            const result = await deliverPrompt(key, promptText, { silent: true });
-            if (result.ok) {
-              log(`控制台：已向 ${key} 的 DSH 发送后台提醒`);
-              appendActivity(`${key} 控制台后台提醒：${message.slice(0, 80)}`);
-              sendJson({ ok: true, key, sessionId });
-            } else {
-              popSilent();
-              sendJson({ ok: false, error: result.error || '投递失败' }, 500);
-            }
-          } catch (error) {
-            if (popSilent) popSilent();
-            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
-          }
-          return;
-        }
         // ── 二代仿真模式（reserved2）内部 Agent API ─────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/socialV2/config') {
           sendJson({ ok: true, config: cfg.socialV2 ?? {} });
@@ -8114,53 +8043,6 @@ async function main() {
           return;
         }
         // ── 图片/表情查询端点（MCP qq_get_message_images 走这里） ────────────
-        if (req.method === 'GET' && url.pathname === '/api/images/message') {
-          const key = String(url.searchParams.get('key') ?? '').trim();
-          const messageId = String(url.searchParams.get('messageId') ?? '').trim();
-          const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
-          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          if (!messageId) { sendJson({ ok: false, error: 'messageId 不能为空' }, 400); return; }
-          if (currentMode === 'reserved2' && !agentToken) {
-            sendJson({ ok: false, error: 'reserved2 模式读取图片必须携带 agent token' }, 403);
-            return;
-          }
-          if (currentMode === 'chat' || currentMode === 'reserved') {
-            sendJson({ ok: false, error: '一代 chat/reserved 模式图片已自动内联，按需图片工具仅 reserved2 模式可用' }, 403);
-            return;
-          }
-          if (agentToken && !agentTokenOk(key, agentToken)) {
-            sendJson({ ok: false, error: 'agent token 无效' }, 403);
-            return;
-          }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
-            sendJson({ ok: false, error: '当前模式不允许读取该会话' }, 403);
-            return;
-          }
-          if (agentToken && !v2ToolEnabled('getImages')) {
-            sendJson({ ok: false, error: '工具未启用：qq_get_message_images' }, 403);
-            return;
-          }
-          if (!agentToken && currentMode === 'closed-agent' && !v2ToolEnabled('getImages')) {
-            sendJson({ ok: false, error: '工具未启用：qq_get_message_images' }, 403);
-            return;
-          }
-          const media = findMessageMedia(key, messageId);
-          if (!media.length) {
-            sendJson({ ok: true, messageId, media: [], images: [], note: '该消息没有可读取的图片/表情元数据' });
-            return;
-          }
-          try {
-            const images = await fetchMediaData(media);
-            sendJson({ ok: true, messageId, media, images });
-          } catch (error) {
-            log(`图片查询失败 ${key} ${messageId}: ${error?.message ?? error}`);
-            sendJson({ ok: false, error: `图片查询失败：${error?.message ?? error}` }, 500);
-          }
-          return;
-        }
 
         // ── 统一发送端点（MCP 旧发送工具也走这里） ───────────────────────────
         if (req.method === 'POST' && (url.pathname === '/api/send/group' || url.pathname === '/api/send/private' || url.pathname === '/api/send/reply')) {

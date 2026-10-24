@@ -35,6 +35,8 @@ import social from './social/index.js';
 import memory from './memory/index.js';
 import inspect from './inspect/index.js';
 import reset from './reset/index.js';
+import consoleModule from './console/index.js';
+import messageImage from './message-image/index.js';
 
 /**
  * @param {object} ctx 由 `bridge.js` 组装的上下文（cfg / log / stateDir / api / 若干纯函数）
@@ -61,6 +63,8 @@ export function defineModules(_ctx) {
     memory,
     inspect,
     reset,
+    consoleModule,
+    messageImage,
   ];
 }
 

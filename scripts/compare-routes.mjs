@@ -70,6 +70,9 @@ const EXPECTED_MOVED = new Set([
   '/api/voice/send', '/api/send/voice',
   '/api/session/reset',
   '/api/workspace/reset',
+  '/api/console/token',
+  '/api/console/notify-ai',
+  '/api/images/message',
 ]);
 // 会随运行时间变化的路由：形状可以比，长度不行。
 const keysOf = (r) => JSON.stringify([r.status, r.shape, r.ok]);
