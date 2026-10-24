@@ -230,7 +230,15 @@ export function formatStickerList(entries, query = '', limit = 48) {
 // 否则就成了跨会话的提示词注入通道。字段本身已在 normalizeStickerEntry 里单行化。
 // MARKER: rotation-tail-v4 —— 候选池三重过滤：伪描述 / 泛化占位 / 冗余重复
 export function buildStickerContext(entries, max = 8, options = {}) {
-  const list = (Array.isArray(entries) ? entries : []).map(normalizeStickerEntry).filter(Boolean);
+  // MARKER: sticker-allowlist
+  // 库里的图来自 QQ 收藏夹（sync 会整库覆盖），所以「只留几张」不能靠删库，
+  // 只能用白名单：allowIds 非空时只有列表里的 id 能进提示词/可选。
+  const allowIds = Array.isArray(options.allowIds) ? options.allowIds.map(String).filter(Boolean) : [];
+  const allowSet = allowIds.length ? new Set(allowIds) : null;
+  const list = (Array.isArray(entries) ? entries : [])
+    .map(normalizeStickerEntry)
+    .filter(Boolean)
+    .filter((e) => !allowSet || allowSet.has(String(e.id)));
   if (!list.length) return '';
   const limit = Math.max(1, Math.min(30, Number(max) || 8));
   const mixTail = Math.max(0, Math.min(24, Number(options.mixTail ?? 3)));

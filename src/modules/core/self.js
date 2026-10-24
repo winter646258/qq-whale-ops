@@ -132,7 +132,7 @@ async function getPrompt({ req, url, sendJson }) {
     stickers: {
       enabled: this.ctx.cfg.socialV2?.sticker?.enabled !== false,
       total: h.stickerEntries().length,
-      context: this.ctx.cfg.socialV2?.sticker?.includeInPrompt !== false ? h.buildStickerContext(h.stickerEntries(), this.ctx.cfg.socialV2?.sticker?.promptMaxStickers ?? 8) : '',
+      context: this.ctx.cfg.socialV2?.sticker?.includeInPrompt !== false ? h.buildStickerContext(h.stickerEntries(), this.ctx.cfg.socialV2?.sticker?.promptMaxStickers ?? 8, { allowIds: this.ctx.cfg.socialV2?.sticker?.allowIds }) : '',
       strategy: this.ctx.cfg.socialV2?.sticker?.includeInPrompt !== false ? h.buildStickerStrategyHint() : '',
     },
     // 语音库摘要：让她一开始就知道有哪些语音可发（真发之前用 qq_list_voices 看详情）。

@@ -989,6 +989,7 @@ function loadConfig() {
         maxListCount: 100,         // qq_list_stickers 单次最大返回数
         includeInPrompt: true,     // 是否在 qq_get_prompt / 唤醒提示里附带表情摘要与策略
         promptMaxStickers: 8,      // 提示里最多列出的常用表情数
+        allowIds: [],              // 非空时只有这些 id 能进提示词（库来自 QQ 收藏夹，sync 会整库覆盖，所以「只留几张」靠白名单不靠删库）
         collect: {
           enabled: true,           // AI 收藏他人表情总开关
           maxPerMinute: 2,         // 每分钟最多收藏次数
@@ -1087,6 +1088,7 @@ function loadConfig() {
     maxListCount: 100,
     includeInPrompt: true,
     promptMaxStickers: 8,
+    allowIds: [],
     collect: {
       enabled: true,
       maxPerMinute: 2,
@@ -4336,7 +4338,7 @@ async function main() {
       formatPortrait: (store) => formatPortraitForPrompt(store),
       syncStickerLibrary: (force) => syncStickerLibrary(force),
       stickerEntries: () => stickerEntries,
-      buildStickerContext: (entries, max) => buildStickerContext(entries, max),
+      buildStickerContext: (entries, max, options) => buildStickerContext(entries, max, options),
       buildStickerStrategyHint: () => buildStickerStrategyHint(),
       confirmedSlangList: () => confirmedSlangListV2(),
       slangEntries: () => slangEntries,
@@ -9954,7 +9956,7 @@ async function main() {
     const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
-      ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
+      ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8, { allowIds: stickerCfg.allowIds })}\n\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 90000);
     const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
