@@ -34,7 +34,8 @@ import {
   MAX_TEXT_CHARS as DIARY_MAX_TEXT, MAX_MOOD_CHARS as DIARY_MAX_MOOD,
   MAX_BYTES as DIARY_MAX_BYTES,
   readDiary, writeDiary, appendDiaryEntry, updateDiaryEntry, removeDiaryEntry,
-  recentDiary, diaryDays, diaryStats, parseLegacyMarkdown, localStamp
+  recentDiary, recallDiary, diaryDays, diaryStats, parseLegacyMarkdown, localStamp,
+  normalizeLevel, daysSinceLast, DEFAULT_LEVEL, LEVEL_LABELS
 } from './diary-store.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -4934,6 +4935,20 @@ async function main() {
    * 图里的要求是「只是提醒，不强制」—— 所以文案里明说可以什么都不做。
    * 做过就落盘记今天，当天不再念。
    */
+  // MARKER: diary-level
+  // 展示用：只有非普通档才加标记，普通条目保持干净（不要每条都挂个【普通】）
+  function fmtLevelTag(level) {
+    const lv = normalizeLevel(level);
+    if (lv === DEFAULT_LEVEL) return '';
+    return `【${LEVEL_LABELS[lv] || lv}】`;
+  }
+
+  function fmtDiaryLine(e) {
+    const lv = normalizeLevel(e?.level);
+    // 给模型看的行里附上 id：改某条（mode=replace）要用
+    return `[${e.time || '未知时间'}]${fmtLevelTag(lv)}${e.mood ? `（${e.mood}）` : ''} ${e.text}${e.id ? ` 〔${e.id}〕` : ''}`;
+  }
+
   function buildSleepReviewLineFor(key) {
     if (cfg.socialV2?.sleepReview?.enabled === false) return '';
     let sleepSt;
@@ -4956,8 +4971,26 @@ async function main() {
     markSleepReviewed(sleepSt, { key, now });
     saveSleepReviewState();
     log(`[sleep-review] 注入今日回顾 ${key}（${localDayOf(now)}）`);
-    return '【今天过完了】下面是今天发生的事。睡前可以翻一翻：想记的用 qq_diary 写一条（一两句具体的小事，别写总结句），'
-      + '想调对谁的好感度就用 qq_mood；不想写、不想动，就直接安静收尾，没人要求你必须留点什么。\n'
+    // MARKER: diary-level
+    // 空窗提醒：她连着几天没写，就直接说出来。
+    // 原来只说「想记的写一条」，三天一条没写 —— 抽象的门槛等于没有门槛。
+    let diaryGap = '';
+    try {
+      const entries = readDiary(path.join(ROOT, 'diary', DIARY_JSONL));
+      const gap = daysSinceLast(entries, nowMs);
+      const lv = diaryStats(entries, nowMs).byLevel;
+      if (gap === null) diaryGap = '你还没写过日记。';
+      else if (gap >= 1) diaryGap = `你上次写日记是 ${gap} 天前了。`;
+      if (entries.length) diaryGap += `（本子上一共 ${entries.length} 条：不想忘 ${lv.critical}、重要 ${lv.important}、普通 ${lv.normal}）`;
+    } catch {
+      diaryGap = '';
+    }
+    return '【今天过完了】下面是今天发生的事。睡前翻一翻，挑一件具体的小事记下来 —— 用 qq_diary 写一两句，别写总结句。'
+      + (diaryGap ? diaryGap + '\n' : '')
+      + '记的时候可以标个档：level=critical（非常重要，永不淡）、level=important（重要，两三周慢慢淡）、不标就是普通（几天就淡了）。'
+      + '标档不是做报表，是给你自己以后翻日记时用的 —— 觉得就是件普通事，那就真的别标。'
+      + '想顺带记一下当时的心情就带 mood。'
+      + '不想写、不想动，就直接安静收尾，没人要求你必须留点什么。\n'
       + (material ? material + '\n' : '')
       + '\n';
   }
@@ -6080,18 +6113,27 @@ async function main() {
                   sendJson({ ok: false, error: `日记读取失败：${error?.message ?? error}` }, 500);
                   return;
                 }
-                const recent = recentDiary(entries, limit);
+                // MARKER: diary-recall
+                // 两个视图：最近 N 条照给（刚发生的事本来就该记得）；
+                // 「还值得想起来的」按档位+时间算权重挑 ——
+                // 普通条目过了几天权重掉到门槛以下就不在这里出现了，这就是「几天就忘」。
+                // 数据一条都没删，翻全部还在文件里。
+                const recalled = recallDiary(entries, { now: Date.now(), recent: limit, faded: 4 });
                 const stats = diaryStats(entries);
+                const gap = daysSinceLast(entries, Date.now());
                 sendJson({
                   ok: true,
                   key,
                   total: entries.length,
                   // 给模型看的是可读的行，不是原始 JSON —— 她不需要解析字段名
-                  recent: recent.map((e) => `[${e.time || '未知时间'}]${e.mood ? `（${e.mood}）` : ''} ${e.text}`),
-                  entries: recent,
+                  recent: recalled.recent.map(fmtDiaryLine),
+                  // 更早的、还够分量的（可能包含 critical 的旧条目）
+                  faded: recalled.faded.map(fmtDiaryLine),
+                  entries: recalled.recent,
                   days: diaryDays(entries).slice(-20),
                   stats,
-                  hint: entries.length ? undefined : '日记还是空的，你可以写第一条'
+                  hint: entries.length ? undefined : '日记还是空的，你可以写第一条',
+                  levelHint: '写的时候可以标 level：critical（非常重要，永不淡）/ important（重要，两三周慢慢淡）/ 不标就是普通（几天就淡了）。'
                 });
               } else {
                 const limit = Math.max(1, Math.min(200, Number(q.get('limit')) || 20));
@@ -6129,7 +6171,17 @@ async function main() {
 
               const text = redactKnownTokensOnly(String(body.text ?? '')).trim();
               const moodRaw = body.mood !== undefined ? redactKnownTokensOnly(String(body.mood ?? '')).trim() : undefined;
-              if (!text && !moodRaw) { sendJson({ ok: false, error: '日记内容不能为空' }, 400); return; }
+              // MARKER: diary-level
+              // 分档（normal / important / critical）：只决定「多久以后想不起来」，不决定能不能写。
+              // 非法值不许报错 —— 归一到 normal，别因为标注写错把整条日记弄丢。
+              const levelRaw = body.level !== undefined && body.level !== null && String(body.level).trim() !== ''
+                ? normalizeLevel(body.level)
+                : undefined;
+              // MARKER: diary-level
+              // 只改档（mode=replace 且只带 level）也是合法操作 —— 原来这里要求 text/mood 至少一个，
+              // 结果「把这条提成 critical」被当成空内容挡掉。
+              // append 模式只给 level 仍然会被 appendDiaryEntry 拒（那里才是真正的空内容校验）。
+              if (!text && !moodRaw && levelRaw === undefined) { sendJson({ ok: false, error: '日记内容不能为空' }, 400); return; }
               if (text && SENSITIVE_RE.test(text)) { sendJson({ ok: false, error: '内容疑似含敏感信息，已拒绝写入' }, 400); return; }
               if (moodRaw && SENSITIVE_RE.test(moodRaw)) { sendJson({ ok: false, error: '心情疑似含敏感信息，已拒绝写入' }, 400); return; }
 
@@ -6144,14 +6196,16 @@ async function main() {
                   id,
                   oldText,
                   text: text || undefined,
-                  mood: moodRaw !== undefined ? moodRaw : undefined
+                  mood: moodRaw !== undefined ? moodRaw : undefined,
+                  level: levelRaw
                 });
                 if (!r) { sendJson({ ok: false, error: '找不到要改写的那条日记' }, 404); return; }
                 const bytes = writeDiary(DIARY_FILE, entries);
                 if (bytes > DIARY_MAX_BYTES) { sendJson({ ok: false, error: '日记文件已达上限' }, 400); return; }
                 sendJson({
                   ok: true, key, mode: 'replace', changed: r.changed,
-                  line: `[${r.entry.time}]${r.entry.mood ? `（${r.entry.mood}）` : ''} ${r.entry.text}`,
+                  level: normalizeLevel(r.entry.level),
+                  line: `[${r.entry.time}]${fmtLevelTag(r.entry.level)}${r.entry.mood ? `（${r.entry.mood}）` : ''} ${r.entry.text}`,
                   total: entries.length
                 });
                 return;
@@ -6159,7 +6213,7 @@ async function main() {
 
               let entry;
               try {
-                entry = appendDiaryEntry(entries, { text, mood: moodRaw });
+                entry = appendDiaryEntry(entries, { text, mood: moodRaw, level: levelRaw });
               } catch (error) {
                 sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
                 return;
@@ -6169,7 +6223,8 @@ async function main() {
               log(`[日记] ${key} 写了一条（共 ${entries.length} 条）`);
               sendJson({
                 ok: true, key, mode: 'append',
-                line: `[${entry.time}]${entry.mood ? `（${entry.mood}）` : ''} ${entry.text}`,
+                level: normalizeLevel(entry.level),
+                line: `[${entry.time}]${fmtLevelTag(entry.level)}${entry.mood ? `（${entry.mood}）` : ''} ${entry.text}`,
                 entry,
                 total: entries.length
               });
