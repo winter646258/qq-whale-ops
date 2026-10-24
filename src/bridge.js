@@ -4154,6 +4154,32 @@ async function main() {
 
   /** 审批状态的内存缓存。改盘上的 json 不会立刻生效，要重启（踩过一次）。 */
   let imageApprovalCache = null;
+  // MARKER: modules-ctx-image
+  // 阶段16：生图/审批/画像搬进 image 模块后要用的句柄。
+  // imageAllowedNow(L10013) / generateImageNow(L10055) 比这里晚得多，必须包闭包；
+  // imageLastStartAt 是 Map（引用不变）但给访问器，免得以后改成重新赋值时踩空。
+  Object.assign(moduleCtx, {
+    imageHelpers: {
+      agentTokenOkOrOwnerDelegate: (key, token) => agentTokenOkOrOwnerDelegate(key, token),
+      imageAllowedNow: (key) => imageAllowedNow(key),
+      imageApprovalEligible: (key) => imageApprovalEligible(key),
+      requestImageApproval: (key, prompt, size) => requestImageApproval(key, prompt, size),
+      getImageApprovalState: () => getImageApprovalState(),
+      imageApprovalStatsOf: (st) => imageApprovalStatsOf(st),
+      approveImageApproval: (st, id) => approveImageApproval(st, id),
+      rejectImageApproval: (st, id) => rejectImageApproval(st, id),
+      persistImageApproval: (action, detail) => persistImageApproval(action, detail),
+      commitApprovedImageApproval: (approval) => commitApprovedImageApproval(approval),
+      generateImageNow: (opts) => generateImageNow(opts),
+      onebotSend: (kind, id, message, replyToMessageId, atUserId, images) =>
+        onebotSend(kind, id, message, replyToMessageId, atUserId, images),
+      throttleMs: () => IMAGE_THROTTLE_MS,
+      lastStartAt: (key) => imageLastStartAt.get(key),
+      markStart: (key) => imageLastStartAt.set(key, Date.now()),
+      maxPromptChars: () => IMAGE_APPROVAL_MAX_PROMPT,
+      ttlMs: () => IMAGE_APPROVAL_TTL_MS,
+    },
+  });
   // 好友昵称表（号码 -> 昵称），由 refreshFriends 填。不落盘。
   const friendNames = new Map();
   const IMAGE_APPROVAL_AUDIT_FILE = path.join(STATE_DIR, 'image-approval-audit.jsonl');
@@ -6556,23 +6582,6 @@ async function main() {
           return;
         }
         // ── 表情包体系（reserved2） ──────────────────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/self-image') {
-          const key = String(url.searchParams.get('key') ?? '').trim();
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getSelfImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_self_image' }, 403); return; }
-          const selfPath = path.join(ROOT, 'assets', 'deepseek娘.png');
-          try {
-            if (!fs.existsSync(selfPath)) { sendJson({ ok: false, error: '未找到 AI 形象图片 assets/deepseek娘.png' }, 404); return; }
-            const buf = fs.readFileSync(selfPath);
-            const mimeType = mimeFromBuffer(buf) || 'image/png';
-            sendJson({ ok: true, key, image: { mimeType, data: buf.toString('base64') } });
-          } catch (error) {
-            sendJson({ ok: false, error: `读取 AI 形象图片失败：${error?.message ?? error}` }, 500);
-          }
-          return;
-        }
         // ── 语音发送（操作者通道：CLI / 控制台，凭 consoleToken） ──────────────
         //
         // 与 /api/send/* 的 agent 通道分开：操作者可能不在任何 QQ 会话里，
@@ -6655,146 +6664,9 @@ async function main() {
 
         // ── 生图：只有主人能让她画 ──────────────────────────────────────────
         // 权限在服务端：prompt 里不提这个能力只是第一道，真正的闸门是 imageAllowedNow。
-        if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/api/socialV2/image') {
-          try {
-            const q = url.searchParams;
-            const body = req.method === 'POST' ? await readBody() : {};
-            const key = String(body.key ?? q.get('key') ?? '').trim();
-            const action = String(body.action ?? q.get('action') ?? 'generate').trim();
-            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-            if (req.headers['x-agent-token'] && !agentTokenOkOrOwnerDelegate(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }  // MARKER: image-approval-ep-image
-            if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-            if (req.headers['x-agent-token'] && !v2ToolEnabled('image')) { sendJson({ ok: false, error: '工具未启用：qq_generate_image' }, 403); return; }
-            if (cfg.socialV2?.image?.enabled === false) { sendJson({ ok: false, error: 'qq_generate_image 已在配置里关闭' }, 403); return; }
-
-            const permit = imageAllowedNow(key);
-            if (!permit.ok) {
-              // MARKER: image-approval-gate
-              // 好友私聊要图：不画，转成一条待审申请发给主人。其余场景仍照旧 403。
-              if (action === 'generate' && imageApprovalEligible(key)) {
-                const reqPrompt = String(body.prompt ?? '').trim();
-                if (!reqPrompt) { sendJson({ ok: false, error: 'prompt 不能为空' }, 400); return; }
-                if (reqPrompt.length > IMAGE_APPROVAL_MAX_PROMPT) {
-                  sendJson({ ok: false, error: `prompt 太长（上限 ${IMAGE_APPROVAL_MAX_PROMPT} 字）` }, 400);
-                  return;
-                }
-                const requested = requestImageApproval(key, reqPrompt, String(body.size ?? '').trim());
-                if (!requested.ok) { sendJson({ ok: false, error: requested.error }, 409); return; }
-                sendJson({
-                  ok: true,
-                  key,
-                  action,
-                  status: 'pending-approval',
-                  approvalId: requested.approval.id,
-                  reused: requested.reused,
-                  ttlMs: IMAGE_APPROVAL_TTL_MS,
-                  note: requested.note
-                });
-                return;
-              }
-              sendJson({ ok: false, error: permit.why }, 403); return;
-            }
-
-            if (action === 'status') {
-              sendJson({
-                ok: true, key, action, scene: permit.scene,
-                model: cfg.socialV2?.image?.model ?? 'gpt-image-2',
-                size: cfg.socialV2?.image?.size ?? '1024x1024'
-              });
-              return;
-            }
-            if (action !== 'generate') {
-              sendJson({ ok: false, error: '不认识的 action：' + action + '（可用 generate / status）' }, 400);
-              return;
-            }
-            const prompt = String(body.prompt ?? '').trim();
-            if (!prompt) { sendJson({ ok: false, error: 'prompt 不能为空' }, 400); return; }
-            if (prompt.length > 2000) { sendJson({ ok: false, error: 'prompt 太长（上限 2000 字）' }, 400); return; }
-            // MARKER: image-rate-limit
-            // 防连点：上一张还在画（或者刚画完不到一分钟）就不要再花一次钱。
-            const lastStart = Number(imageLastStartAt.get(key) || 0);
-            const sinceLast = Date.now() - lastStart;
-            if (lastStart && sinceLast < IMAGE_THROTTLE_MS) {
-              const waitSec = Math.ceil((IMAGE_THROTTLE_MS - sinceLast) / 1000);
-              log(`[reserved2] 生图被限流（${key}）：${waitSec} 秒内已画过一次，这次不画`);
-              sendJson({
-                ok: false,
-                error: `上一张还在画（${waitSec} 秒前刚画过一张），别重复调 —— 画完会直接发出来。`,
-                throttled: true,
-                retryAfterMs: IMAGE_THROTTLE_MS - sinceLast
-              }, 429);
-              return;
-            }
-            imageLastStartAt.set(key, Date.now());
-            log(`[reserved2] 生图请求（${permit.scene}，${key}）：${prompt.slice(0, 60)}`);
-            const result = await generateImageNow({ prompt, size: body.size });
-            // 画完就发：工具只把 url/本地路径当文本回给模型，她自己看不到图，主人也收不到。
-            // 不发等于白画一张（$0.01），所以默认发。发送失败只记日志，生图结果照常返回。
-            let sent = false;
-            try {
-              if (result?.path) {
-                const [sendKind, sendId] = String(key).split(':');
-                if ((sendKind === 'group' || sendKind === 'private') && Number(sendId) > 0) {
-                  await onebotSend(sendKind, Number(sendId), '', null, null, [result.path]);
-                  sent = true;
-                  log(`[reserved2] 生图已发送（${key}）：${path.basename(result.path)}`);
-                }
-              }
-            } catch (error) {
-              log(`[reserved2] 生图后发送失败（${key}）：${error?.message ?? error}`);
-            }
-            sendJson({ ok: true, key, action, scene: permit.scene, sent, ...result });
-          } catch (error) {
-            sendJson({ ok: false, error: '生图失败：' + (error?.message ?? error) }, 500);
-          }
-          return;
-        }
-
         // MARKER: image-approval-route
         // 生图审批的查询与人工处置入口（控制台/管理端用；智能体侧走 QQ 里的
         // 「通过 / 拒绝」，不从这里批）。
-        if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/api/socialV2/image-approval') {
-          // MARKER: image-approval-console-only
-          // 审批查询/人工处置是管理端动作：智能体侧走 QQ 里的「通过 / 拒绝」由主人确认，
-          // 不该能读全局统计，更不该能自己批一张图（approve 会真的出图并发送）。
-          // 智能体进程同时持有 x-console-token，上面的控制台令牌闸门挡不住它，这里必须单独拒绝。
-          if (req.headers['x-agent-call'] !== undefined || String(req.headers['x-agent-token'] ?? '') !== '') {
-            sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
-            return;
-          }
-          try {
-            const q = url.searchParams;
-            const body = req.method === 'POST' ? await readBody() : {};
-            const action = String(body.action ?? q.get('action') ?? 'list').trim();
-            const st = getImageApprovalState();
-            if (action === 'list' || action === 'stats') {
-              const stats = imageApprovalStatsOf(st);
-              sendJson({ ok: true, action, ...stats });
-              return;
-            }
-            if (action === 'approve' || action === 'reject') {
-              const id = String(body.id ?? q.get('id') ?? '').trim();
-              if (!id) { sendJson({ ok: false, error: 'id 不能为空' }, 400); return; }
-              const res = action === 'approve'
-                ? approveImageApproval(st, id)
-                : rejectImageApproval(st, id);
-              if (!res.ok) { sendJson({ ok: false, error: res.reason }, 409); return; }
-              persistImageApproval(action, `${id} ${res.approval.key}`);
-              log(`[imgapprove] 人工 ${action} ${id}（${res.approval.key}）`);
-              if (action === 'approve') {
-                void commitApprovedImageApproval(res.approval).catch(() => {});
-              }
-              sendJson({ ok: true, action, approval: res.approval });
-              return;
-            }
-            sendJson({ ok: false, error: '不认识的 action：' + action + '（可用 list / approve / reject / stats）' }, 400);
-          } catch (error) {
-            sendJson({ ok: false, error: '生图审批操作失败：' + (error?.message ?? error) }, 500);
-          }
-          return;
-        }
-
-
         // ── 日程 / 画像：角色的短期记忆与长期认识 ──────────────────────────
         // 规格三条原则的落点：
         //   一、只给工具和事实：这里没有任何「按天数自动糊/自动删」的代码路径，
