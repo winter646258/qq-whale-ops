@@ -29,6 +29,7 @@ import status from './status/index.js';
 import testSend from './test-send/index.js';
 import phone from './phone/index.js';
 import slang from './slang/index.js';
+import image from './image/index.js';
 
 /**
  * @param {object} ctx 由 `bridge.js` 组装的上下文（cfg / log / stateDir / api / 若干纯函数）
@@ -49,6 +50,7 @@ export function defineModules(_ctx) {
     testSend,
     phone,
     slang,
+    image,
   ];
 }
 
