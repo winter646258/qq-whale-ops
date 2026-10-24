@@ -101,6 +101,10 @@ const EXPECTED_MOVED = new Set([
   '/api/socialV2/spotify',
   '/api/socialV2/diary/migrate',
   '/api/socialV2/feedback',
+  // 阶段28：bili（B 站只读查询）
+  '/api/socialV2/bili',
+  // 阶段29：forward（合并转发预览 / 转发媒体读取）
+  '/api/socialV2/forward-message', '/api/socialV2/forward-media',
 ]);
 // 会随运行时间变化的路由：形状可以比，长度不行。
 const keysOf = (r) => JSON.stringify([r.status, r.shape, r.ok]);

@@ -5016,6 +5016,21 @@ async function main() {
     return biliClientCache;
   }
 
+// MARKER: modules-ctx-forward
+  // 合并转发查看模块的句柄。全部包箭头：
+  // getSocialV2State / fetchMediaData / modeAllowed 都在注入点之后声明，
+  // bot 是 late 绑定（可能在 main() 里被整体重新赋值），seenForwardIds 是会被清空的 Map。
+  Object.assign(moduleCtx, {
+    forwardHelpers: {
+      currentMode: () => currentMode,
+      getSocialV2State: (k) => getSocialV2State(k),
+      modeAllowed: (k, kind, id, config, mode) => modeAllowed(k, kind, id, config, mode),
+      seenForwardIds: () => seenForwardIds,
+      bot: () => bot,
+      fetchMediaData: (list) => fetchMediaData(list),
+    },
+  });
+
 // MARKER: modules-ctx-bili
   // B 站浏览模块用的句柄。biliClient 懒建一次后复用（内部持有唯一的 PhoneBridge 订阅），
   // 所以交工厂而不是交实例 —— 注入这一刻它还是 null。
@@ -5397,117 +5412,6 @@ async function main() {
         // ── 安全拦截通知设置 ─────────────────────────────────────────────────
         // ── 控制台访问令牌（可手动修改/生成随机） ─────────────────────────────
         // ── 二代仿真模式（reserved2）内部 Agent API ─────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/forward-message') {
-          const key = String(url.searchParams.get('key') ?? '').trim();
-          const id = String(url.searchParams.get('id') ?? '').trim();
-          const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
-          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          if (!id) { sendJson({ ok: false, error: 'id 不能为空' }, 400); return; }
-          if (currentMode !== 'reserved2') {
-            sendJson({ ok: false, error: '合并转发查看仅 reserved2 模式可用' }, 403);
-            return;
-          }
-          if (!agentToken) {
-            sendJson({ ok: false, error: 'reserved2 模式读取合并转发必须携带 agent token' }, 403);
-            return;
-          }
-          if (!agentTokenOk(key, agentToken)) {
-            sendJson({ ok: false, error: 'agent token 无效' }, 403);
-            return;
-          }
-          const kind = keyMatch[1];
-          const num = Number(keyMatch[2]);
-          if (!Number.isFinite(num) || num <= 0 || !modeAllowed(key, kind, num, cfg, currentMode)) {
-            sendJson({ ok: false, error: '当前模式不允许读取该会话' }, 403);
-            return;
-          }
-          if (!v2ToolEnabled('getForwardMsg')) {
-            sendJson({ ok: false, error: '工具未启用：qq_get_forward_msg' }, 403);
-            return;
-          }
-          // 安全边界：只允许读取本会话确实收到过的 forward id，防止 AI 任意探测/跨会话读取
-          const st = getSocialV2State(key);
-          const seenInRecent = (st?.recentMessages || []).some((m) => Array.isArray(m?.forwardIds) && m.forwardIds.includes(id));
-          const seenInUnread = (st?.unread || []).some((m) => Array.isArray(m?.forwardIds) && m.forwardIds.includes(id));
-          const seenInMemory = seenForwardIds.get(key)?.has(id) === true;
-          if (!seenInRecent && !seenInUnread && !seenInMemory) {
-            sendJson({ ok: false, error: '该转发消息 id 不在当前会话可见范围内，拒绝读取' }, 404);
-            return;
-          }
-          try {
-            const data = await bot.raw('get_forward_msg', { id });
-            const formatted = formatForwardResponse(data);
-            const remember = (fid) => {
-              if (!fid) return;
-              let set = seenForwardIds.get(key);
-              if (!set) {
-                set = new Set();
-                seenForwardIds.set(key, set);
-              }
-              set.add(fid);
-              if (set.size > 1000) {
-                for (const old of set) {
-                  set.delete(old);
-                  if (set.size <= 1000) break;
-                }
-              }
-            };
-            // 把本层出现的嵌套 forward id 登记为“本会话已见过”，AI 后续可直接再次读取。
-            for (const m of formatted.messages || []) {
-              for (const fid of m.nestedForwardIds || []) remember(fid);
-            }
-            // 抓取嵌套转发的前几条作为预览，让 AI 不需要二次调用也能先看到内容。
-            const nestedPreviews = [];
-            const nestedIds = [];
-            const seenNested = new Set();
-            for (const m of formatted.messages || []) {
-              for (const fid of m.nestedForwardIds || []) {
-                if (!seenNested.has(fid) && nestedIds.length < 5) {
-                  seenNested.add(fid);
-                  nestedIds.push(fid);
-                }
-              }
-            }
-            for (const fid of nestedIds) {
-              try {
-                const ndata = await bot.raw('get_forward_msg', { id: fid });
-                const nfmt = formatForwardResponse(ndata, { maxMessages: 3, maxCharsPerMessage: 120 });
-                for (const nm of nfmt.messages || []) {
-                  for (const nfid of nm.nestedForwardIds || []) remember(nfid);
-                }
-                nestedPreviews.push({ id: fid, ...nfmt });
-              } catch (error) {
-                log(`嵌套转发预览失败 ${key} ${fid}:`, error?.message ?? error);
-                nestedPreviews.push({ id: fid, error: error?.message ?? '嵌套转发读取失败' });
-              }
-            }
-            sendJson({ ok: true, key, id, ...formatted, nestedPreviews });
-          } catch (error) {
-            log(`合并转发查询失败 ${key} ${id}: ${error?.message ?? error}`);
-            sendJson({ ok: false, error: `合并转发查询失败：${error?.message ?? error}` }, 500);
-          }
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/forward-media') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const media = Array.isArray(body.media) ? body.media : [];
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getForwardMsg')) { sendJson({ ok: false, error: '工具未启用：qq_get_forward_msg' }, 403); return; }
-          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '转发媒体读取仅 reserved2 模式可用' }, 403); return; }
-          if (!media.length) { sendJson({ ok: true, key, media: [], images: [] }); return; }
-          try {
-            const images = await fetchMediaData(media);
-            sendJson({ ok: true, key, media, images });
-          } catch (error) {
-            log(`转发媒体读取失败 ${key}:`, error?.message ?? error);
-            sendJson({ ok: false, error: `转发媒体读取失败：${error?.message ?? error}` }, 500);
-          }
-          return;
-        }
         // MARKER: bili-route
         // B 站只读（MCP qq_bili 走这里）。
         //

@@ -1,3 +1,4 @@
+import forwardModule from './forward/index.js';
 import biliModule from './bili/index.js';
 // 功能模块清单。
 //
@@ -77,6 +78,7 @@ export function defineModules(_ctx) {
     aiExtras,
     coreModule,
     biliModule,
+    forwardModule,
   ];
 }
 
