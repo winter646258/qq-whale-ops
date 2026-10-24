@@ -18,6 +18,9 @@
 const inject = [
   'log', 'cfg', 'readConfigObject', 'atomicWriteJson', 'path', 'rootDir',
   'slangHelpers',
+  // 阶段25：AI 工具面新增
+  'agentTokenOk', 'v2SessionAllowed', 'v2ToolEnabled',
+  'redactKnownTokensOnly', 'appendActivity',
 ];
 
 // 路径里出现的 id 形状：黑话 id 是 createSlangEntry 生成的字符串，
@@ -363,6 +366,117 @@ async function postIdPath({ url, sendJson }) {
   // 老代码没有「裸 id 的 POST」这条分支，等效于 404。
   sendJson({ ok: false, error: 'not found' }, 404);
 }
+// ── AI 工具面（reserved2）／api/socialV2/slang/{query,submit} ──────────────
+// 鉴权口径与 memory / share 一致：带 x-agent-token 才校验
+// agentTokenOk → v2SessionAllowed → v2ToolEnabled(<flag>)；不带令牌 = 控制台。
+function rejectAi({ ctx, req, sendJson, key, tool, what }) {
+  const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
+  if (!agentToken) return false;
+  if (!ctx.agentTokenOk(key, agentToken)) {
+    sendJson({ ok: false, error: 'agent token 无效' }, 403);
+    return true;
+  }
+  if (!ctx.v2SessionAllowed(key)) {
+    sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+    return true;
+  }
+  if (!ctx.v2ToolEnabled(tool)) {
+    sendJson({ ok: false, error: `工具未启用：${what}` }, 403);
+    return true;
+  }
+  return false;
+}
+
+// GET /api/socialV2/slang/query —— 让她查「这个说法我们群里是什么意思」
+async function aiQuery({ req, url, sendJson }) {
+  const key = String(url.searchParams.get('key') ?? '').trim();
+  const q = String(url.searchParams.get('q') ?? '').trim().toLowerCase();
+  if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+  const ctx = this.ctx;
+  if (rejectAi({ ctx, req, sendJson, key, tool: 'slangQuery', what: 'qq_slang_query' })) return;
+  const list = ctx.slangHelpers.confirmedList().filter((e) => {
+    if (!q) return true;
+    return e.content.toLowerCase().includes(q)
+      || e.meaning.toLowerCase().includes(q)
+      || e.usage.toLowerCase().includes(q)
+      || e.example.toLowerCase().includes(q);
+  });
+  sendJson({
+    ok: true,
+    key,
+    total: list.length,
+    entries: list,
+    block: ctx.slangHelpers.buildContext(ctx.slangHelpers.entries(), ctx.cfg.slang?.injectMax ?? 8)
+  });
+}
+
+// POST /api/socialV2/slang/submit —— 让她把遇到的新词交上来
+async function aiSubmit({ req, sendJson, readBody }) {
+  const body = (await readBody()) ?? {};
+  const key = String(body.key ?? '').trim();
+  const content = this.ctx.redactKnownTokensOnly(String(body.content ?? '')).trim();
+  const context = this.ctx.redactKnownTokensOnly(String(body.context ?? '')).trim();
+  const ctx = this.ctx;
+  if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+  if (rejectAi({ ctx, req, sendJson, key, tool: 'slangSubmit', what: 'qq_slang_submit' })) return;
+  if (ctx.cfg.slang?.enabled === false) {
+    sendJson({ ok: false, error: '黑话学习已关闭（slang.enabled=false）' }, 403);
+    return;
+  }
+  if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
+  if (content.length > 50) { sendJson({ ok: false, error: '黑话词条过长（最多 50 字）' }, 400); return; }
+  const h = ctx.slangHelpers;
+  if (!h.allowSubmit(key)) {
+    sendJson({ ok: false, error: '黑话提交过于频繁，请稍后再试' }, 429);
+    return;
+  }
+  const existing = h.entries().find((e) => e.content === content);
+  if (existing) {
+    if (existing.status === h.SLANG_STATUS.CONFIRMED) {
+      sendJson({ ok: true, duplicate: true, status: 'confirmed', entry: h.publicEntry(existing) });
+      return;
+    }
+    if (existing.status === h.SLANG_STATUS.REJECTED) {
+      sendJson({ ok: false, error: '该词已被管理员拒绝，如需重新收录请联系管理员' }, 403);
+      return;
+    }
+    // candidate：累计出现次数并追加语境证据
+    existing.count = (Number(existing.count) || 0) + 1;
+    if (context) {
+      existing.evidence = h.mergeEvidence(existing.evidence, [{
+        key, sender: 'AI提交', text: context.slice(0, 200), time: Date.now()
+      }]);
+    }
+    existing.updatedAt = new Date().toISOString();
+    h.save();
+    if (ctx.cfg.slang?.autoResearch !== false) {
+      const thresholds = Array.isArray(ctx.cfg.slang?.inferenceThresholds)
+        ? ctx.cfg.slang.inferenceThresholds.map(Number).filter(Boolean)
+        : [2, 4, 8];
+      if (thresholds.includes(existing.count) && existing.count > (Number(existing.lastInferenceCount) || 0)) {
+        h.queueTask(() => h.runResearch([existing]));
+      }
+    }
+    ctx.log(`[reserved2] AI 再次提交黑话候选「${content}」(${key})，累计 ${existing.count} 次`);
+    sendJson({ ok: true, duplicate: true, status: 'candidate', entry: h.publicEntry(existing) });
+    return;
+  }
+  const entry = h.createEntry({
+    content,
+    source: 'ai',
+    status: h.SLANG_STATUS.CANDIDATE,
+    evidence: context ? [{ key, sender: 'AI提交', text: context.slice(0, 200), time: Date.now() }] : []
+  });
+  h.entries().push(entry);
+  h.save();
+  if (ctx.cfg.slang?.autoResearch !== false) {
+    h.queueTask(() => h.runResearch([entry]));
+  }
+  ctx.log(`[reserved2] AI 提交黑话候选「${content}」(${key})`);
+  ctx.appendActivity(`${key} [reserved2] AI 提交黑话候选：${content}${context ? '（附语境）' : ''}`);
+  sendJson({ ok: true, entry: h.publicEntry(entry) });
+}
+
 // 路由表：id 型路由用 prefix 挂号再在 handler 里 parseIdPath 复核（exact 无法表达可变段）。
 // 注意 registry 的 compareRoutes 是「exact 优先」，所以 `/api/slang/clear` 这类
 // 固定后缀永远赢过 `/api/slang/<id>`，无需担心顺序。
@@ -376,6 +490,9 @@ const routes = [
   { method: 'POST', path: '/api/slang/extract', kind: 'exact', handler: extract },
   { method: 'POST', path: '/api/slang/research', kind: 'exact', handler: research },
   { method: 'POST', path: '/api/slang/config', kind: 'exact', handler: updateConfig },
+  // AI 工具面（原 v2:memory 族）
+  { method: 'GET', path: '/api/socialV2/slang/query', kind: 'exact', handler: aiQuery },
+  { method: 'POST', path: '/api/socialV2/slang/submit', kind: 'exact', handler: aiSubmit },
   { method: 'PATCH', path: '/api/slang/', kind: 'prefix', handler: update },
   { method: 'DELETE', path: '/api/slang/', kind: 'prefix', handler: removeOne },
   { method: 'POST', path: '/api/slang/', kind: 'prefix', handler: postIdPath },
