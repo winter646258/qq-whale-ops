@@ -39,6 +39,10 @@ const EXPECTED_MOVED = new Set([
   '/api/stickers/sync',
   '/api/stickers/note',
   '/api/stickers/remark',
+  '/api/socialV2/sticker-list',
+  '/api/socialV2/sticker-image',
+  '/api/socialV2/sticker-note',
+  '/api/socialV2/sticker-remark',
 ]);
 // 会随运行时间变化的路由：形状可以比，长度不行。
 const keysOf = (r) => JSON.stringify([r.status, r.shape, r.ok]);
