@@ -1,0 +1,101 @@
+SNAPSHOT 20261024
+date: 2026-10-24 20:42:00 CST
+host: iZbp180y8s00kynoo5wjhoZ
+
+== git HEAD ==
+5c876fad05c57a1e5dacee195e768f19fb4de44f 2026-10-24 01:24:50 +0800 feat(modular): 阶段6 Token 用量账本整族搬进 tokens 模块
+
+== git log -30 ==
+5c876fa feat(modular): 阶段6 Token 用量账本整族搬进 tokens 模块
+11f1572 feat(modular): 阶段5 仿真提示词管理 4 条路由搬进 preset 模块
+d7221ae feat(modular): 阶段4 人格管理 7 条 + 挂起审批 1 条搬进模块
+a446b6b feat(modular): 阶段3 第二批试点（/api/role、/api/sessions、/api/security GET+POST）
+1fa76a5 chore: 补提交阶段0/1 的脚本与鉴权补丁（前次漏 add）
+6e86c9f feat(modular): 阶段2 首个真实模块 role-console（/api/presets、/api/role-mode）
+35417b1 chore: 插件化改造前的线上基线快照 (20261024-000225)
+b4ee45e fix(role): 二代允许人格卡与消息里的中文空格，不再改写成逗号
+dc067cb chore(bridge): 同步 2026-10-03 以来未提交的改动
+1c3661f feat(roles): 小鲸鱼角色卡改版 — 去鸣潮/加好感度/六处风格修正
+5502592 chore(roles): 备份改版前的小鲸鱼角色卡(20261023)
+9df6a7e docs: 撤回 v0.2.1 标签与 Release，并把全部引用改为「已撤回」表述
+
+== git status ==
+ M config.example.json
+ M "diary/\346\227\245\350\256\260.jsonl"
+ M "roles/\345\260\217\351\262\270\351\261\274.md"
+ M scripts/compare-routes.mjs
+ M scripts/golden-routes.mjs
+ M src/bridge.js
+ M src/diary-store.js
+ M src/mcp-snowluma-safe.js
+ M src/modules/approval/index.js
+ M src/modules/index.js
+ M src/modules/preset/index.js
+ M src/modules/registry.js
+ M src/modules/role-console/index.js
+ M src/modules/security/index.js
+ M src/modules/tokens/index.js
+ M switch-provider.sh
+?? "docs/\346\250\241\345\235\227\345\245\221\347\272\246.md"
+?? "roles/\345\216\206\345\217\262\347\211\210\346\234\254/"
+?? scripts/compare-routes.mjs.b64
+?? scripts/patch-modules-stage10.mjs
+?? scripts/patch-modules-stage11.mjs
+?? scripts/patch-modules-stage12.mjs
+?? scripts/patch-modules-stage13.mjs
+?? scripts/patch-modules-stage14.mjs
+?? scripts/patch-modules-stage15.mjs
+?? scripts/patch-modules-stage16.mjs
+?? scripts/patch-modules-stage17.mjs
+?? scripts/patch-modules-stage18.mjs
+?? scripts/patch-modules-stage19.mjs
+?? scripts/patch-modules-stage20.mjs
+?? scripts/patch-modules-stage24.mjs
+?? scripts/patch-modules-stage25.mjs
+?? scripts/patch-modules-stage26.mjs
+?? scripts/patch-modules-stage27.mjs
+?? scripts/patch-modules-stage28.mjs
+?? scripts/patch-modules-stage29.mjs
+?? scripts/patch-modules-stage7.mjs
+?? scripts/patch-modules-stage8.mjs
+?? scripts/patch-modules-stage9.mjs
+?? scripts/test-diary-level.mjs
+?? scripts/test-wake-trigger.mjs
+?? src/.bridge-core.tmp.js
+?? src/modules/ai-extras/
+?? src/modules/bili/
+?? src/modules/console/
+?? src/modules/core/
+?? src/modules/forward/
+?? src/modules/image/
+?? src/modules/inspect/
+?? src/modules/memory/
+?? src/modules/message-image/
+?? src/modules/mode/
+?? src/modules/ops/
+?? src/modules/phone/
+?? src/modules/reset/
+?? src/modules/send-legacy/
+?? src/modules/share/
+?? src/modules/slang/
+?? src/modules/social/
+?? src/modules/status/
+?? src/modules/sticker-console/
+?? src/modules/sticker/
+?? src/modules/test-send/
+?? src/modules/voice/
+?? src/modules/whitelist/
+
+== sizes ==
+633376 2026-10-24 16:14:25.255214227 +0800 src/bridge.js
+110444 2026-10-24 16:11:12.668374993 +0800 src/mcp-snowluma-safe.js
+15185 2026-10-24 16:13:18.068828272 +0800 src/diary-store.js
+12714 2026-10-23 23:53:53.109349039 +0800 src/spotify-client.js
+3871 2026-10-23 21:25:21.332671246 +0800 src/qq-model-view.js
+
+== services ==
+active active active active
+== wc -l bridge ==
+ 11953 src/bridge.js
+  1790 src/mcp-snowluma-safe.js
+ 13743 total

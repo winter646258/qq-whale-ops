@@ -17,6 +17,7 @@ import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport,
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
+import { extractMemories, scopeForText } from './auto-memory.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
@@ -3924,6 +3925,29 @@ async function main() {
   }
 
   /** 当前受众的注入文本，超限返回空串（不截半句进 prompt）。 */
+  // MARKER: auto-memory-write
+  // 代码层自动记忆：每回合收工时，从这回合收到的用户消息里抽一条值得记住的话写进 shared-memory。
+  // 主人 2026-10-24 明确要求「直接做代码层的自动写入」——记忆工具靠她自觉调用，实测三个月 0 次。
+  function autoRememberFromTurn(key, userText) {
+    try {
+      if (!key || !userText) return;
+      if (cfg.socialV2?.autoMemory?.enabled === false) return;
+      const who = String(key).startsWith('private:') ? '主人' : '有人';
+      const best = extractMemories(userText, { max: 1, who })[0];
+      if (!best) return;
+      const store = loadSharedMemoryState();
+      if (!store) return;
+      const scope = scopeForText(best.text);
+      const { created } = addItem(store, { text: best.text, scope, importance: best.importance, sourceRef: key });
+      if (created) {
+        saveSharedMemoryState();
+        log(`[auto-memory] 记住（${scope}）：${best.text}`);
+      }
+    } catch (error) {
+      log(`[auto-memory] 抽取失败：${error?.message ?? error}`);
+    }
+  }
+
   function buildSharedMemoryLineFor(key) {
     if (cfg.socialV2?.sharedMemory?.enabled === false) return '';
     const reader = sharedMemoryReaderFor(key);
@@ -11230,6 +11254,7 @@ async function main() {
             collectors.set(frame.sessionId, collector);
             const ended = collector.push(frame.event);
             if (ended) {
+              autoRememberFromTurn(key, ended.userText);
               // reserved2 无行动兜底：普通唤醒回合若既没发消息、也没 mark_read / set_wake_config，
               // 则累计 noActionCount；达到阈值后自动重置 WakeConfig，避免 AI 卡死。
               const silentQueueNow = social.silentTurns.get(frame.sessionId) ?? [];

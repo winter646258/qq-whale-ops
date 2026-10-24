@@ -931,9 +931,19 @@ export function unwrap(response, label) {
 /** 在会话事件流里收集一次 turn 的 assistant 文本（按 turn 分组）。 */
 export function createTurnCollector() {
   const turns = new Map(); // turn -> { text }
+  // 本回合收到的「用户消息」原文。turn/end 时随 text 一起返回，供代码层自动记忆抽取
+  // （见 auto-memory.js）。只收 user/message，桥接自己注入的提示词走 agent/inbox/spliced，不在此列。
+  let pendingUserText = '';
   return {
     /** 处理一条 session/event，返回该事件是否终结了一个 turn（此时可取最终文本）。 */
     push(event) {
+      if (event.type === 'user/message') {
+        for (const block of event.data?.message?.content ?? []) {
+          if (block?.type === 'text' && typeof block.text === 'string') pendingUserText += block.text;
+        }
+        if (pendingUserText.length > 2000) pendingUserText = pendingUserText.slice(0, 2000);
+        return null;
+      }
       if (event.type === 'turn/start') {
         turns.set(event.data.turn, { text: '' });
         return null;
@@ -954,8 +964,10 @@ export function createTurnCollector() {
       if (event.type === 'turn/end') {
         const t = turns.get(event.data.turn);
         turns.delete(event.data.turn);
+        const userText = pendingUserText;
+        pendingUserText = '';
         if (!t) return null;
-        return { turn: event.data.turn, reason: event.data.reason, text: t.text };
+        return { turn: event.data.turn, reason: event.data.reason, text: t.text, userText };
       }
       return null;
     },
