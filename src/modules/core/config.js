@@ -227,7 +227,7 @@ export const configRoutes = [
       if (rejectConsoleOnly({ req, sendJson })) return;
       const h = this.ctx.coreHelpers;
       h.bumpEpoch();
-      h.sessionPromises.clear();
+      h.sessionPromises().clear();
       h.clearAllSocialV2Timers();
       h.drainAllPromptQueues('二代状态已重置');
       const sv2 = h.socialV2();
@@ -240,28 +240,28 @@ export const configRoutes = [
           // 少了这一步，DSH 会继续跑完在途/排队的 turn（token 照烧、副作用照做），
           // 而桥接这边已经把所有映射删掉 —— 输出被静默丢弃，agentToken 也已轮换（它的 MCP 发送全部 403）。
           h.stopRetiredSessionWork(sid, key);
-          h.sessionModels.delete(sid);
-          h.modelAppliedSessions.delete(sid);
-          h.reverse.delete(sid);
-          h.collectors.delete(sid);
-          h.v2TurnStartAt.delete(sid);
-          h.toolCallNames.delete(sid);
-          h.pendingSendToolCalls.delete(sid);
-          h.sendToolSucceededSessions.delete(sid);
+          h.sessionModels().delete(sid);
+          h.modelAppliedSessions().delete(sid);
+          h.reverse().delete(sid);
+          h.collectors().delete(sid);
+          h.v2TurnStartAt().delete(sid);
+          h.toolCallNames().delete(sid);
+          h.pendingSendToolCalls().delete(sid);
+          h.sendToolSucceededSessions().delete(sid);
           // 订阅也要退掉，否则它会在每次重连时被重新 follow 并重发整份快照。
           this.ctx.api.events.forget?.(sid);
         }
         delete state.sessionPolicies[key];
         h.forgetAgentToken(key);
         sv2.conversations.delete(key);
-        h.seenForwardIds.delete(key);
+        h.seenForwardIds().delete(key);
       }
       h.saveState();
-      h.pendingWakeKeys.clear();
+      h.pendingWakeKeys().clear();
       h.clearAllPendingWakeLeases();
-      h.wakeConfigUpdatedKeys.clear();
-      h.markReadCalledKeys.clear();
-      h.wakeConfigMissCount.clear();
+      h.wakeConfigUpdatedKeys().clear();
+      h.markReadCalledKeys().clear();
+      h.wakeConfigMissCount().clear();
       sv2.paused = false;
       try {
         h.atomicWriteJson(h.socialV2File, { conversations: {} });

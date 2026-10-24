@@ -69,13 +69,11 @@ const EXPECTED_MOVED = new Set([
   '/api/socialV2/wake-config', '/api/socialV2/activity', '/api/socialV2/states',
   '/api/socialV2/reset', '/api/socialV2/wake', '/api/socialV2/unread',
   '/api/socialV2/recent', '/api/socialV2/mark-read', '/api/socialV2/message-detail',
-  // 下面 14 条是 mcp-snowluma-safe.js 里的调用字符串，被老正则误抽成路由，
-  // 快照里从来就是 404（现已只扫 bridge.js + src/modules/）。登记成已知缺席。
-  '/api/socialV2/album', '/api/socialV2/check-send', '/api/socialV2/collect-sticker',
-  '/api/socialV2/diary', '/api/socialV2/portrait', '/api/socialV2/qzone',
-  '/api/socialV2/record-sent', '/api/socialV2/schedule', '/api/socialV2/send-burst',
-  '/api/socialV2/send-message', '/api/socialV2/send-poke', '/api/socialV2/send-sticker',
-  '/api/socialV2/send-voice', '/api/socialV2/wait',
+  // 2026-10-24 事故更正：下面 14 条曾被误判成「mcp 调用字符串被误抽成路由」而登记在此，
+  // 真实情况是阶段27 模块化把 config→forward-message 之间 1957 行整段删掉、只搬走 13 条，
+  // 这 14 条连带丢失（MCP 里 8 个工具因此全线 404）。现已逐字回滚进 bridge.js 的
+  // // MARKER: v2-rest-rollback 区段，所以它们必须从这里删掉 ——
+  // EXPECTED_MOVED 只能登记「确实搬进模块了」的路径，绝不能用来消除 MISSING 告警。
   // 阶段28：bili（B 站浏览）
   '/api/socialV2/bili',
   // 阶段14：slang（黑话库管理）

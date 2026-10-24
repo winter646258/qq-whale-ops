@@ -273,8 +273,8 @@ async function setWakeConfig({ req, sendJson, readBody }) {
   st.preSleepWaitObservedAt = 0;
   st.preSleepWaitAccumMs = 0;
   h.saveSocialV2State();
-  h.wakeConfigUpdatedKeys.add(key);
-  h.wakeConfigMissCount.delete(key);
+  h.wakeConfigUpdatedKeys().add(key);
+  h.wakeConfigMissCount().delete(key);
   if (st.pendingWakeTimer) {
     clearTimeout(st.pendingWakeTimer);
     st.pendingWakeTimer = null;

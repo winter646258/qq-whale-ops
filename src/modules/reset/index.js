@@ -45,14 +45,14 @@ async function resetSession({ req, sendJson, readBody }) {
   h.bumpEpoch();
   const oldSessionId = state.sessions[key];
   delete state.sessions[key];
-  h.modelAppliedSessions.delete(oldSessionId);
+  h.modelAppliedSessions().delete(oldSessionId);
   delete state.sessionPolicies[key];
-  h.reverse.delete(oldSessionId);
-  h.collectors.delete(oldSessionId);
-  h.sendToolSucceededSessions.delete(oldSessionId);
-  h.pendingSendToolCalls.delete(oldSessionId);
-  h.v2TurnStartAt.delete(oldSessionId);
-  h.toolCallNames.delete(oldSessionId);
+  h.reverse().delete(oldSessionId);
+  h.collectors().delete(oldSessionId);
+  h.sendToolSucceededSessions().delete(oldSessionId);
+  h.pendingSendToolCalls().delete(oldSessionId);
+  h.v2TurnStartAt().delete(oldSessionId);
+  h.toolCallNames().delete(oldSessionId);
   const pe = h.pending().get(key);
   if (pe) {
     clearTimeout(pe.timer);
@@ -61,7 +61,7 @@ async function resetSession({ req, sendJson, readBody }) {
   h.pending().delete(key);
   h.queued.delete(key);
   h.queuedHintAt.delete(key);
-  h.sessionPromises.delete(key);
+  h.sessionPromises().delete(key);
   h.drainPromptQueue(key, '会话已重置');
   const social = h.social();
   social.recentMessages.delete(key);
@@ -76,13 +76,13 @@ async function resetSession({ req, sendJson, readBody }) {
   h.slangSubmitTimes.delete(key);
   h.cancelSocialTimers(key);
   h.clearSocialV2Timers(key);
-  h.pendingWakeKeys.delete(key);
-  h.wakeConfigUpdatedKeys.delete(key);
-  h.markReadCalledKeys.delete(key);
-  h.wakeConfigMissCount.delete(key);
+  h.pendingWakeKeys().delete(key);
+  h.wakeConfigUpdatedKeys().delete(key);
+  h.markReadCalledKeys().delete(key);
+  h.wakeConfigMissCount().delete(key);
   h.forgetAgentToken(key);
   h.socialV2().conversations.delete(key);
-  h.seenForwardIds.delete(key);
+  h.seenForwardIds().delete(key);
   h.saveSocialV2State();
   h.saveState();
   try { await h.api.stopSessionWork(oldSessionId); }
@@ -123,13 +123,13 @@ async function resetWorkspace({ sendJson }) {
   pending.clear();
   h.queued.clear();
   h.queuedHintAt.clear();
-  h.sessionPromises.clear();
+  h.sessionPromises().clear();
   h.drainAllPromptQueues('工作区已清空');
   const social = h.social();
   social.states.clear();
   social.recentMessages.clear();
   h.messageMediaStore.clear();
-  h.seenForwardIds.clear();
+  h.seenForwardIds().clear();
   social.pendingSummaries.clear();
   social.silentContext.clear();
   social.silentTurns.clear();
@@ -146,12 +146,12 @@ async function resetWorkspace({ sendJson }) {
   const state = h.getState();
   state.sessions = {};
   state.sessionPolicies = {};
-  h.reverse.clear();
-  h.collectors.clear();
-  h.sendToolSucceededSessions.clear();
-  h.pendingSendToolCalls.clear();
-  h.v2TurnStartAt.clear();
-  h.toolCallNames.clear();
+  h.reverse().clear();
+  h.collectors().clear();
+  h.sendToolSucceededSessions().clear();
+  h.pendingSendToolCalls().clear();
+  h.v2TurnStartAt().clear();
+  h.toolCallNames().clear();
   h.saveState();
   try { h.fs.writeFileSync(h.ACTIVITY_LOG, ''); } catch {}
   h.log(`控制台：已清空 QQ 聊天工作区（停止 ${stoppedCount} 个、归档 ${archivedCount} 个会话，映射与活动日志已清空）`);

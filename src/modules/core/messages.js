@@ -91,7 +91,7 @@ async function markRead({ req, sendJson, readBody }) {
   h.ensureWakeable(st, { key });
   st.wakeConfig.confirmedAt = Date.now();
   st.wakeConfig.confirmedBy = 'mark_read';
-  h.markReadCalledKeys.add(key);
+  h.markReadCalledKeys().add(key);
   h.saveSocialV2State();
   this.ctx.log(`[reserved2] 控制台/工具标记 ${key} 未读已读：${markedCount} 条，已确认下一次唤醒配置`);
   sendJson({
