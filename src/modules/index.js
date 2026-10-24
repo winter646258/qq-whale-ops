@@ -40,6 +40,7 @@ import messageImage from './message-image/index.js';
 import mode from './mode/index.js';
 import sendLegacy from './send-legacy/index.js';
 import share from './share/index.js';
+import aiExtras from './ai-extras/index.js';
 
 /**
  * @param {object} ctx 由 `bridge.js` 组装的上下文（cfg / log / stateDir / api / 若干纯函数）
@@ -71,6 +72,7 @@ export function defineModules(_ctx) {
     mode,
     sendLegacy,
     share,
+    aiExtras,
   ];
 }
 

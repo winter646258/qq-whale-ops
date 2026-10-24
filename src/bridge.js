@@ -1519,6 +1519,7 @@ async function main() {
   // ROOT 也在这里交出去：slang 模块读写 config.json 要用 path.join(ROOT, 'config.json')，
   // 它是顶层 const（src/bridge.js:176），不是在 main() 里。
   Object.assign(moduleCtx, { cfg, log, stateDir: STATE_DIR, rootDir: ROOT, fs, path });
+  Object.assign(moduleCtx, { truncateText });
   // ── 群聊黑话/网络用语学习（slang） ──────────────────────────────────────
   let slangEntries = [];
   // 读失败时（被占用 / 权限 / JSON 损坏）必须**暂停写入**：否则内存里的空数组
@@ -1678,6 +1679,18 @@ async function main() {
   // MARKER: modules-ctx-stickers
   // 表情库：stickerEntries / stickerSyncedAt 会被 syncStickerLibrary 整体换成新数组，
   // 所以只交访问器；三个改动函数是 main() 内的声明，包一层即可保持原闭包。
+// MARKER: modules-ctx-ai-extras
+  Object.assign(moduleCtx, {
+    aiExtrasHelpers: {
+      moodStore: () => moodStore(),
+      saveMoodSafe: (store, label) => saveMoodSafe(store, label),
+      affinityEntryFor: (key) => affinityEntryFor(key),
+      recordAffinityForKey: (key, payload) => recordAffinityForKey(key, payload),
+      spotifyClient: () => spotifyClient(),
+      feedbackTimes: () => feedbackTimes,
+      appendFeedbackEntry: (entry) => appendFeedbackEntry(entry),
+    },
+  });
   Object.assign(moduleCtx, {
     stickerHelpers: {
       entries: () => stickerEntries,
@@ -5764,59 +5777,6 @@ async function main() {
         // 三层闸门，另起 HTTP 服务等于把三层重写一遍还容易漏。
         //
         // OAuth 授权不在这里（那要开临时回调端口），见 scripts/spotify-auth.mjs。
-        if (url.pathname === '/api/socialV2/spotify') {
-          try {
-            const body = req.method === 'POST' ? await readBody() : {};
-            const q = url.searchParams;
-            const key = String(body.key ?? q.get('key') ?? '').trim();
-            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-
-            const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
-            if (agentToken && !agentTokenOk(key, agentToken)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-            if (agentToken && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-            if (agentToken && !v2ToolEnabled('spotify')) { sendJson({ ok: false, error: '工具未启用：spotify' }, 403); return; }
-
-            const action = String(body.action ?? q.get('action') ?? 'now-playing').trim();
-            const ACTIONS = ['search', 'now-playing', 'playlists', 'playlist-items', 'saved-tracks', 'status'];
-            if (!ACTIONS.includes(action)) {
-              sendJson({ ok: false, error: `action 必须是 ${ACTIONS.join(' / ')}` }, 400);
-              return;
-            }
-
-            const sp = spotifyClient();
-            if (!sp.configured && action !== 'status') {
-              sendJson({ ok: false, error: 'Spotify 还没配置：config.json 里的 spotify.clientId / clientSecret 是空的。' }, 503);
-              return;
-            }
-
-            if (action === 'status') {
-              sendJson({ ok: true, action, configured: sp.configured, authorized: sp.hasRefreshToken(),
-                scope: sp.grantedScope(),
-                remind: sp.hasRefreshToken() ? '' : '还没授权用户级权限：搜索能用，看正在播放/歌单需要主人点一次授权。' });
-              return;
-            }
-            if (action === 'search') {
-              const r = await sp.search(body.keyword ?? body.q, { type: body.type, limit: body.limit });
-              sendJson({ ok: true, action, ...r }); return;
-            }
-            if (action === 'now-playing') {
-              const r = await sp.nowPlaying();
-              sendJson({ ok: true, action, ...r }); return;
-            }
-            if (action === 'playlists') {
-              sendJson({ ok: true, action, items: await sp.myPlaylists(body.limit) }); return;
-            }
-            if (action === 'playlist-items') {
-              sendJson({ ok: true, action, items: await sp.playlistItems(body.playlistId ?? body.id, body.limit) }); return;
-            }
-            sendJson({ ok: true, action, items: await sp.mySavedTracks(body.limit) });
-          } catch (error) {
-            const needsAuth = Boolean(error?.needsAuth);
-            log(`[spotify] 查询失败：${error?.message ?? error}`);
-            sendJson({ ok: false, error: String(error?.message ?? error), needsAuth }, needsAuth ? 401 : 502);
-          }
-          return;
-        }
 
         // MARKER: qzone-tool
         // 发说说/空间动态。send_qzone_msg 是公开可见、删了也会留痕的不可逆动作，
@@ -6479,78 +6439,6 @@ async function main() {
         // ── 情绪：此刻的心情、长期底色、压着没说的事 ────────────────────────
         // 数值（PAD 三点 + 好感度）只用来算衰减和阈值，对外一律给模糊文本 ——
         // 她自己看到的是「【此刻】有点烦 · 因为xxx」，不是 pleasure=-0.4。
-        if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/api/socialV2/mood') {
-          try {
-            const q = url.searchParams;
-            const body = req.method === 'POST' ? await readBody() : {};
-            const key = String(body.key ?? q.get('key') ?? '').trim();
-            const action = String(body.action ?? q.get('action') ?? 'read').trim();
-            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-            if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-            if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-            if (req.headers['x-agent-token'] && !v2ToolEnabled('mood')) { sendJson({ ok: false, error: '工具未启用：qq_mood' }, 403); return; }
-            if (cfg.socialV2?.mood?.enabled === false) { sendJson({ ok: false, error: 'qq_mood 已在配置里关闭' }, 403); return; }
-
-            const store = moodStore();
-            if (action === 'read') {
-              sendJson({
-                ok: true, key, action,
-                view: describeMood(store, Date.now()),
-                stats: moodStats(store, Date.now()),
-                // 暗流要带 id，否则她没法 resolve —— 注入里不展开内容，翻明细得主动看。
-                undercurrent: store.undercurrent.map((it) => ({ id: it.id, text: it.text, weight: it.weight, at: it.at })),
-                // MARKER: affinity-migrate-read
-                // 好感度按会话取。没存过就是 null —— **绝不回退到某个全局值**，
-                // 那份全局值是谁最后说的就归谁，回退等于把别人的评价说给这个人听。
-                affinity: affinityEntryFor(key)
-              });
-              return;
-            }
-            if (action === 'set') {
-              const next = setMood(store, {
-                label: body.label,
-                reason: body.reason,
-                pleasure: body.pleasure,
-                arousal: body.arousal,
-                dominance: body.dominance
-              });
-              saveMoodSafe(next, '情绪');
-              sendJson({ ok: true, key, action, view: describeMood(next, Date.now()), stats: moodStats(next, Date.now()) });
-              return;
-            }
-            if (action === 'vent') {
-              const next = ventUndercurrent(store, { text: body.text, weight: body.weight });
-              saveMoodSafe(next, '情绪');
-              sendJson({ ok: true, key, action, view: describeMood(next, Date.now()), undercurrent: next.undercurrent });
-              return;
-            }
-            if (action === 'resolve') {
-              const r = resolveUndercurrent(store, body.id ?? q.get('id'));
-              if (!r.item) { sendJson({ ok: false, error: '找不到这件事（id=' + String(body.id ?? '') + '）' }, 404); return; }
-              saveMoodSafe(r.state, '情绪');
-              sendJson({ ok: true, key, action, resolved: r.item, view: describeMood(r.state, Date.now()), undercurrent: r.state.undercurrent });
-              return;
-            }
-            if (action === 'affinity') {
-              // MARKER: affinity-migrate-write
-              // 只写按会话那一份。写不成就让它抛出去 —— 让她看到「没改成」，
-              // 而不是以为改了、下次还念着旧评价。
-              const entry = recordAffinityForKey(key, { level: body.level, note: body.note });
-              sendJson({ ok: true, key, action, affinity: entry, view: describeMood(store, Date.now()) });
-              return;
-            }
-            if (action === 'baseline') {
-              const r = setBaseline(store, { pleasure: body.pleasure, arousal: body.arousal, dominance: body.dominance });
-              saveMoodSafe(r.state, '情绪');
-              sendJson({ ok: true, key, action, moved: r.moved, baseline: r.state.baseline, view: describeMood(r.state, Date.now()) });
-              return;
-            }
-            sendJson({ ok: false, error: '不认识的 action：' + action + '（可用 read/set/vent/resolve/affinity/baseline）' }, 400);
-          } catch (error) {
-            sendJson({ ok: false, error: '情绪操作失败：' + (error?.message ?? error) }, 500);
-          }
-          return;
-        }
 
         // ── 生图：只有主人能让她画 ──────────────────────────────────────────
         // 权限在服务端：prompt 里不提这个能力只是第一道，真正的闸门是 imageAllowedNow。
@@ -6693,31 +6581,6 @@ async function main() {
         // ── 旧 Markdown 日记迁移（仅控制台，幂等）─────────────────────────────
         // 角色调不到（没有 agent token 时走控制台鉴权；带 agent token 会被
         // v2ToolEnabled 的 diary 开关拦，且这个路径不在任何模型工具的描述里）。
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/diary/migrate') {
-          try {
-            const target = path.join(ROOT, 'diary', DIARY_JSONL);
-            const legacy = path.join(ROOT, 'diary', DIARY_LEGACY_MD);
-            const existing = readDiary(target);
-            if (existing.length) {
-              sendJson({ ok: true, skipped: true, reason: '目标 jsonl 已有内容，不覆盖', total: existing.length });
-              return;
-            }
-            const parsed = parseLegacyMarkdown(legacy);
-            if (!parsed.length) { sendJson({ ok: true, migrated: 0, reason: '旧日记没有可迁移的条目' }); return; }
-            // 旧数据没有机器时间戳：给个递增的占位 t，保证排序稳定；time 保留原文。
-            const base = Date.now() - parsed.length * 1000;
-            for (let i = 0; i < parsed.length; i += 1) {
-              parsed[i].t = base + i * 1000;
-              if (!parsed[i].id) parsed[i].id = 'd' + (i + 1).toString(16).padStart(5, '0');
-            }
-            writeDiary(target, parsed);
-            log(`日记迁移：从 ${DIARY_LEGACY_MD} 迁入 ${parsed.length} 条（时间戳保留原文，未纠时区）`);
-            sendJson({ ok: true, migrated: parsed.length, total: parsed.length });
-          } catch (error) {
-            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
-          }
-          return;
-        }
 
         // ── 日记 / 相册（diary-album-tools）：作用域严格受限，AI 碰不到其他文件 ─────────
         // 为什么需要：QQ 会话执行期白名单不含 read/write/bash，
@@ -7343,37 +7206,6 @@ async function main() {
         // 不应让某个群里的 AI 读到别的群烧了多少钱。这里再显式拒绝一次做双保险。
         // ── 工具调用日志 ─────────────────────────────────────────────────────
         // ── 反馈 / 自己消息 / 消息详情 / 活跃成员 ────────────────────────────
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/feedback') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const level = body.level === 'warning' || body.level === 'error' ? body.level : 'info';
-          const rawMessage = String(body.message ?? '').trim();
-          if (!key || !rawMessage) { sendJson({ ok: false, error: 'key 和 message 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('feedback')) { sendJson({ ok: false, error: '工具未启用：qq_report_feedback' }, 403); return; }
-          // 反馈限频：防止持有会话 token 的调用方刷磁盘/日志。
-          const fNow = Date.now();
-          const fTimes = feedbackTimes.get(key) || [];
-          const fRecentMinute = fTimes.filter((t) => fNow - t < 60000).length;
-          const fRecentHour = fTimes.filter((t) => fNow - t < 3600000).length;
-          if (fRecentMinute >= 5 || fRecentHour >= 20) {
-            sendJson({ ok: false, error: '反馈过于频繁，请稍后再试' }, 429);
-            return;
-          }
-          fTimes.push(fNow);
-          feedbackTimes.set(key, fTimes.slice(-100));
-          const maxLength = Math.max(1, Number(cfg.socialV2?.feedback?.maxLength) || 500);
-          const message = truncateText(rawMessage, maxLength);
-          appendFeedbackEntry({ id: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), key, level, message, time: new Date().toISOString() });
-          log(`[reserved2] AI 反馈 (${key}) [${level}]: ${message.slice(0, 80)}`);
-          appendActivity(`${key} [reserved2] AI 反馈 [${level}]：${message.slice(0, 80)}`);
-          if (cfg.socialV2?.feedback?.notifyOwnerOnError && level === 'error' && cfg.ownerQQ) {
-            log(`[reserved2] 错误级反馈，可通知 owner ${cfg.ownerQQ}（当前仅记录日志）`);
-          }
-          sendJson({ ok: true, key, level, message });
-          return;
-        }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/record-sent') {
           // 内部接口不对外开放：防止持有会话 token 的调用方伪造“我说过…”的历史记录。
           sendJson({ ok: false, error: '该接口仅桥接内部使用，不接受外部调用' }, 403);

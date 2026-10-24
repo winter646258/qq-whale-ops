@@ -81,6 +81,10 @@ const EXPECTED_MOVED = new Set([
   '/api/socialV2/shared-memory',
   '/api/socialV2/slang/query',
   '/api/socialV2/slang/submit',
+  '/api/socialV2/mood',
+  '/api/socialV2/spotify',
+  '/api/socialV2/diary/migrate',
+  '/api/socialV2/feedback',
 ]);
 // 会随运行时间变化的路由：形状可以比，长度不行。
 const keysOf = (r) => JSON.stringify([r.status, r.shape, r.ok]);
