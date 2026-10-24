@@ -77,6 +77,8 @@ const EXPECTED_MOVED = new Set([
   '/api/send/group',
   '/api/send/private',
   '/api/send/reply',
+  '/api/socialV2/share-signal',
+  '/api/socialV2/shared-memory',
 ]);
 // 会随运行时间变化的路由：形状可以比，长度不行。
 const keysOf = (r) => JSON.stringify([r.status, r.shape, r.ok]);
