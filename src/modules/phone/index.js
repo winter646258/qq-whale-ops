@@ -18,6 +18,22 @@
 // 3) `/api/phone/result` 的 body 要在**令牌校验之后**才读：
 //    读早了等于给未授权请求一次无成本的 body 解析。
 
+// MARKER: phone-agent-deny —— 智能体进程不许碰浏览器桥。
+// 老代码里 /api/phone/* 不在 agentAllowed 白名单内，所以 agent token 请求会被
+// 集中闸门回 403「该接口仅控制台可用」(41 字节)。模块化后委派点排在那道闸门之前，
+// phone 模块会先跑到自己的 phoneTokenOk 校验、返回 401「令牌无效」(36 字节) ——
+// 两者都拒绝，但外层语义变了（黄金快照抓到的唯一非预期差异）。
+// 这里补回老口径：带 agent 标识的直接 403，与白名单/记忆/slang 同一判据。
+function agentDeny(arg) {
+  const req = arg?.req;
+  if (!req) return false;
+  if (req.headers['x-agent-call'] !== undefined || String(req.headers['x-agent-token'] ?? '') !== '') {
+    arg.sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
+    return true;
+  }
+  return false;
+}
+
 function phoneCors(res) {
   if (!res || typeof res.setHeader !== 'function') return;
   res.setHeader('access-control-allow-origin', '*');
@@ -27,6 +43,7 @@ function phoneCors(res) {
 
 async function poll({ req, res, sendJson }) {
   phoneCors(res);
+  if (agentDeny({ req, sendJson })) return;
   if (!this.ctx.phoneTokenOk(req.headers['x-phone-token'])) {
     sendJson({ ok: false, error: '令牌无效' }, 401);
     return;
@@ -37,6 +54,7 @@ async function poll({ req, res, sendJson }) {
 
 async function submitResult({ req, res, sendJson, readBody }) {
   phoneCors(res);
+  if (agentDeny({ req, sendJson })) return;
   if (!this.ctx.phoneTokenOk(req.headers['x-phone-token'])) {
     sendJson({ ok: false, error: '令牌无效' }, 401);
     return;
@@ -49,6 +67,7 @@ async function submitResult({ req, res, sendJson, readBody }) {
 
 async function status({ req, res, sendJson }) {
   phoneCors(res);
+  if (agentDeny({ req, sendJson })) return;
   if (!this.ctx.phoneTokenOk(req.headers['x-phone-token'])) {
     sendJson({ ok: false, error: '令牌无效' }, 401);
     return;
