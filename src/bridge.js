@@ -3786,6 +3786,11 @@ async function main() {
     goodCheckedAt: 0,
     degraded: false,      // 当前是否处于"已告警"状态（边沿触发，避免刷屏）
     reason: '',
+    // ── WS 看门狗观测（见 startWsWatchdog）──
+    lastConnectError: '',      // 最近一次 connect() 失败原因
+    lastConnectErrorAt: 0,
+    watchdogRevives: 0,        // 看门狗累计强制重连次数
+    watchdogLastAt: 0,
   };
 
   /** 记录一次"上游还活着"的证据。任何来自 SnowLuma 的事件包都算（含心跳）。 */
@@ -3895,6 +3900,72 @@ async function main() {
     setInterval(() => { void pollSnowlumaStatus(); }, SNOWLUMA_STATUS_POLL_MS);
     // 边沿告警的兜底心跳：主信号（心跳 status.good）到达时会立刻评估，这里只防"心跳也没了"
     setInterval(reportSnowlumaHealth, 30_000);
+  }
+
+  // ── WS 看门狗：SDK 自动重连失效时的最后一道保险 ─────────────────────────────
+  //
+  // 为什么需要它（这是「WS 断了必须人工 systemctl restart」的真正根因）：
+  //   SDK 的 close() 会把内部的 closedByUser 置 true，而这个标志**只有
+  //   connect() 会清回 false**。桥接在 token 热切换时是 close() + connect()
+  //   连着调用的；只要 connect() 那一步失败（异步 rejection 被空的 try/catch 吞掉），
+  //   closedByUser 就永久停在 true —— SDK 的退避重连据此判断「是用户主动关的，
+  //   不该重连」，于是**再也不发起任何连接**。进程还活着、日志还在刷「重连中…」，
+  //   但链路永远不会再通。SDK 自身没有任何「重连久未成功」的出口。
+  //
+  // 看门狗不碰 SDK 内部字段，只用两个可信的外部事实：
+  //   · bot.isConnected —— 底层 socket 是否 OPEN，SDK 的公开 getter；
+  //   · 连续多次采样都为 false —— 证明不是瞬时抖动。
+  // 满足条件就 close() + connect() 一次，把 closedByUser 重新清回 false。
+  const WS_WATCHDOG_INTERVAL_MS = 60_000;    // 采样周期
+  const WS_WATCHDOG_FAILS_BEFORE_REVIVE = 3; // 连续 3 次（约 3 分钟）不通才动手
+  const WS_WATCHDOG_BACKOFF_MS = 5 * 60_000; // 同一轮故障里最快每 5 分钟重连一次
+  let wsWatchdogStarted = false;
+  let wsWatchdogFails = 0;
+  let wsWatchdogLastReviveAt = 0;
+
+  /**
+   * 启动 WS 看门狗。
+   * @param {() => ({ isConnected: boolean, connect: () => Promise<void>, close: (c?: number, r?: string) => void })} getBot
+   *   延迟取 bot 的取值器。**必须传函数而不是对象**：bot 在 main() 里声明得比这里
+   *   晚得多（`const`，TDZ），直接引用会在启动瞬间抛
+   *   「Cannot access 'bot' before initialization」。
+   */
+  function startWsWatchdog(getBot) {
+    if (wsWatchdogStarted) return;
+    wsWatchdogStarted = true;
+    const timer = setInterval(() => {
+      let b;
+      try { b = getBot(); } catch { return; }
+      if (!b) return;
+      if (b.isConnected) {
+        if (wsWatchdogFails > 0) log(`[ws-watchdog] 连接已恢复（此前连续 ${wsWatchdogFails} 次不通）`);
+        wsWatchdogFails = 0;
+        return;
+      }
+      wsWatchdogFails += 1;
+      if (wsWatchdogFails < WS_WATCHDOG_FAILS_BEFORE_REVIVE) return;
+      const now = Date.now();
+      if (now - wsWatchdogLastReviveAt < WS_WATCHDOG_BACKOFF_MS) return;
+      wsWatchdogLastReviveAt = now;
+      snowlumaHealth.watchdogRevives += 1;
+      snowlumaHealth.watchdogLastAt = now;
+      log(`[ws-watchdog] WS 已连续 ${wsWatchdogFails} 次采样不通，强制重连（第 ${snowlumaHealth.watchdogRevives} 次）`);
+      // 先 close 再 connect：close() 会清掉 SDK 的 socket 与 connectPromise，
+      // 让 connect() 走完整流程并把 closedByUser 清回 false —— 这正是自愈的关键一步。
+      // 但 close() 会把 closedByUser 置 true，所以两步必须绑在一起，且 connect() 必须接住失败。
+      try { b.close(1000, 'watchdog'); } catch (error) {
+        log(`[ws-watchdog] close 异常（忽略，继续 connect）：${error?.message ?? error}`);
+      }
+      Promise.resolve()
+        .then(() => b.connect())
+        .then(() => log('[ws-watchdog] 已重新发起连接'))
+        .catch((error) => {
+          snowlumaHealth.lastConnectError = error?.message ?? String(error);
+          snowlumaHealth.lastConnectErrorAt = Date.now();
+          log(`[ws-watchdog] 强制重连失败：${snowlumaHealth.lastConnectError}`);
+        });
+    }, WS_WATCHDOG_INTERVAL_MS);
+    timer.unref?.();
   }
 
   // ── 本地控制台（独立 Web 面板，不依赖 DSH WebUI） ───────────────────────────
@@ -12175,7 +12246,18 @@ async function main() {
     // 更新了就让 SDK 立刻用新参数重连（否则要等下一轮退避，最长要好几秒）
     if (wsChanged) {
       try { bot.close(1000, 'token-refresh'); } catch {}
-      try { bot.connect(); } catch {}
+      // ⚠️ 这里**不能**写成 `try { bot.connect(); } catch {}`：
+      //   · `connect()` 是 async，同步 try/catch 抓不到它的 rejection，只会变成
+      //     unhandledRejection（被全局兜底吞掉，日志里只剩「重连中…」）；
+      //   · 更糟的是 `close()` 会先把 SDK 的 `closedByUser` 置 true，只有
+      //     `connect()` 能把它清回 false。一旦 connect 这一步失败，SDK 内部的
+      //     自动重连逻辑从此永久停摆 —— 这正是「WS 断了必须人工 restart」的根因。
+      // 所以必须显式接住失败，并在失败后交给看门狗（wsWatchdog）兜底重连。
+      bot.connect().catch((error) => {
+        snowlumaHealth.lastConnectError = error?.message ?? String(error);
+        snowlumaHealth.lastConnectErrorAt = Date.now();
+        log(`⚠️ WS 热切换重连失败（${snowlumaHealth.lastConnectError}），交给看门狗兜底`);
+      });
     }
     return wsChanged;
   }
@@ -12227,6 +12309,9 @@ async function main() {
     // 日志里的「token 自愈失败」与 config.json 的 snowluma.homeDir。
     log(`SnowLuma 首次连接未成功（将在后台自动重连并尝试自愈 WS token）: ${error?.message ?? error}`);
   });
+  // WS 看门狗：SDK 自己重连失效时的兜底（根因见 startWsWatchdog 的注释）。
+  // 传取值器而不是 bot 本身，避免任何 TDZ 风险。
+  startWsWatchdog(() => bot);
   log('桥接已启动。按 Ctrl+C 退出。');
   // 预热表情库：启动时同步一次 QQ 收藏表情，失败不阻塞（AI 首次调用工具时还会再试）。
   if (cfg.socialV2?.sticker?.enabled !== false) {
