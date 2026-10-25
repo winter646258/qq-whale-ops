@@ -72,3 +72,9 @@ audio/
 /roles/*.pre-*
 /roles/*.myversion-*
 /roles/历史版本/
+
+# 她的日记与相册：运行时数据，含私人内容和情绪记录，不发布。
+# 目录结构保留（.gitkeep），文件本身永不入库。
+/diary/*.jsonl
+/diary/*.md.bak-*
+/album/
