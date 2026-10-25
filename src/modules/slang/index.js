@@ -480,22 +480,38 @@ async function aiSubmit({ req, sendJson, readBody }) {
 // 路由表：id 型路由用 prefix 挂号再在 handler 里 parseIdPath 复核（exact 无法表达可变段）。
 // 注意 registry 的 compareRoutes 是「exact 优先」，所以 `/api/slang/clear` 这类
 // 固定后缀永远赢过 `/api/slang/<id>`，无需担心顺序。
+// MARKER: slang-console-only —— 管理类接口只给控制台。
+// 集中闸门只挡「没有控制台令牌」的请求；智能体进程同时握有控制台令牌，
+// 所以这些管理接口必须在 handler 层自己拒掉 agent（与白名单/记忆同口径）。
+// 判据用「带了 agent 标识」而不是「令牌对错」：空串令牌也算带，否则会被绕过。
+// 注意 handler 的签名是单个对象 { req, res, url, sendJson, readBody }。
+function consoleOnly(fn) {
+  return async function guarded(arg) {
+    const req = arg?.req;
+    if (req && (req.headers['x-agent-call'] !== undefined || String(req.headers['x-agent-token'] ?? '') !== '')) {
+      arg.sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
+      return;
+    }
+    return fn.call(this, arg);
+  };
+}
+
 const routes = [
-  { method: 'GET', path: '/api/slang', kind: 'exact', handler: list },
-  { method: 'POST', path: '/api/slang', kind: 'exact', handler: create },
-  { method: 'POST', path: '/api/slang/clear', kind: 'exact', handler: clear },
-  { method: 'POST', path: '/api/slang/batch-delete', kind: 'exact', handler: batchDelete },
-  { method: 'POST', path: '/api/slang/batch-confirm', kind: 'exact', handler: batchConfirm },
-  { method: 'POST', path: '/api/slang/batch-reject', kind: 'exact', handler: batchReject },
-  { method: 'POST', path: '/api/slang/extract', kind: 'exact', handler: extract },
-  { method: 'POST', path: '/api/slang/research', kind: 'exact', handler: research },
-  { method: 'POST', path: '/api/slang/config', kind: 'exact', handler: updateConfig },
+  { method: 'GET', path: '/api/slang', kind: 'exact', handler: consoleOnly(list) },
+  { method: 'POST', path: '/api/slang', kind: 'exact', handler: consoleOnly(create) },
+  { method: 'POST', path: '/api/slang/clear', kind: 'exact', handler: consoleOnly(clear) },
+  { method: 'POST', path: '/api/slang/batch-delete', kind: 'exact', handler: consoleOnly(batchDelete) },
+  { method: 'POST', path: '/api/slang/batch-confirm', kind: 'exact', handler: consoleOnly(batchConfirm) },
+  { method: 'POST', path: '/api/slang/batch-reject', kind: 'exact', handler: consoleOnly(batchReject) },
+  { method: 'POST', path: '/api/slang/extract', kind: 'exact', handler: consoleOnly(extract) },
+  { method: 'POST', path: '/api/slang/research', kind: 'exact', handler: consoleOnly(research) },
+  { method: 'POST', path: '/api/slang/config', kind: 'exact', handler: consoleOnly(updateConfig) },
   // AI 工具面（原 v2:memory 族）
   { method: 'GET', path: '/api/socialV2/slang/query', kind: 'exact', handler: aiQuery },
   { method: 'POST', path: '/api/socialV2/slang/submit', kind: 'exact', handler: aiSubmit },
-  { method: 'PATCH', path: '/api/slang/', kind: 'prefix', handler: update },
-  { method: 'DELETE', path: '/api/slang/', kind: 'prefix', handler: removeOne },
-  { method: 'POST', path: '/api/slang/', kind: 'prefix', handler: postIdPath },
+  { method: 'PATCH', path: '/api/slang/', kind: 'prefix', handler: consoleOnly(update) },
+  { method: 'DELETE', path: '/api/slang/', kind: 'prefix', handler: consoleOnly(removeOne) },
+  { method: 'POST', path: '/api/slang/', kind: 'prefix', handler: consoleOnly(postIdPath) },
 ];
 
 export default { name: 'slang', title: '黑话库管理', inject, routes };

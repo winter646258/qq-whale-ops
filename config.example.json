@@ -229,7 +229,14 @@
       "checkIntervalMinMs": 1800000,
       "checkIntervalMaxMs": 5400000,
       "idleThresholdMs": 900000,
-      "probability": 0.3
+      "probability": 0.3,
+      "minIntervalMs": 2700000,
+      "maxPerHour": 2,
+      "quietHours": {
+        "start": 23,
+        "end": 8
+      },
+      "capProbability": 0.5
     },
     "feedback": {
       "maxLength": 500,
@@ -246,6 +253,11 @@
     },
     "modules": {
       "enabled": true
+    },
+    "turnBudget": {
+      "maxSteps": 40,
+      "maxMs": 600000,
+      "maxSends": 8
     }
   },
   "qzone": {

@@ -1003,7 +1003,18 @@ function loadConfig() {
         checkIntervalMinMs: 30 * 60 * 1000,
         checkIntervalMaxMs: 90 * 60 * 1000,
         idleThresholdMs: 15 * 60 * 1000,
-        probability: 0.3
+        probability: 0.3,
+        // MARKER: proactive-limits-config
+        minIntervalMs: 45 * 60 * 1000,
+        maxPerHour: 2,
+        quietHours: { start: 23, end: 8 },
+        capProbability: 0.5
+      },
+      // MARKER: turn-budget-config —— 回合硬预算默认值
+      turnBudget: {
+        maxSteps: 40,        // 单回合工具调用次数上限
+        maxMs: 600000,       // 单回合时长上限（10 分钟）
+        maxSends: 8          // 单回合发送条数上限
       },
       feedback: {
         maxLength: 500,
@@ -3046,6 +3057,80 @@ async function main() {
   }
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
+  // MARKER: turn-budget
+  // 回合硬预算。与内容彻底无关的兜底闸门：她已经证明「判断没错但停不下来」
+  // （turn 15 在群里配合玩梗，52 分钟 129 次工具调用），所以不能再靠提示词自律。
+  const turnBudgetLedger = new Map(); // sessionId -> { startedAt, steps, sends, cancelled, reason }
+  const TURN_BUDGET_GRACE_FILE = path.join(STATE_DIR, 'wake-config-grace.json');
+  function turnBudgetCfg() {
+    const b = cfg.socialV2?.turnBudget ?? {};
+    const pick = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : d);
+    // 正常回合 2–10 分钟 / 10–15 次工具 / 2–4 条发送，这里留 3–4 倍余量
+    return { maxSteps: pick(b.maxSteps, 40), maxMs: pick(b.maxMs, 600000), maxSends: pick(b.maxSends, 8) };
+  }
+  function turnBudgetFor(sessionId) {
+    let entry = turnBudgetLedger.get(sessionId);
+    if (!entry) {
+      entry = { startedAt: Date.now(), steps: 0, sends: 0, cancelled: false, reason: '' };
+      turnBudgetLedger.set(sessionId, entry);
+    }
+    return entry;
+  }
+  function readGraceNotes() {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(TURN_BUDGET_GRACE_FILE, 'utf8'));
+      return parsed && typeof parsed === 'object' && parsed.notes && typeof parsed.notes === 'object' ? parsed.notes : {};
+    } catch { return {}; }
+  }
+  function writeGraceNote(key, note) {
+    try {
+      const notes = readGraceNotes();
+      if (note) notes[key] = note; else delete notes[key];
+      const trimmed = Object.fromEntries(Object.entries(notes).slice(-50));
+      const tmp = `${TURN_BUDGET_GRACE_FILE}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ notes: trimmed }, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, TURN_BUDGET_GRACE_FILE);
+    } catch (error) {
+      log('[turn-budget] 写 grace 失败：', error?.message ?? error);
+    }
+  }
+  function noteTurnBudgetStep(key, sessionId) {
+    if (!key || !sessionId) return;
+    const b = turnBudgetCfg();
+    const entry = turnBudgetFor(sessionId);
+    entry.steps += 1;
+    if (entry.cancelled) return;
+    if (entry.steps > b.maxSteps) { void cancelTurnForBudget(key, sessionId, entry, `步数 ${entry.steps} > ${b.maxSteps}`); return; }
+    if (Date.now() - entry.startedAt > b.maxMs) { void cancelTurnForBudget(key, sessionId, entry, `时长超 ${Math.round(b.maxMs / 60000)} 分钟`); }
+  }
+  function noteTurnBudgetSend(key, sessionId) {
+    if (!key || !sessionId) return;
+    const b = turnBudgetCfg();
+    const entry = turnBudgetFor(sessionId);
+    entry.sends += 1;
+    if (entry.cancelled) return;
+    if (entry.sends > b.maxSends) { void cancelTurnForBudget(key, sessionId, entry, `发送 ${entry.sends} 条 > ${b.maxSends}`); }
+  }
+  // 掐回合。不抛错：调用方是 tool/result 处理流，抛了会连带吞掉正常逻辑。
+  async function cancelTurnForBudget(key, sessionId, entry, why) {
+    if (entry.cancelled) return;
+    entry.cancelled = true;
+    entry.reason = why;
+    const elapsedMs = Date.now() - entry.startedAt;
+    log(`[turn-budget] 超上限（${why}）：${key} 已跑 ${Math.round(elapsedMs / 1000)}s / ${entry.steps} 步 / ${entry.sends} 条，掐掉本回合`);
+    appendActivity(`${key} [turn-budget] 超上限（${why}），已中止回合`);
+    // stopSessionWork = 清队列 + session/cancel + archiveSession，是桥接现成且唯一的
+    // 「让 DSH 停下这个会话」入口（见 stopRetiredSessionWork 的注释）。别自己拼 cancel。
+    try {
+      await api.stopSessionWork(sessionId);
+    } catch (error) {
+      log('[turn-budget] 中止回合失败（DSH 侧可能仍在内跑）：', error?.message ?? error);
+    }
+    writeGraceNote(key, {
+      at: Date.now(), reason: why,
+      elapsedSec: Math.round(elapsedMs / 1000), steps: entry.steps, sends: entry.sends
+    });
+  }
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
   // MARKER: role-card-refresh —— 会话 -> 最近一次已注入的角色卡指纹。
   // 进程重启后为空，所以每个会话重启后第一次唤醒会重注入一次，属于预期行为。
@@ -5838,6 +5923,7 @@ async function main() {
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
+            if (sentMessages.length > 0) noteTurnBudgetSend(key, state.sessions[key]);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
             const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
@@ -6453,6 +6539,7 @@ async function main() {
             saveSocialV2State();
             scheduleReplyCheckV2(key);
             log(`[sticker] 工具发送表情 ${key}: ${sent.entry?.id || stickerId}`);
+            noteTurnBudgetSend(key, state.sessions[key]);
             appendActivity(`${key} [sticker] 工具发送表情：${label}`);
             sendJson({ ok: true, key, sticker: sent.entry, sent: 1, failed: 0, quoted: quotedInfo });
           } catch (error) {
@@ -7057,6 +7144,17 @@ async function main() {
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+      const retcode = Number(body.retcode);
+      // 群聊 result=120 多半是禁言：查实之后抛一个能看懂的错误，并把这个群静音到期。
+      if (kind === 'group' && retcode === 120) {
+        const mutedUntil = await probeGroupMute(id);
+        if (mutedUntil > 0) {
+          mutedUntilByGroup.set(String(id), mutedUntil);
+          const until = new Date(mutedUntil).toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
+          log(`[mute-aware] ${kind}:${id} 被禁言，到 ${until} 解禁，期间不唤醒`);
+          throw new Error(`这个群正在禁言你，到 ${until} 解禁；禁言期间发不出去，不用重试`);
+        }
+      }
       const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口，请检查 config.json 的 snowluma.httpUrl 是否为 OneBot HTTP API 地址）' : '';
       throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
     }
@@ -7654,7 +7752,34 @@ async function main() {
     if (min > max) [min, max] = [max, min];
     return Math.floor(min + Math.random() * (max - min + 1));
   };
-  let selfNickname = 'deepseek'; // 机器人昵称（启动时从网关获取，识别"被提到"用）
+  let selfNickname = 'deepseek';
+  // MARKER: mute-aware
+  // QQ 侧的 retcode 本身没有语义，群聊 result=120 最常见的成因就是「禁言中」。
+  // 与其让她一次次打字、发送、被打回，不如真去查一次群成员信息把答案坐实：
+  // 拿到 shut_up_timestamp 就把这个群静音到期，期间 evaluateWakeTriggerV2 直接
+  // 返回 null（不唤醒），到期自动恢复。重启会清空这张表，最多多失败一次。
+  const mutedUntilByGroup = new Map();
+
+  async function probeGroupMute(groupId) {
+    try {
+      const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+      const res = await fetch(`${httpUrl}/get_group_member_info`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+        },
+        body: JSON.stringify({ group_id: Number(groupId), user_id: Number(selfUserId), no_cache: true }),
+        signal: AbortSignal.timeout(8000)
+      });
+      const body = await res.json().catch(() => ({}));
+      const ts = Number(body?.data?.shut_up_timestamp) || 0;
+      return ts * 1000 > Date.now() ? ts * 1000 : 0;
+    } catch {
+      return 0;
+    }
+  }
+  // MARKER: mute-aware-end // 机器人昵称（启动时从网关获取，识别"被提到"用）
   // MARKER: self-user-id
   // 自己的 QQ 号。用于「不主动打扰自己」—— 幽灵会话 private:<自己> 会排上主动档期。
   let selfUserId = '';
@@ -9705,6 +9830,16 @@ async function main() {
 
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
     if (kind === 'private') return 'private';
+    // MARKER: mute-aware-skip —— 禁言期间这个群发不出任何东西，唤醒只会白烧 token。
+    if (kind === 'group') {
+      const gid = key.slice(key.indexOf(':') + 1);
+      const mutedUntil = mutedUntilByGroup.get(gid) || 0;
+      if (mutedUntil) {
+        if (mutedUntil > Date.now()) return null;
+        mutedUntilByGroup.delete(gid);
+        log(`[mute-aware] ${key} 禁言已到期，恢复唤醒`);
+      }
+    }
     const tr = st.wakeConfig?.triggers ?? {};
     if (tr.anyMessage) return 'anyMessage';
     if (tr.atMention) {
@@ -10091,7 +10226,20 @@ async function main() {
     let styleLine = '';
     const styleHint = String(cfg.socialV2?.send?.styleHint ?? '').trim();
     if (styleHint) styleLine = `【断句】${styleHint}\n\n`;
-    const base = roleLine + tokenLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine;
+    // MARKER: turn-budget-grace-inject
+    // 上一轮如果是被硬停的，这一轮必须先告诉她 —— 否则她以为是自己说完的，
+    // 会接着同一个话题继续发，把「被打断」变成「主动续话」。
+    let graceLine = '';
+    try {
+      const note = readGraceNotes()[key];
+      if (note && note.at) {
+        graceLine = `【上一轮被打断】上一轮你不是自己说完的：跑了 ${note.elapsedSec} 秒、${note.steps} 次工具、发了 ${note.sends} 条，被系统掐掉了（${note.reason}）。这一轮只做一件事：看一眼现在群里在说什么，回一条就够了，然后收尾。不要接着上一轮的话尾继续补，也不要解释为什么断开。\n\n`;
+        writeGraceNote(key, null);
+      }
+    } catch (error) {
+      log('[turn-budget] grace 注入跳过：', error?.message ?? error);
+    }
+    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -10161,6 +10309,20 @@ async function main() {
       if (!m || !proactiveAllowed(key, m[1], Number(m[2]), cfg, currentMode)) {
         log(`[reserved2] 跳过唤醒 ${key}（${reason}）：不在主动白名单内`);
         return;
+      }
+    }
+    // MARKER: mute-aware-send
+    // 禁言期间任何唤醒都是白烧一轮：她打字、发送、再被打回。evaluateWakeTriggerV2
+    // 只管「被动唤醒」，proactiveCheck / replyCheck / bootstrap 都绕过它，所以统一
+    // 在这里兜一次。私聊没有禁言这回事，跳过判断。
+    if (reason !== 'private') {
+      const mm = /^group:(\d+)$/.exec(key);
+      if (mm) {
+        const mutedUntil = mutedUntilByGroup.get(mm[1]) || 0;
+        if (mutedUntil > Date.now()) {
+          log(`[reserved2] 跳过唤醒 ${key}（${reason}）：群内被禁言，还剩 ${Math.round((mutedUntil - Date.now()) / 60000)} 分钟`);
+          return;
+        }
       }
     }
     const st = getSocialV2State(key);
@@ -10313,6 +10475,10 @@ async function main() {
     nameMention: 70,
     keyword: 60,
     anyMessage: 50,
+    // 「按概率随口接一句」原来漏在表外，wakePriorityV2 落在 `?? 0` 分支上，
+    // 于是繁忙队列里它永远垫底、队列满时第一个被丢。介于 anyMessage(50) 与
+    // replyCheck(40) 之间才是它的真实位置。
+    probability: 45,
     replyCheck: 40,
     timeout: 30,
     proactiveCheck: 20,
@@ -10555,6 +10721,42 @@ async function main() {
     st.proactiveTimer = null;
   }
 
+  // MARKER: proactive-limits
+  // 原来只有 idleThresholdMs + probability 再乘四个折扣（回话后 ×0.5、夜里 ×0.3、
+  // 一小时内发过 5 条 ×0.3）。乘法永远到不了 0，所以深夜照样排档期、刚说完也不停。
+  // 参照 ATLES 的 proactive 配置补三个硬闸：
+  //   1) 距上次 AI 发言 < minIntervalMs → 0（不是 ×0.5）
+  //   2) 近一小时已冒泡 ≥ maxPerHour 次 → 0
+  //   3) quietHours（默认 23:00-08:00，支持跨午夜）→ 0（不是 ×0.3）
+  function proactiveLimitsCfg() {
+    const p = cfg.socialV2?.proactive ?? {};
+    const num = (v, d) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : d);
+    return {
+      minIntervalMs: num(p.minIntervalMs, 45 * 60 * 1000),
+      maxPerHour: Math.max(1, Math.floor(num(p.maxPerHour, 2))),
+      quietHours: p.quietHours === null ? null : (p.quietHours ?? { start: 23, end: 8 }),
+      capProbability: Math.min(1, Math.max(0, num(p.capProbability, 0.5)))
+    };
+  }
+  function inQuietHours(hours, date = new Date()) {
+    if (!hours) return false;
+    const start = Number(hours.start);
+    const end = Number(hours.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start === end) return false;
+    const h = date.getHours();
+    return start < end ? (h >= start && h < end) : (h >= start || h < end); // 支持 23→8 跨午夜
+  }
+  // 返 0 = 这一轮不许冒泡；返 >0 = 允许的概率上限
+  function proactiveHardCapV2(key, st) {
+    const limits = proactiveLimitsCfg();
+    if (inQuietHours(limits.quietHours)) return 0;
+    const now = Date.now();
+    if (st.lastAiReplyAt && now - Number(st.lastAiReplyAt) < limits.minIntervalMs) return 0;
+    const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+    const aiLastHour = recent.filter((m) => m && m.isSelf && now - Number(m.time || 0) < 60 * 60 * 1000).length;
+    if (aiLastHour >= limits.maxPerHour) return 0;
+    return limits.capProbability;
+  }
   function scheduleProactiveCheckV2(key, opts = {}) {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
@@ -10599,7 +10801,16 @@ async function main() {
       const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;
-      if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
+      // MARKER: proactive-limits-apply —— 硬闸放在四个乘法折扣之后，
+      // 0 就是 0，不会被任何公式抬回来。
+      const hardCap = proactiveHardCapV2(key, st);
+      if (hardCap <= 0) {
+        log(`[reserved2] proactive 跳过 ${key}（安静时段/刚说过/本小时已到上限）`);
+      } else {
+        prob = Math.min(prob, hardCap);
+      }
+      if (hardCap > 0 && idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
+        void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
         void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
       }
       scheduleProactiveCheckV2(key);
@@ -11232,6 +11443,7 @@ async function main() {
               sendToolSucceededSessions.delete(frame.sessionId);
               pendingSendToolCalls.delete(frame.sessionId);
               v2TurnStartAt.set(frame.sessionId, Date.now());
+              turnBudgetLedger.set(frame.sessionId, { startedAt: Date.now(), steps: 0, sends: 0, cancelled: false, reason: '' });
             }
             if (frame.event.type === 'tool/call') {
               const toolName = String(frame.event.data?.name ?? '');
@@ -11282,6 +11494,8 @@ async function main() {
                 }
               }
             }
+            // MARKER: turn-budget-step
+            if (frame.event.type === 'tool/result') noteTurnBudgetStep(key, frame.sessionId);
             const collector = collectors.get(frame.sessionId) ?? createTurnCollector();
             collectors.set(frame.sessionId, collector);
             const ended = collector.push(frame.event);
@@ -11323,6 +11537,17 @@ async function main() {
                   at: Date.now()
                 };
                 globalThis.__qqTurnContext = null;
+              }
+              { // MARKER: turn-budget-end
+                const budget = turnBudgetLedger.get(frame.sessionId);
+                if (budget) {
+                  const elapsedSec = Math.round((Date.now() - budget.startedAt) / 1000);
+                  if (!budget.cancelled) writeGraceNote(key, null);
+                  if (elapsedSec >= 300 || budget.steps >= 30 || budget.cancelled) {
+                    log(`[turn-budget] ${key} 回合 ${elapsedSec}s / ${budget.steps} 步 / ${budget.sends} 条${budget.cancelled ? `（已中止：${budget.reason}）` : ''}`);
+                  }
+                  turnBudgetLedger.delete(frame.sessionId);
+                }
               }
               collectors.delete(frame.sessionId);
               const sendToolSucceeded = sendToolSucceededSessions.has(frame.sessionId);
@@ -11930,6 +12155,23 @@ async function main() {
   startSnowlumaWatch();
   startConsoleServer();
   // ── 功能模块装载（阶段 1：骨架） ────────────────────────────────────────
+  // MARKER: mute-aware-init
+  // 重启后 mutedUntilByGroup 是空的，与其等第一次发送失败再学，不如启动时把
+  // 白名单里的群都问一遍 get_group_member_info。失败/超时都当没禁言。
+  void (async () => {
+    await new Promise((resolve) => setTimeout(resolve, 8000));
+    const groups = Array.isArray(cfg.allow?.groups) ? cfg.allow.groups : [];
+    for (const gid of groups) {
+      try {
+        const mutedUntil = await probeGroupMute(gid);
+        if (mutedUntil > 0) {
+          mutedUntilByGroup.set(String(gid), mutedUntil);
+          const until = new Date(mutedUntil).toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
+          log(`[mute-aware] group:${gid} 当前处于禁言，到 ${until} 解禁，期间跳过唤醒`);
+        }
+      } catch {}
+    }
+  })();
   // MARKER: sticker-sightings-init
   // 观测层启动即装载，与模块装配无关（模块全关也不影响它）。
   if (cfg.socialV2?.sticker?.sightings?.enabled !== false) {
