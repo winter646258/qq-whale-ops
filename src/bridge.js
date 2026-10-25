@@ -9368,7 +9368,14 @@ async function main() {
         groupBotIdsCache.set(gid, { ids, ts: Date.now() });
         if (ids.size) log(`[bot-mutex] ${gid} 识别到 ${ids.size} 个机器人：${[...ids].join(",")}`);
       })
-      .catch((error) => { log(`[bot-mutex] 拉取 ${gid} 成员失败（下一轮再试）：${error?.message ?? error}`); })
+      .catch((error) => {
+        // MARKER: bot-ids-negative-cache —— 失败也要落一份空集合。
+        // 否则 groupBotIdsCache 里永远没有这个群，每条群消息都会重新拉一次成员列表。
+        // 实测 673877456 / 910502749 累计失败 30 次，全是无谓重试。
+        // ts 往前拨半 TTL：相当于「半 TTL 后再试」，既不放弃，也不每条消息都打。
+        groupBotIdsCache.set(gid, { ids: new Set(), ts: Date.now() - Math.floor(GROUP_BOT_IDS_TTL_MS / 2) });
+        log(`[bot-mutex] 拉取 ${gid} 成员失败（半 TTL 后重试）：${error?.message ?? error}`);
+      })
       .finally(() => { groupBotIdsInflight.delete(gid); });
   }
   function isKnownBot(groupId, userId) {
