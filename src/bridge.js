@@ -330,11 +330,13 @@ function loadOrCreateConsoleToken() {
   const tokenFile = path.join(STATE_DIR, 'console-token');
   try {
     const existing = fs.readFileSync(tokenFile, 'utf8').trim();
-    if (existing) return existing;
+    // fromFile 只用于让启动日志说清「这是沿用的、不是刚换的」：
+    // 令牌在多次重启之间是**稳定**的，旧文案一律写「已自动生成」会让人误以为凭据失效。
+    if (existing) return { token: existing, fromFile: true };
   } catch {}
   const token = crypto.randomBytes(24).toString('hex');
   atomicWriteText(tokenFile, token);
-  return token;
+  return { token, fromFile: false };
 }
 
 /**
@@ -5255,7 +5257,11 @@ async function main() {
     // 使用 let 以便控制台内手动修改令牌后热更新。
     const configuredToken = String(cfg.consoleToken ?? '').trim();
     const tokenValid = configuredToken.length >= 16 && configuredToken.length <= 128 && /^[A-Za-z0-9_-]+$/.test(configuredToken);
-    let consoleToken = tokenValid ? configuredToken : loadOrCreateConsoleToken();
+    // loadOrCreateConsoleToken() 返回 { token, fromFile }：
+    // fromFile=true 表示 state/console-token 里已有值、本次只是沿用。
+    const loadedToken = tokenValid ? null : loadOrCreateConsoleToken();
+    const consoleTokenLoadedFromFile = Boolean(loadedToken?.fromFile);
+    let consoleToken = tokenValid ? configuredToken : loadedToken.token;
   // MARKER: modules-ctx-console-token
   // consoleToken 是本函数的局部 let，模块改令牌后必须靠这个句柄写回。
   Object.assign(moduleCtx, { consoleTokenSet: (value) => { consoleToken = value; } });
@@ -5266,7 +5272,15 @@ async function main() {
     // 挡不住本机进程。这里改成失败关闭：宁可启动时报错，也不要静默开着一个无鉴权的管理 API。
     if (!consoleToken) throw new Error('控制台令牌为空：拒绝以无鉴权方式启动控制台 API');
     if (!tokenValid && configuredToken) log(`控制台 config.consoleToken 长度/字符不合法，已忽略并回退到自动生成令牌`);
-    if (!configuredToken) log(`控制台未配置 consoleToken，已自动生成：${String(consoleToken).slice(0, 6)}…（完整值保存在 state/console-token）`);
+    // ⚠️ 文案必须区分「首次生成」与「沿用文件里已有的」：loadOrCreateConsoleToken()
+    // 是「有就读、没有再生成」，令牌本身在多次重启间**是稳定的**。
+    // 原来一律写「已自动生成」，看日志的人会以为每次重启都换了令牌，
+    // 进而怀疑控制台凭据失效 —— 实际没有。
+    if (!configuredToken) {
+      log(consoleTokenLoadedFromFile
+        ? `控制台未配置 consoleToken，沿用 state/console-token 中已有的令牌：${String(consoleToken).slice(0, 6)}…`
+        : `控制台未配置 consoleToken，已自动生成：${String(consoleToken).slice(0, 6)}…（完整值保存在 state/console-token）`);
+    }
     // 二代会话级隔离：MCP 工具调用时若带 x-agent-token，则必须匹配该会话的 agentToken。
     // 控制台/管理端请求不带此头，仍走 consoleToken 管理通道。
     //
