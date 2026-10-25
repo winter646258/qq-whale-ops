@@ -66,3 +66,9 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+
+# ── 角色卡本地备份（人格卡正文属私密内容，只留当前版本入库）──────────────
+# `.bak` / `.bak-*` 已在上方统一忽略；这里补上另外几种手工备份命名。
+/roles/*.pre-*
+/roles/*.myversion-*
+/roles/历史版本/

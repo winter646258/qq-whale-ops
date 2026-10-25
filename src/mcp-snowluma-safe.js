@@ -1335,7 +1335,10 @@ await
 // 存储格式不进工具描述 —— 她不需要知道文件长什么样。
 server.tool(
   'qq_diary',
-  '你自己的日记。只看不传 text；想写就带 text。想写的时候才写，一天几条就够，一两句、具体的小事，别写总结句，也别在聊天里汇报你写了日记。想给某条标一下当时的心情就带 mood（随便几个字，不想标就不标）。',
+  '你自己的日记。只看不传 text；想写就带 text。想写的时候才写，一天几条就够，一两句、具体的小事，别写总结句，也别在聊天里汇报你写了日记。'
+  + '想给某条标一下当时的心情就带 mood（随便几个字，不想标就不标）。'
+  + 'level 是这条字能记多久：critical=非常重要，永远不会淡；important=重要，两三周慢慢淡；不传=普通，几天就淡了（淡了不等于删，是以后翻的时候不再浮出来）。'
+  + '大部分人大部分事都是普通的，别把什么都标成 critical —— 标滥了这条分档就没意义了。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1344,14 +1347,15 @@ server.tool(
     mode: z.enum(['append', 'replace']).optional().describe('append=追加一条（默认）；replace=改写某一条，用 oldText 或 id 指定'),
     oldText: z.string().optional().describe('mode=replace 时：要改写的那一条里的一段原文'),
     id: z.string().optional().describe('mode=replace 时：那条日记的 id（查看时有）'),
+    level: z.enum(['normal', 'important', 'critical']).optional().describe('这条能记多久：critical=永不淡 / important=两三周慢慢淡 / 不传=普通（几天就淡）。真有分量才往高标，别什么都标 critical'),
     recent: z.number().optional().describe('查看时返回最近几条，默认 10')
   },
-  async ({ key, token, text, mood, mode, oldText, id, recent }) => {
+  async ({ key, token, text, mood, level, mode, oldText, id, recent }) => {
     try {
       if (text || mood) {
         const data = await agentApi('/api/socialV2/diary', {
           method: 'POST',
-          body: JSON.stringify({ key, token, text, mood, mode: mode || 'append', oldText, id }),
+          body: JSON.stringify({ key, token, text, mood, level, mode: mode || 'append', oldText, id }),
           // ⚠️ 必须带 x-agent-token：agentApi 会自动加 x-agent-call:1，
           // 桥接见到该声明就要求令牌有效（防 confused deputy 提权）。
           headers: { 'x-agent-token': token }

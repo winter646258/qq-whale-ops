@@ -5,6 +5,10 @@
 #   第 0 级 loomy    DeepSeek-V4.1-Flash      effort=low    快（首字 ~1.7s），cache 命中率高
 #   第 1 级 trae     deepseek-v4.1-flash      effort=light  快（~2.2s），但 cache 命中率 0%
 #   第 2 级 raccoon  sn-deepseek-v4-1-flash   effort=on     慢（~29s），但 cache 命中率高、省 token
+#   第 3 级 raccoon 之后追加：
+#   ※ 2026-10-24 15:20 起把 our-free-model（windking 中转 https://ai.windking.shop/v1，
+#     模型 deepseek/deepseek-v4.1-flash，effort=light）放到链首 —— 免费渠道额度用尽，
+#     主人给了中转 key，临时用它兜住。要回退就把它从三个数组里删掉。
 #
 # 顺序的理由：能快就别拖。trae 排在前是因为它快；raccoon 排最后是因为它慢但省，
 # 长期挂着也不心疼。三者都免费，所以「降级」不产生额外花费。
@@ -67,9 +71,9 @@ SLOW_STRIKES="${SLOW_STRIKES:-2}"            # 连续这么多次检查都慢 ->
 FAIL_PATTERN="unauthorized|quota|insufficient|balance|rate.?limit|额度不足|余额不足|发送失败|限流|解禁|所有账号|可用账号|AI 反馈.*error|agent 处理出错|Illegal API invocation|unapproved channel"
 
 # 候选链：从优到劣。加渠道就往这三个数组尾部追加，判定逻辑会自动跟上。
-CHAIN_PROVIDERS=(loomy trae raccoon)
-CHAIN_MODELS=(DeepSeek-V4.1-Flash deepseek-v4.1-flash sn-deepseek-v4-1-flash)
-CHAIN_EFFORTS=(low light on)
+CHAIN_PROVIDERS=(loomy trae raccoon our-free-model)
+CHAIN_MODELS=(DeepSeek-V4.1-Flash deepseek-v4.1-flash sn-deepseek-v4-1-flash deepseek/deepseek-v4.1-flash)
+CHAIN_EFFORTS=(low light on light)
 
 # A_/B_ 是链首与次级的别名 —— 脚本里还有一批地方按这两个名字取「主渠道」，
 # 保留它们可以让 record_history 的 role 判定、--status 输出等无需改动。

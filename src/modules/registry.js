@@ -76,7 +76,7 @@ export function createModuleHost({ ctx, log, onError } = {}) {
       }
       if (typeof r.handler !== 'function') return `路由 ${r.path} 缺少 handler`;
       if (r.kind !== 'exact' && r.kind !== 'prefix') return `路由 ${r.path} 的 kind 必须是 exact / prefix`;
-      if (r.method !== undefined && !/^(GET|POST|PUT|DELETE|PATCH)$/.test(r.method)) {
+      if (r.method !== undefined && !/^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)$/.test(r.method)) {
         return `路由 ${r.path} 的 method 非法：${r.method}`;
       }
     }
@@ -111,6 +111,17 @@ export function createModuleHost({ ctx, log, onError } = {}) {
     // ── 2. setup ──
     const settled = [];
     for (const def of ready) {
+      // validate 在 load() 第一步就把缺依赖的模块挡掉了，能走到这里的都该是齐的。
+      // 但 modules.set() 发生在 validate 之后、这里之前 —— 中途万一有人动了 ctx
+      // （比如某个模块的 setup 顺手删了键），必须在**启用之前**再确认一次。
+      // 少了这一步，坏模块会以「半死」状态留在 loaded 里：/api/_modules 看上去
+      // 「10 个模块全在」，实际少一个在干活 —— 阶段12 就是这么被瞒过去的。
+      const stillMissing = (def.inject ?? []).filter((k) => k !== 'cfg' && !(k in ctx));
+      if (stillMissing.length) {
+        fail(def, 'inject', `启用前复核发现 ctx 缺少依赖：${stillMissing.join(', ')}`);
+        modules.delete(def.name);
+        continue;
+      }
       try {
         if (typeof def.setup === 'function') await def.setup(ctx);
         settled.push(def);
@@ -125,7 +136,7 @@ export function createModuleHost({ ctx, log, onError } = {}) {
     for (const def of settled) {
       for (const r of def.routes ?? []) {
         routes.push({
-          method: r.method ?? null,
+          method: r.method === undefined ? null : r.method,
           path: r.path,
           kind: r.kind,
           module: def.name,
@@ -138,10 +149,21 @@ export function createModuleHost({ ctx, log, onError } = {}) {
 
     // 前缀路由互相遮蔽检查：/a 与 /a/b 同时存在时，/a 会先吃掉 /a/b。
     // 这不是错误（老代码里就有这种分层），但要显式记下来，免得以后误改顺序。
+    //
+    // 只对 **method 通配** 的前缀报：`OPTIONS /a/` 只吃 OPTIONS，
+    // `GET /a/b` 的 GET 请求根本不会命中去，两者不构成遮蔽。
+    // 浏览器桥的 CORS 预检就是「OPTIONS 前缀 + 三条 exact」这种写法，
+    // 按旧口径会报 6 条假告警，把真问题淹掉。
+    // 判定口径：**只有 method 为空（通配）的前缀才算遮蔽**。
+    // 登记时 `method: r.method ?? null` 会把省略 method 的路由记成 null；
+    // 判定用 `typeof a.method === 'string' && a.method.length > 0` 显式排除带方法的前缀，
+    // 不依赖 `!== null`（`undefined` 会让它失灵，踩过一次）。
     for (const a of routes) {
       if (a.kind !== 'prefix') continue;
+      if (typeof a.method === 'string' && a.method.length > 0) continue;
       for (const b of routes) {
         if (a === b) continue;
+        if (b.kind !== 'exact') continue;
         if (b.path.length > a.path.length && b.path.startsWith(a.path)) {
           problems.push({
             module: a.module, phase: 'route-shadow',
