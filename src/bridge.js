@@ -9606,7 +9606,10 @@ async function main() {
       ownerLabel: isOwner ? `管理员（ownerQQ ${cfg.ownerQQ ?? ''}）` : '',
       isSelf: false,
       // MARKER: bot-mutex —— 这个人是机器人吗。唤醒判断会跳过它，避免两个 bot 对聊。
-      isBot: kind === 'group' ? isKnownBot(key.slice(key.indexOf(':') + 1), userId) : false,
+      // MARKER: bot-mutex —— 只在群里判机器人。key 自带 'group:'/'private:' 前缀，
+      // 不依赖 kind 参数（这个函数签名里没有 kind —— 第一版误用导致「处理群消息出错: kind is not defined」，
+      // 群消息被整条吞掉）。
+      isBot: String(key).startsWith('group:') ? isKnownBot(key.slice(key.indexOf(':') + 1), userId) : false,
       media: safeMedia,
       hasMedia: safeMedia.length > 0,
       forwardIds: safeForwardIds,
