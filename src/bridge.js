@@ -9320,6 +9320,45 @@ async function main() {
   }
 
   // QQ 群成员名片/昵称缓存：@ 段解析用，避免每条消息都调一次 OneBot API。
+  // MARKER: bot-mutex —— 别的机器人发的消息不进唤醒判断。
+  // 为什么需要：群里有一堆 bot（201188739 就有 5 个 is_robot=true），它们互相 @、互相接话，
+  // 一旦她对着另一个 bot 说话，两个 bot 会无限对聊，烧掉的是主人的 token。
+  // 数据来源：消息事件的 sender 里**没有** is_robot（实测只有 age/card/nickname/role/sex/user_id），
+  // 只有 get_group_member_list 有 ⇒ 只能自己拉一份缓存，按 user_id 判。
+  const groupBotIdsCache = new Map(); // groupId -> { ids: Set<string>, ts }
+  const GROUP_BOT_IDS_TTL_MS = 30 * 60 * 1000;
+  const groupBotIdsInflight = new Set(); // 正在拉取的群，避免并发重复请求
+  function groupBotIdsOf(groupId) {
+    const hit = groupBotIdsCache.get(String(groupId));
+    return hit ? hit.ids : null;
+  }
+  function refreshGroupBotIds(groupId) {
+    const gid = String(groupId ?? "");
+    if (!gid) return;
+    const hit = groupBotIdsCache.get(gid);
+    if (hit && Date.now() - hit.ts < GROUP_BOT_IDS_TTL_MS) return;
+    if (groupBotIdsInflight.has(gid)) return;
+    groupBotIdsInflight.add(gid);
+    Promise.resolve()
+      .then(() => bot.raw("get_group_member_list", { group_id: Number(gid) }))
+      .then((data) => {
+        const list = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : []);
+        const ids = new Set();
+        for (const m of list) {
+          if (m && m.is_robot === true && m.user_id != null) ids.add(String(m.user_id));
+        }
+        groupBotIdsCache.set(gid, { ids, ts: Date.now() });
+        if (ids.size) log(`[bot-mutex] ${gid} 识别到 ${ids.size} 个机器人：${[...ids].join(",")}`);
+      })
+      .catch((error) => { log(`[bot-mutex] 拉取 ${gid} 成员失败（下一轮再试）：${error?.message ?? error}`); })
+      .finally(() => { groupBotIdsInflight.delete(gid); });
+  }
+  function isKnownBot(groupId, userId) {
+    if (userId == null) return false;
+    const ids = groupBotIdsOf(groupId);
+    return ids ? ids.has(String(userId)) : false;
+  }
+
   const groupMemberNameCache = new Map(); // `groupId:userId` -> { name, ts }
   const GROUP_MEMBER_NAME_TTL_MS = 5 * 60 * 1000;
   function pruneGroupMemberNameCache() {
@@ -9566,6 +9605,8 @@ async function main() {
       isOwner: !!isOwner,
       ownerLabel: isOwner ? `管理员（ownerQQ ${cfg.ownerQQ ?? ''}）` : '',
       isSelf: false,
+      // MARKER: bot-mutex —— 这个人是机器人吗。唤醒判断会跳过它，避免两个 bot 对聊。
+      isBot: kind === 'group' ? isKnownBot(key.slice(key.indexOf(':') + 1), userId) : false,
       media: safeMedia,
       hasMedia: safeMedia.length > 0,
       forwardIds: safeForwardIds,
@@ -9839,6 +9880,14 @@ async function main() {
         mutedUntilByGroup.delete(gid);
         log(`[mute-aware] ${key} 禁言已到期，恢复唤醒`);
       }
+    }
+    // MARKER: bot-mutex —— 另一个机器人说的话不触发唤醒。
+    // 用 event.user_id（本条的发送者），不是历史里的谁。缓存没建立时 isKnownBot 返回 false，
+    // 也就是「宁可多醒一次，也不误封真人」——拉取失败不会让她变哑巴。
+    if (kind === 'group') {
+      const gid = key.slice(key.indexOf(':') + 1);
+      refreshGroupBotIds(gid);
+      if (isKnownBot(gid, event?.user_id)) return null;
     }
     const tr = st.wakeConfig?.triggers ?? {};
     if (tr.anyMessage) return 'anyMessage';
@@ -12002,6 +12051,20 @@ async function main() {
         selfUserId = String(login.user_id).trim();
       }
     }).catch(() => {});
+    // MARKER: bot-mutex-warmup —— 启动/重连时把所有在白名单里的群都预热一遍机器人名单，
+    // 免得第一次收到机器人消息时缓存还没建立、白白醒一次。
+    setImmediate(() => {
+      try {
+        const groups = new Set();
+        for (const g of cfg.allow?.groups ?? []) if (g != null) groups.add(String(g));
+        for (const rel of (socialV2?.conversations?.keys?.() ?? [])) {
+          const k = String(rel);
+          if (k.startsWith('group:')) groups.add(k.slice(6));
+        }
+        for (const gid of groups) refreshGroupBotIds(gid);
+        if (groups.size) log(`[bot-mutex] 预热 ${groups.size} 个群的机器人名单`);
+      } catch (error) { log('[bot-mutex] 预热失败：', error?.message ?? error); }
+    });
     // 连接成功后顺手确认一下 token 是否已跟当前账号对齐；不一致就写回 config.json，
     // 让 MCP 工具（另一个进程）也能拿到正确的 token。
     void syncTokenToFile();
