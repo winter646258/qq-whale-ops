@@ -44,13 +44,24 @@ import sendLegacy from './send-legacy/index.js';
 import share from './share/index.js';
 import aiExtras from './ai-extras/index.js';
 import coreModule from './core/index.js';
+import dashboardModule from './dashboard/index.js';
+import searchModule from './search/index.js';
+
+// 统一面板的模块级开关（区别于 modules.enabled 的一刀切）：
+//   cfg.socialV2.modules.dashboard === false → 整个 dashboard 模块不装载，
+//   它的 3 条路由变 404，前端 section 自动隐藏，其余 28 个模块照常。
+// 开关塞在已有的 socialV2.modules 子对象里，所以 loadConfig 的白名单不用动。
+function panelOn(ctx, name) {
+  if (ctx?.cfg?.socialV2?.modules?.enabled === false) return false;
+  return ctx?.cfg?.socialV2?.modules?.[name] !== false;
+}
 
 /**
  * @param {object} ctx 由 `bridge.js` 组装的上下文（cfg / log / stateDir / api / 若干纯函数）
  * @returns {Array<object>} 模块定义数组
  */
 export function defineModules(_ctx) {
-  return [
+  const list = [
     roleConsole,
     security,
     approval,
@@ -80,5 +91,10 @@ export function defineModules(_ctx) {
     biliModule,
     forwardModule,
   ];
+  // 面板模块走独立开关，坏了只关它自己，不影响上面 28 个。
+  // search 与 dashboard 是两个独立开关：检索坏了不必连健康卡一起停。
+  if (panelOn(_ctx, 'dashboard')) list.push(dashboardModule);
+  if (panelOn(_ctx, 'search')) list.push(searchModule());
+  return list;
 }
 

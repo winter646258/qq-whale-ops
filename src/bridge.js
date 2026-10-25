@@ -3318,6 +3318,24 @@ async function main() {
     readActivityTail: (n) => readActivityTail(n),
     snowlumaHealthSnapshot: () => snowlumaHealthSnapshot(),
   });
+  // MARKER: modules-ctx-dashboard
+  // 统一面板（src/modules/dashboard/）的依赖。
+  //  - os：顶部 import（src/bridge.js:9），纯内存读，可直接进值位置；
+  //  - appStartedAt：求值即得，用来算进程 uptime，不碰 systemd；
+  //  - readRoleState：文件级纯函数，声明在 :747 —— 比注入点早，可以直接进值位置，
+  //    但还是包成箭头，跟其它块保持同一形态，以后挪位置也不会踩 TDZ。
+  Object.assign(moduleCtx, {
+    os,
+    appStartedAt: Date.now(),
+    readRoleState: () => readRoleState(),
+    // 跨域检索（src/modules/search/）要的会话键清单。
+    // 为什么用箭头：`socialV2` 在 :7810 才声明（比这个注入点晚），
+    // 直接写进值位置会撞 TDZ；箭头延迟到调用时才求值。
+    conversationKeys: () => Array.from(socialV2.conversations.keys()),
+    // 运行备注（S3）要写盘：atomicWriteJson 在 :302 声明，比注入点早，可进值位置；
+    // 但跟上面保持同一形态，包箭头。
+    atomicWriteJson: (file, obj) => atomicWriteJson(file, obj),
+  });
   let dshCheckStarted = false;
   let snowlumaWatchStarted = false; // SnowLuma 上游健康探测只启动一次（见 startSnowlumaWatch）
   let currentMode = 'chat'; // chat | closed-agent | reserved（仿真模式，由 DSH settings / state/mode.json 驱动）
@@ -12270,7 +12288,7 @@ async function main() {
         log: (message) => log(message),
         onError: (mod, phase, error) => log(`[modules] ${phase} 失败 ${mod?.name ?? "?"}：${error?.message ?? error}`),
       });
-      await moduleHost.load(defineModules());
+      await moduleHost.load(defineModules(moduleCtx));
       log(`[modules] 装载完成：${moduleHost.loaded.length} 个模块 / ${moduleHost.describe().routes.length} 条路由`);
     } catch (error) {
       moduleHost = null;

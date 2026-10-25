@@ -1789,6 +1789,224 @@ button:active:not(:disabled) {
         <div class="search-wrap"><label class="sr-only" for="consoleSearch">搜索功能或参数</label><input id="consoleSearch" type="search" placeholder="搜索功能或参数…" autocomplete="off" aria-controls="searchResults" aria-expanded="false"><div id="searchResults" class="search-results" hidden></div></div>
       </div>
       <div id="connectionAlert" class="connection-alert" role="alert" hidden></div>
+      <!-- MARKER: section-dashboard -->
+<section id="section-dashboard" data-page="overview" class="card span-all" hidden>
+  <h2>首屏健康卡</h2>
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px">
+    <div class="metric"><span>服务</span><strong id="dashPid">—</strong><small id="dashUptime">—</small></div>
+    <div class="metric"><span>内存</span><strong id="dashMem">—</strong><small id="dashMemHint">—</small></div>
+    <div class="metric"><span>负载</span><strong id="dashLoad">—</strong><small id="dashLoadHint">—</small></div>
+    <div class="metric"><span>DSH</span><strong id="dashDsh">—</strong><small id="dashDshHint">—</small></div>
+    <div class="metric"><span>模式</span><strong id="dashMode">—</strong><small id="dashModeHint">—</small></div>
+    <div class="metric"><span>待处理审批</span><strong id="dashPending">—</strong><small id="dashPendingHint">—</small></div>
+  </div>
+  <div style="margin-top:12px">
+    <div class="row" style="align-items:center;gap:8px">
+      <strong style="font-size:13px">运行备注</strong>
+      <span class="meta" id="dashNoteMeta">（未写）</span>
+      <span style="flex:1"></span>
+      <button id="dashNoteSave" class="small">保存备注</button>
+    </div>
+    <textarea id="dashNote" rows="2" maxlength="2000" placeholder="记一句当前状态/待办，比如「S3 部署中，改完 10:40 重启验证」" style="width:100%;margin-top:6px;font-size:13px"></textarea>
+  </div>
+  <div class="row" style="margin-top:12px">
+    <button id="dashRefresh" class="small">刷新</button>
+    <span class="meta" id="dashMsg"></span>
+  </div>
+  <details style="margin-top:12px">
+    <summary>最近错误（最多 20 条）</summary>
+    <pre id="dashErrors" style="max-height:280px;overflow:auto">（无）</pre>
+  </details>
+  <details style="margin-top:8px">
+    <summary>能力开关（<span id="dashToolsCount">0</span> 项，<span id="dashToolsOffCount">0</span> 项关闭）</summary>
+    <div id="dashTools" style="max-height:240px;overflow:auto;font-size:12px;line-height:1.7"></div>
+  </details>
+  <div class="meta" style="margin-top:8px">数据来自 <code>/api/dashboard/overview|errors|links</code>，全部只读、纯内存读，不跑子进程。面板模块可用 <code>socialV2.modules.dashboard=false</code> 单独关闭。</div>
+</section>
+<script>
+// MARKER: section-dashboard-js
+// 统一面板首屏。三条自我约束（对应 docs/统一面板方案评审-2026-10-25.md）：
+//   1. 只在 overview 页可见时轮询，且 document.hidden 时暂停 —— 线上 nproc=2，不能白打接口；
+//   2. 轮询间隔 >= 5s（评审 R5）；
+//   3. 自己判 res.ok，不复用全局 api() 的错误处理（它被 18 个 section 共用，改它会连锁，评审 R10）。
+(function () {
+  var el = document.getElementById('section-dashboard');
+  if (!el) return;
+  var TICK_MS = 5000;
+  var timer = null;
+  var busy = false;
+
+  function setText(id, value) {
+    var node = document.getElementById(id);
+    if (node) node.textContent = value === null || value === undefined ? '—' : String(value);
+  }
+
+  async function dashFetch(path) {
+    var headers = {};
+    var token = localStorage.getItem('consoleToken');
+    if (token) headers['x-console-token'] = token;
+    var res = await fetch(path, { method: 'GET', headers: headers });
+    if (!res.ok) throw new Error(path + ' → HTTP ' + res.status);
+    return res.json();
+  }
+
+  function renderOverview(d) {
+    setText('dashPid', 'PID ' + d.pid);
+    setText('dashUptime', d.uptimeText || '—');
+    if (d.mem) {
+      setText('dashMem', d.mem.usedMb + ' / ' + d.mem.totalMb + ' MB');
+      setText('dashMemHint', '已用 ' + d.mem.usedPct + '%　剩余 ' + d.mem.freeMb + ' MB');
+      var memNode = document.getElementById('dashMem');
+      if (memNode) memNode.style.color = d.mem.usedPct >= 90 ? 'var(--danger,#c0392b)' : '';
+    }
+    if (d.load) {
+      setText('dashLoad', d.load.l1.toFixed(2));
+      setText('dashLoadHint', '5m ' + d.load.l5.toFixed(2) + '　15m ' + d.load.l15.toFixed(2) + '　' + (d.load.cpus || '?') + ' 核');
+    }
+    setText('dashDsh', d.dshReady === true ? '已连接' : (d.dshReady === false ? '未连接' : '未知'));
+    setText('dashDshHint', d.dshReady === false ? '她暂时不能干活' : '每 5 秒探测一次');
+    setText('dashMode', d.mode || '—');
+    var f = d.flags || {};
+    var hint = [];
+    if (f.paused) hint.push('已暂停');
+    if (f.socialV2Enabled === false) hint.push('仿真已关');
+    if (f.modulesEnabled === false) hint.push('模块已关');
+    if (f.turnBudget) hint.push('回合上限 ' + f.turnBudget.maxSteps + ' 步 / ' + Math.round(f.turnBudget.maxMs / 1000) + ' 秒');
+    setText('dashModeHint', hint.join('　') || '正常');
+  }
+
+  function renderErrors(d) {
+    var node = document.getElementById('dashErrors');
+    if (!node) return;
+    if (!d.count) { node.textContent = '（最近没有错误记录）'; return; }
+    node.textContent = (d.errors || []).join('\n') + (d.truncated ? '\n…（已截断）' : '');
+  }
+
+  function renderLinks(d) {
+    var t = d.tools || {};
+    setText('dashToolsCount', t.total || 0);
+    setText('dashToolsOffCount', (t.disabled || []).length);
+    var node = document.getElementById('dashTools');
+    if (!node) return;
+    var parts = [];
+    (t.enabled || []).forEach(function (n) { parts.push('<span style="color:var(--ok,#2e7d32)">✓ ' + n + '</span>'); });
+    (t.disabled || []).forEach(function (n) { parts.push('<span style="opacity:.55">✗ ' + n + '</span>'); });
+    node.innerHTML = parts.join('　') || '（无）';
+  }
+
+  async function refreshPending() {
+    // 待处理审批走已有的 /api/pending（评审 §4.4 复用清单），不重造。
+    try {
+      var res = await dashFetch('/api/pending');
+      var n = Array.isArray(res.pendingList) ? res.pendingList.length
+            : Array.isArray(res.list) ? res.list.length
+            : Array.isArray(res) ? res.length
+            : (typeof res.count === 'number' ? res.count : 0);
+      setText('dashPending', n);
+      setText('dashPendingHint', n > 0 ? '卡住的请求，点左侧会话页处理' : '无');
+      var node = document.getElementById('dashPending');
+      if (node) node.style.color = n > 0 ? 'var(--warn,#e67e22)' : '';
+    } catch (error) { setText('dashPendingHint', '读取失败'); }
+  }
+
+  // S3：运行备注。读一次 + 保存。不走 tick()，避免每 5 秒把用户正在敲的字冲掉。
+  function renderNote(d) {
+    var ta = document.getElementById('dashNote');
+    var meta = document.getElementById('dashNoteMeta');
+    if (ta) ta.value = d && typeof d.note === 'string' ? d.note : '';
+    if (meta) {
+      if (d && d.updatedAt) {
+        meta.textContent = '更新于 ' + new Date(d.updatedAt).toLocaleString('zh-CN', { hour12: false });
+      } else {
+        meta.textContent = '（未写）';
+      }
+    }
+  }
+
+  async function loadNote() {
+    try {
+      renderNote(await dashFetch('/api/dashboard/note'));
+    } catch (error) {
+      var meta = document.getElementById('dashNoteMeta');
+      if (meta) meta.textContent = '读取失败';
+    }
+  }
+
+  async function saveNote() {
+    var ta = document.getElementById('dashNote');
+    var btn = document.getElementById('dashNoteSave');
+    if (!ta) return;
+    if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+    try {
+      var headers = { 'content-type': 'application/json' };
+      var token = localStorage.getItem('consoleToken');
+      if (token) headers['x-console-token'] = token;
+      var res = await fetch('/api/dashboard/note', {
+        method: 'POST', headers: headers, body: JSON.stringify({ note: ta.value }),
+      });
+      var data = await res.json().catch(function () { return {}; });
+      if (!res.ok || !data.ok) throw new Error(data.error || ('HTTP ' + res.status));
+      renderNote(data);
+    } catch (error) {
+      var meta = document.getElementById('dashNoteMeta');
+      if (meta) meta.textContent = '保存失败：' + (error && error.message ? error.message : error);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '保存备注'; }
+    }
+  }
+
+  async function tick() {
+    if (busy || document.hidden) return;
+    // currentConsolePage 在文件尾才声明；这里用 typeof 兜底，早于声明也不会抛。
+    if (typeof currentConsolePage === 'string' && currentConsolePage !== 'overview') return;
+    busy = true;
+    try {
+      var ov = await dashFetch('/api/dashboard/overview');
+      renderOverview(ov);
+      var er = await dashFetch('/api/dashboard/errors?limit=20');
+      renderErrors(er);
+      var lk = await dashFetch('/api/dashboard/links');
+      renderLinks(lk);
+      await refreshPending();
+      setText('dashMsg', '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }));
+    } catch (error) {
+      setText('dashMsg', '刷新失败：' + (error && error.message ? error.message : error));
+    } finally {
+      busy = false;
+    }
+  }
+
+  function start() { if (!timer) timer = setInterval(tick, TICK_MS); tick(); }
+  function stop() { if (timer) { clearInterval(timer); timer = null; } }
+
+  document.addEventListener('visibilitychange', function () { if (document.hidden) stop(); else start(); });
+  var btn = document.getElementById('dashRefresh');
+  if (btn) btn.addEventListener('click', tick);
+  var noteBtn = document.getElementById('dashNoteSave');
+  if (noteBtn) noteBtn.addEventListener('click', saveNote);
+
+  // 后端模块关掉 → 路由 404 → 这里退化为隐藏，页面自然消失（评审 §4.5 前端回退）。
+  //
+  // 时序注意：这个 script 位置很早（首屏 section 附近），而页面路由变量
+  // `currentConsolePage` 要到文件尾才声明。直接在这里读它会 ReferenceError，
+  // 于是 tick() 一进第一行就抛，catch 又把 section 藏起来 —— 现象是"接口 200 但面板空"。
+  // 所以探测放到 DOMContentLoaded 之后，并且读页面变量时做存在性判断。
+  function bootstrap() {
+    dashFetch('/api/dashboard/overview').then(function () {
+      el.hidden = false;
+      start();
+      loadNote();
+    }).catch(function () {
+      el.hidden = true;
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bootstrap);
+  } else {
+    setTimeout(bootstrap, 0);
+  }
+})();
+</script>
       <div id="overviewSummary" class="overview-summary span-all" data-page="overview">
         <div class="metric"><span>DSH 连接</span><strong id="metricDsh">连接中</strong><small id="metricDshHint">等待服务响应</small></div>
         <div class="metric"><span>SnowLuma 上游</span><strong id="metricSnowluma">读取中</strong><small id="metricSnowlumaHint">等待网关健康上报</small></div>
