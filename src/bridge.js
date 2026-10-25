@@ -3064,11 +3064,20 @@ async function main() {
   // （turn 15 在群里配合玩梗，52 分钟 129 次工具调用），所以不能再靠提示词自律。
   const turnBudgetLedger = new Map(); // sessionId -> { startedAt, steps, sends, cancelled, reason }
   const TURN_BUDGET_GRACE_FILE = path.join(STATE_DIR, 'wake-config-grace.json');
-  function turnBudgetCfg() {
+  function turnBudgetCfg(key) {
     const b = cfg.socialV2?.turnBudget ?? {};
     const pick = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : d);
     // 正常回合 2–10 分钟 / 10–15 次工具 / 2–4 条发送，这里留 3–4 倍余量
-    return { maxSteps: pick(b.maxSteps, 40), maxMs: pick(b.maxMs, 600000), maxSends: pick(b.maxSends, 8) };
+    let maxSends = pick(b.maxSends, 8);
+    // MARKER: per-group-override —— 单个群单独收紧每轮发送条数。
+    // 优先级：按群覆盖 > 全局。只降低不抬高（Math.min），避免覆盖成了开后门。
+    const keyStr = String(key ?? '');
+    if (keyStr.startsWith('group:')) {
+      const ov = cfg.socialV2?.wake?.overrides?.[keyStr.slice(6)];
+      const n = Number(ov?.turnMaxSends);
+      if (Number.isFinite(n) && n > 0) maxSends = Math.min(maxSends, Math.floor(n));
+    }
+    return { maxSteps: pick(b.maxSteps, 40), maxMs: pick(b.maxMs, 600000), maxSends };
   }
   function turnBudgetFor(sessionId) {
     let entry = turnBudgetLedger.get(sessionId);
@@ -3098,18 +3107,22 @@ async function main() {
   }
   function noteTurnBudgetStep(key, sessionId) {
     if (!key || !sessionId) return;
-    const b = turnBudgetCfg();
+    const b = turnBudgetCfg(key);
     const entry = turnBudgetFor(sessionId);
     entry.steps += 1;
     if (entry.cancelled) return;
     if (entry.steps > b.maxSteps) { void cancelTurnForBudget(key, sessionId, entry, `步数 ${entry.steps} > ${b.maxSteps}`); return; }
     if (Date.now() - entry.startedAt > b.maxMs) { void cancelTurnForBudget(key, sessionId, entry, `时长超 ${Math.round(b.maxMs / 60000)} 分钟`); }
   }
-  function noteTurnBudgetSend(key, sessionId) {
+  // MARKER: turn-budget-by-messages —— 按「实际发出的条数」记账。
+  // 旧版固定 +1，而 qq_send_burst 一次可带 burstMaxMessages 条，
+  // maxSends=8 的真实语义变成「8 次调用」，实际最多能发 8 × burstMaxMessages 条。
+  function noteTurnBudgetSend(key, sessionId, count = 1) {
     if (!key || !sessionId) return;
-    const b = turnBudgetCfg();
+    const b = turnBudgetCfg(key);
     const entry = turnBudgetFor(sessionId);
-    entry.sends += 1;
+    const n = Math.max(1, Math.floor(Number(count) || 1));
+    entry.sends += n;
     if (entry.cancelled) return;
     if (entry.sends > b.maxSends) { void cancelTurnForBudget(key, sessionId, entry, `发送 ${entry.sends} 条 > ${b.maxSends}`); }
   }
@@ -3132,7 +3145,18 @@ async function main() {
       at: Date.now(), reason: why,
       elapsedSec: Math.round(elapsedMs / 1000), steps: entry.steps, sends: entry.sends
     });
+    // MARKER: cancel-cooldown —— 掐断后给一段冷却，否则下一批消息立刻又把她叫醒，
+    // 惩罚等于没罚（实测 11:12:59 掐断，39 秒后又被唤醒）。
+    // 私聊不加冷却：主人找她不该被沉默。
+    const cfgCooldown = Number(cfg.socialV2?.turnBudget?.cancelCooldownMs);
+    const cooldownMs = Number.isFinite(cfgCooldown) && cfgCooldown >= 0 ? cfgCooldown : 5 * 60 * 1000;
+    if (!String(key).startsWith('private:') && cooldownMs > 0) {
+      cancelCooldownUntil.set(key, Date.now() + cooldownMs);
+      log(`[turn-budget] ${key} 进入 ${Math.round(cooldownMs / 1000)}s 冷却，期间不安排新唤醒`);
+    }
   }
+  // key -> 掐断冷却截止时间
+  const cancelCooldownUntil = new Map();
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
   // MARKER: role-card-refresh —— 会话 -> 最近一次已注入的角色卡指纹。
   // 进程重启后为空，所以每个会话重启后第一次唤醒会重注入一次，属于预期行为。
@@ -4013,9 +4037,20 @@ async function main() {
       const n = Number(groupVal);
       return Number.isFinite(n) && n > 0 ? n : baseOk;
     };
+    // MARKER: per-group-override —— 单个群单独收紧的口子。
+    // 起因：906710082 在 12:32~12:40 八分钟内发了 15 条（多轮唤醒叠加，
+    // 每轮 1~2 条都在上限内，但没人管「一段时间内累计多少」）。
+    // 全局收紧会误伤私聊和正常群，所以用「按群覆盖」而不是改全局值。
+    const ov = (isGroup && w.overrides && w.overrides[String(key).slice(6)]) || {};
+    const pickOv = (base, o) => {
+      const n = Number(o);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : base;
+    };
     return {
       autoReplyCheckMs: pick(g.autoReplyCheckMs, g.autoReplyCheckMsInGroup, 30000),
-      maxWakePerHour: pick(w.maxWakePerHour, w.maxWakePerHourInGroup, 12),
+      maxWakePerHour: pickOv(pick(w.maxWakePerHour, w.maxWakePerHourInGroup, 12), ov.maxWakePerHour),
+      maxWakePerMinute: pickOv(Number(w.maxWakePerMinute) > 0 ? Number(w.maxWakePerMinute) : 0, ov.maxWakePerMinute),
+      turnMaxSends: pickOv(0, ov.turnMaxSends),
       isGroup,
     };
   }
@@ -5874,6 +5909,8 @@ async function main() {
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
+            // MARKER: burst-turn-budget —— 分条发送同样要记 turn-budget，且按实际条数记
+            if (sentMessages.length > 0) noteTurnBudgetSend(key, state.sessions[key], sentMessages.length);
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
@@ -6026,7 +6063,7 @@ async function main() {
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
-            if (sentMessages.length > 0) noteTurnBudgetSend(key, state.sessions[key]);
+            if (sentMessages.length > 0) noteTurnBudgetSend(key, state.sessions[key], sentMessages.length);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
             const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
@@ -8742,19 +8779,32 @@ async function main() {
   }
 
   // 是否"直接针对 AI"的提问/挑战：提到 AI 相关词且带疑问/比较，或对"你"开火，或追问催促
+  // MARKER: directed-at-ai-strict —— 「这句话是不是在问 AI」
+  //
+  // 旧版只收一个字符串，完全不知道「你」指谁。中文群里「你会不会啊」「你行不行」
+  // 「你说呢」是日常句式，旧正则全部命中，于是每条闲聊都能把她叫醒；末尾那条
+  // /说话/ 更是裸匹配，「说话」「说话啊」任意位置出现即真。
+  //
+  // 新规则：只认真正指向本体的信号——
+  //   A) 出现明确的 AI 称谓（含词边界的 ai / ds），且整句是疑问或挑战
+  //   B) 句首「你/您」+ 疑问（短句、没点别人），才算直接问
+  //   C) 「你是…吗 / 你是…还是…」这类身份式提问
+  //   D) 「怎么不说话 / 回我 / 理我 / 别装死 / 在不在」这类明确对话对象缺失的追问
+  //      但必须没有其他 @ 目标（由调用方 isDirectedAtOthers 兜）
   function isDirectedAtAi(textContent) {
     const lower = String(textContent ?? '').toLowerCase();
-    const aiMention = /deepseek|claude|chatgpt|gpt|大肥鱼|小鲸鱼|鲸鱼|d指导|d老师|d师傅|深度求索|\bds\b|ai|人工智障|机器人|模型/.test(lower);
-    const challenge = /强|弱|行不行|能不能|会不会|是不是|一半|水平|垃圾|废物|白嫖|菜|不如|厉害|赢|输|比.*强|比.*弱/.test(lower);
-    const question = /[?？吗呢吧]|怎么|为什么|哪|谁/.test(lower);
+    // 词边界：ai 不会命中 rain / wait / mail；ds 不会命中 ads / bdsm
+    const aiMention = /deepseek|claude|chatgpt|\bgpt\b|大肥鱼|小鲸鱼|鲸鱼|d指导|d老师|d师傅|深度求索|\bds\b|\bai\b|人工智障|机器人/.test(lower);
+    const challenge = /强|弱|行不行|能不能|会不会|是不是|一半|水平|垃圾|废物|白嫖|菜|不如|厉害|赢|输/.test(lower);
+    const question = /[?？吗呢]|怎么|为什么|哪|谁/.test(lower);
+    // A) 有明确 AI 称谓 + 疑问或挑战 —— 这条最可靠
     if (aiMention && (question || challenge)) return true;
-    // "你/您" + 疑问/比较/挑战（放宽，避免漏掉"你有claude一半强吗"这类直接问）
-    if (/(你|您).{0,10}(吗|呢|？|\?|怎么|是不是|能不能|行不行|有没有|有|没有|比|不如|强|弱|一半|厉害|垃圾|菜|赢|输)/.test(lower)) return true;
-    if (/^(你|您)(是不是|行不行|能不能|会不会|觉得|有|没有)/.test(lower)) return true;
-    // "你是...还是... / 你是...吗 / 你是...？"（如：你是人类还是ai、你是真人吗）
-    if (/(你|您)是[^？?。！!]{0,14}(还是|或者|吗|么|？|\?)/.test(lower)) return true;
-    // 追问/催促：AI 没回时的真人式催促
-    if (/怎么不说话|人呢|回我|说话啊|理我|别装死|在不在|装死|说话/.test(lower)) return true;
+    // C) 身份式提问：「你是人类还是ai」「你是真人吗」
+    if (/(你|您)是[^？?。！!]{0,14}(还是|或者|吗|嘛|么|？|\?)/.test(lower)) return true;
+    // B) 句首「你/您」+ 疑问，且整句够短（长句多半在跟别人聊别的事）
+    if (/^[\s，,。.~～]*(你|您)/.test(lower) && /[?？吗呢嘛]|怎么|为什么/.test(lower) && lower.length <= 40) return true;
+    // D) 明确的对话对象缺失式追问。这里的「说话」「人呢」单字词不再单独命中。
+    if (/怎么不说话|说话啊|回我一下|你回我|理我|别装死|在不在|你人呢/.test(lower)) return true;
     return false;
   }
 
@@ -10126,6 +10176,10 @@ async function main() {
     return before - st.unread.length;
   }
 
+  // MARKER: trigger-seq-real —— 本批唤醒的触发消息 seq。
+  // scheduleWakeV2 在「合并窗口刚建立」那一刻就知道是谁叫她醒的（当时 st.lastUnreadSeq），
+  // 这条一旦被读过就离开 unread，之后再靠正文倒推必然错。这里存下来给快照用。
+  const wakeTriggerSeq = new Map(); // key -> seq
   function buildWakeSnapshotV2(key, reason) {
     const context = cfg.socialV2?.context ?? {};
     if (context.inlineWakeMessages === false || (!v2ToolEnabled('getUnread') && !v2ToolEnabled('getRecent'))) return null;
@@ -10204,6 +10258,55 @@ async function main() {
         packet.readThroughSeq = readThroughSeqV2(st, [...packet.messages, ...packet.recent]);
         packet.partial = packet.messages.length < st.unread.length;
         packet.triggerSeq = Number(trigger.seq);
+      }
+    }
+    // MARKER: trigger-seq-real —— 触发消息必须每次都明确告诉模型，且来自真实唤醒点。
+    //
+    // 旧实现两个洞：
+    //  1) 上面那段只在「有积压」(st.unread.length > packet.messages.length) 才跑，
+    //     没积压时 packet.triggerSeq 根本不存在，模型只能靠「正文里还有我的昵称」倒推，
+    //     于是同一条早回过的旧 @ 被反复当成新触发（实测连醒十几次、每次都报「旧 @」）。
+    //  2) 找触发消息只搜 st.unread，而叫她醒的那条一被读过就离开 unread 了。
+    //
+    // 现在：优先用 scheduleWakeV2 记下的真实 seq，在 unread / recentMessages 两处找；
+    // 找到就把它单独放进 packet.trigger 并标明来源，让模型一眼看出「这次唤醒的点在哪」。
+    if (wantsTrigger) {
+      const realSeq = Number(wakeTriggerSeq.get(key));
+      let found = null;
+      let from = '';
+      if (Number.isSafeInteger(realSeq) && realSeq > 0) {
+        for (const [name, arr] of [['unread', st.unread], ['recent', st.recentMessages]]) {
+          if (!Array.isArray(arr)) continue;
+          const hit = arr.find((m) => m && Number(m.seq) === realSeq);
+          if (hit) { found = hit; from = name; break; }
+        }
+        if (!found) from = 'expired'; // 触发消息已滚出缓存
+      }
+      if (!found && !Number.isSafeInteger(realSeq)) {
+        // 没有记录（如 replyCheck/proactive/bootstrap）时退回：点名优先，其次最新未读。
+        const newest = st.unread[st.unread.length - 1];
+        const nick = String(selfNickname || '').toLowerCase();
+        if (triggerReason === 'private') { found = newest; from = 'unread-latest'; }
+        else {
+          for (let i = st.unread.length - 1; i >= 0; i -= 1) {
+            const m = st.unread[i];
+            if (!m) continue;
+            const t = String(m.plain ?? m.text ?? '').toLowerCase();
+            if (m.quoteTargetIsSelf || (nick && t.includes(nick))) { found = m; from = 'unread-mention'; break; }
+          }
+          if (!found) { found = newest; from = 'unread-latest'; }
+        }
+      }
+      const triggerSeqOut = found && Number.isSafeInteger(Number(found.seq)) ? Number(found.seq) : (Number.isSafeInteger(realSeq) ? realSeq : undefined);
+      if (triggerSeqOut !== undefined) {
+        packet.triggerSeq = triggerSeqOut;
+        packet.triggerFrom = from || 'unknown';
+        // 触发消息必须在快照里露脸，否则模型照样不知道是哪条
+        const shownNow = new Set([...packet.messages, ...packet.recent].map((m) => Number(m?.seq)));
+        if (found && !shownNow.has(triggerSeqOut)) packet.trigger = compactModelMessage(found);
+      }
+      if (from === 'expired') {
+        log(`[reserved2] 触发消息 seq${realSeq} 已滚出缓存 ${key}，快照按最近未读兜底`);
       }
     }
     return packet;
@@ -10512,10 +10615,15 @@ async function main() {
     const __wlim = resolveWakeLimitsV2(key);
     const exemptHigh = (cfg.socialV2?.wake?.exemptHighPriorityFromLimit ?? true) !== false;
     const reasonBase = String(reason ?? '').split(':')[0];
-    const HIGH_PRIORITY = new Set(['private', 'atMention', 'question']);
+    // MARKER: wake-limit-question — question 不再豁免唤醒限流。
+    // 旧版把 question 放进 HIGH_PRIORITY，而 question 的判定本身很松（见 isDirectedAtAi），
+    // 等于「任何带『你…吗』的闲聊都能无限唤醒」。private / atMention 是确定性信号，保留豁免；
+    // question 是概率性信号，必须受限流约束。
+    const HIGH_PRIORITY = new Set(['private', 'atMention']);
     const isExplicit = exemptHigh && HIGH_PRIORITY.has(reasonBase);
     if (!isExplicit) {
-      const maxPerMinute = Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0;
+      // MARKER: per-group-override
+      const maxPerMinute = __wlim.maxWakePerMinute || (Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0);
       const maxPerHour = __wlim.maxWakePerHour;
       const recentMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).length;
       const recentHour = (st.wakeTimes || []).filter((t) => now - t < 3600000).length;
@@ -10601,6 +10709,7 @@ async function main() {
 
   function scheduleReplyCheckV2(key) {
     if (cfg.socialV2?.enabled === false) return;
+    if ((cancelCooldownUntil.get(key) || 0) > Date.now()) return; // MARKER: cancel-cooldown
     if (socialV2.paused || currentMode !== 'reserved2') return;
     const st = getSocialV2State(key);
     // 已有真实唤醒/有限睡眠/回复检查在排队时不再重复安排，避免 AI 被连环唤醒。
@@ -10794,6 +10903,15 @@ async function main() {
   function scheduleWakeV2(key, reason, opts = {}) {
     if (cfg.socialV2?.enabled === false) return;
     if (socialV2.paused) return;
+    // MARKER: cancel-cooldown —— 冷却期内只放过「有人直接找她」的唤醒，其余静默。
+    // 否则掐断刚生效，群里任意一条消息又能把她拉起来。
+    if (!opts.force && (cancelCooldownUntil.get(key) || 0) > Date.now()) {
+      const base = String(reason ?? '').split(':')[0];
+      if (!['private', 'atMention'].includes(base)) {
+        log(`[reserved2] ${key} 处于掐断冷却期，跳过唤醒（${reason}）`);
+        return;
+      }
+    }
     if (!isSessionAllowedInCurrentMode(key)) {
       log(`[reserved2] 跳过计划唤醒 ${key}（${reason}）：会话已不在当前模式允许范围内`);
       return;
@@ -10826,12 +10944,20 @@ async function main() {
       st.sleepTimer = null;
     }
     st.pendingWakeReason = reason;
+    // MARKER: trigger-seq-real —— 只在「刚建立合并窗口」时记触发 seq：
+    // 合并窗口内后续消息属于同一次唤醒的补充，不该覆盖真正的触发点。
+    {
+      const seqNow = Number(st.lastUnreadSeq);
+      if (Number.isSafeInteger(seqNow) && seqNow > 0) wakeTriggerSeq.set(key, seqNow);
+    }
     const batchMs = Math.max(1000, Number(st.wakeConfig?.batchWindowMs) || 8000);
     st.pendingWakeTimer = setTimeout(() => {
       st.pendingWakeTimer = null;
       const finalReason = st.pendingWakeReason || reason;
       st.pendingWakeReason = null;
-      void sendWakePromptV2(key, finalReason).catch((error) => log(`[reserved2] 计划唤醒异常 ${key}:`, error?.message ?? error));
+      void sendWakePromptV2(key, finalReason)
+        .catch((error) => log(`[reserved2] 计划唤醒异常 ${key}:`, error?.message ?? error))
+        .finally(() => { wakeTriggerSeq.delete(key); });
     }, batchMs);
     // 与其它 per-conversation 定时器保持一致：别让一个待唤醒定时器把进程钉住不退出。
     st.pendingWakeTimer.unref?.();
@@ -10914,9 +11040,12 @@ async function main() {
     if (inQuietHours(limits.quietHours)) return 0;
     const now = Date.now();
     if (st.lastAiReplyAt && now - Number(st.lastAiReplyAt) < limits.minIntervalMs) return 0;
-    const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
-    const aiLastHour = recent.filter((m) => m && m.isSelf && now - Number(m.time || 0) < 60 * 60 * 1000).length;
-    if (aiLastHour >= limits.maxPerHour) return 0;
+    // MARKER: proactive-cap-by-bubbles —— 这里数的是「主动冒泡次数」，不是「她说过的所有话」。
+    // 旧版数 m.isSelf，而 maxPerHour 默认 2 ⇒ 任何活跃群（她正常回话早超 2 条）
+    // hardCap 恒为 0，主动冒泡永远不触发；冷清群反倒能冒。闸门方向反了。
+    const bubbles = Array.isArray(st.proactiveTimes) ? st.proactiveTimes : [];
+    const bubblesLastHour = bubbles.filter((t) => now - Number(t || 0) < 60 * 60 * 1000).length;
+    if (bubblesLastHour >= limits.maxPerHour) return 0;
     return limits.capProbability;
   }
   function scheduleProactiveCheckV2(key, opts = {}) {
@@ -10972,7 +11101,11 @@ async function main() {
         prob = Math.min(prob, hardCap);
       }
       if (hardCap > 0 && idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
-        void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
+        // MARKER: proactive-cap-by-bubbles —— 冒泡真正发起时才记一次，供硬闸统计。
+        if (!Array.isArray(st.proactiveTimes)) st.proactiveTimes = [];
+        st.proactiveTimes.push(Date.now());
+        if (st.proactiveTimes.length > 200) st.proactiveTimes = st.proactiveTimes.slice(-200);
+        saveSocialV2State();
         void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
       }
       scheduleProactiveCheckV2(key);
