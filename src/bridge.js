@@ -3153,6 +3153,7 @@ async function main() {
     if (entry.cancelled) return;
     entry.cancelled = true;
     entry.reason = why;
+    abortReasonByKey.set(key, why);
     const elapsedMs = Date.now() - entry.startedAt;
     log(`[turn-budget] 超上限（${why}）：${key} 已跑 ${Math.round(elapsedMs / 1000)}s / ${entry.steps} 步 / ${entry.sends} 条，掐掉本回合`);
     appendActivity(`${key} [turn-budget] 超上限（${why}），已中止回合`);
@@ -3179,6 +3180,9 @@ async function main() {
   }
   // key -> 掐断冷却截止时间
   const cancelCooldownUntil = new Map();
+  // MARKER: abort-reason-by-key —— key -> 回合被掐的原因（时长超限 / 条数超限）。
+  // 供 ended.reason.kind === 'aborted' 分支拼诊断用，免得只发一句没头没尾的「已停止」。
+  const abortReasonByKey = new Map();
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
   // MARKER: role-card-refresh —— 会话 -> 最近一次已注入的角色卡指纹。
   // 进程重启后为空，所以每个会话重启后第一次唤醒会重注入一次，属于预期行为。
@@ -4821,6 +4825,33 @@ async function main() {
   }
 
   /** 直接往 QQ 发一条文本（不触发模型回合，省钱）。 */
+  /**
+   * 技术性投递错误只发给管理员私聊，当前会话一个字都不发。
+   *
+   * 为什么：`session/attachment-invalid: Model "x" does not support image input`
+   * 这类信息对群友毫无意义，还会把渠道名、模型名、内部错误码抖到群里；
+   * 好友私聊里读到一串英文报错一样只会让人困惑。诊断信息归管理员。
+   *
+   * 为什么单独成函数：两处投递失败（普通回合 / 群聊兜底路径）都要用，
+   * 复制一遍既容易走样，也容易在其中一处忘了给 sourceKey。
+   * 绝不抛错 —— 通知失败只能记日志，不能污染调用方的主流程。
+   */
+  async function notifyAdminOnly(headline, detail, sourceKey) {
+    const src = String(sourceKey ?? '').trim();
+    const ownerKey = cfg.ownerQQ ? `private:${String(cfg.ownerQQ)}` : '';
+    const where = src && src !== ownerKey ? `（${src}）` : '';
+    log(`${headline}${where}：${detail}`);
+    if (!ownerKey) {
+      log(`⚠️ ${headline}：未配置 ownerQQ，诊断信息只留在日志里`);
+      return;
+    }
+    try {
+      await sendToQQ(ownerKey, `${headline}${where}：${detail}`);
+    } catch (error) {
+      log(`${headline} 通知管理员失败（已忽略）：${error?.message ?? error}`);
+    }
+  }
+
   async function sendPlainToQQ(key, text) {
     const m = /^(group|private):(\d+)$/.exec(String(key ?? '').trim());
     if (!m) throw new Error(`sendPlainToQQ: key 格式不对：${key}`);
@@ -9088,7 +9119,8 @@ async function main() {
       if (opts.farewell) social.exitingSessions.delete(sessionId);
       const errText = `${accepted.result.error.code}: ${accepted.result.error.message}`;
       const safeErrText = shouldAuditKey(key) && SENSITIVE_RE.test(errText) ? '（含敏感信息，已隐藏）' : errText;
-      if (!opts.silent) await sendToQQ(key, `⚠️ 消息未被接受：${safeErrText}`);
+      // MARKER: err-to-admin —— 投递被上游拒绝属于技术错误，只通知管理员。
+      if (!opts.silent) await notifyAdminOnly('⚠️ 消息未被接受', safeErrText, key);
       return { ok: false, error: safeErrText };
     }
     if (wakeSnapshot && isCurrentSession(key, sessionId)
@@ -11542,7 +11574,8 @@ async function main() {
     if (!accepted.result.ok) {
       const errText = `${accepted.result.error.code}: ${accepted.result.error.message}`;
       const safeErrText = shouldAuditKey(key) && SENSITIVE_RE.test(errText) ? '（含敏感信息，已隐藏）' : errText;
-      await sendToQQ(key, `⚠️ 消息未被接受：${safeErrText}`);
+      // MARKER: err-to-admin
+      await notifyAdminOnly('⚠️ 消息未被接受', safeErrText, key);
       return;
     }
     if (accepted.result.value.command) {
@@ -12103,7 +12136,13 @@ async function main() {
                   }
                 }
               } else if (ended.reason.kind === 'aborted') {
-                await sendToQQ(key, '⏹️ 已停止');
+                // MARKER: abort-notice-admin-only
+                // 原来是无条件把「⏹️ 已停止」发到当前会话。回合因预算超标被掐时也会走到这里，
+                // 群友只看到一条没头没尾的「已停止」（实测 2026-10-25 一天 22 次）。
+                // 现在：会话侧一个字都不发，只记日志 + 抄送管理员私聊，并带上真实原因。
+                const abortWhy = abortReasonByKey.get(key) || '';
+                abortReasonByKey.delete(key);
+                await notifyAdminOnly('⏹️ 回合已中止', abortWhy || '被中止（原因未知）', key);
                 if (isFarewell) {
                   const st = socialState(key);
                   if (st.phase === 'exiting') {
