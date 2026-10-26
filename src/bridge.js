@@ -1485,6 +1485,18 @@ function extractMediaFromSegments(segments) {
         kind: 'face',
         faceId: String(d.id ?? '')
       });
+    } else if (seg.type === 'mface' || seg.type === 'marketface') {
+      // MARKER: mface-media
+      // QQ 的「收藏表情 / 商城表情」走 mface 段，不是 image 也不是 face。
+      // 以前这里没分支 → 整段直接蒸发：mediaList 为空，她连「这里有个表情」都不知道，
+      // 只会被告知「没看见」。summary 形如「[表情包:我是吃白饭的大肥鱼]」。
+      media.push({
+        kind: 'mface',
+        file: String(d.file ?? ''),
+        url: String(d.url ?? ''),
+        summary: String(d.summary ?? d.text ?? ''),
+        emojiId: String(d.emoji_id ?? d.emojiId ?? '')
+      });
     }
   }
   return media;
@@ -7536,17 +7548,25 @@ async function main() {
           parts.push({ type: 'text', text: face.text || `[表情#${media.faceId}]` });
         }
       } else {
+        // mface 的 summary 已经是「[表情包:名字]」格式，先剥壳再用，别套成双层
+        const rawSummary = String(media.summary ?? '')
+          .replace(/^\[表情包[:：]?/, '')
+          .replace(/\]$/, '')
+          .trim();
+        const label = media.kind === 'mface'
+          ? (rawSummary ? `[表情包:${rawSummary}]` : '[表情包]')
+          : `[图片${index}]`;
         const img = await fetchOneBotImage(media);
         if (img?.buffer) {
           if (totalBytes + img.buffer.length > MAX_MEDIA_BYTES) {
-            parts.push({ type: 'text', text: `[图片${index}（图片总大小超限，已跳过）]` });
+            parts.push({ type: 'text', text: `${label}（图片总大小超限，已跳过）` });
             continue;
           }
           totalBytes += img.buffer.length;
-          parts.push({ type: 'text', text: `[图片${index}]` });
+          parts.push({ type: 'text', text: label });
           parts.push({ type: 'image', mediaType: img.mimeType || 'image/jpeg', data: img.buffer.toString('base64'), name: `qq-image-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}` });
         } else {
-          parts.push({ type: 'text', text: `[图片${index}（获取失败）]` });
+          parts.push({ type: 'text', text: `${label}（图片取不到，只看到名字）` });
         }
       }
     }
