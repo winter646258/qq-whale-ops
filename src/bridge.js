@@ -5692,7 +5692,12 @@ async function main() {
         try {
           verdict = await moduleHost.dispatch(req.method, url.pathname, { req, res, url, sendJson, readBody });
         } catch (error) {
-          log('[modules] 路由处理失败:', error?.message ?? error);
+          // MARKER: module-stack —— 光有 message 定位不到行（22:06:34 那条
+          // `key is not defined` 就是这样，静态扫了 108 条路由也没复现）。
+          // 这里把 method+path 和前三层栈帧一起打出来，下次一犯就能指到行号。
+          log('[modules] 路由处理失败:', error?.message ?? error, `${req.method} ${url.pathname}`);
+          const stk = String(error?.stack ?? '').split('\n').slice(1, 4).map((s) => s.trim()).join(' | ');
+          if (stk) log('[modules] 出错位置:', stk);
           sendJson({ ok: false, error: `模块处理失败：${error?.message ?? error}` }, Number(error?.statusCode) || 500);
           return;
         }
