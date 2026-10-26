@@ -82,3 +82,7 @@ audio/
 # 2026-10-26：曾误入库并含明文密钥（已改写历史抹除）。同类文件一律不入库。
 config.json.pre-*
 *.pre-*
+
+# 2026-10-26：视觉模型对比用的临时脚本，不入库
+/bench*.mjs
+/check_vision_logic.mjs
