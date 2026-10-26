@@ -25,6 +25,8 @@ function isAgentCall(req) {
 async function image({ req, url, sendJson, readBody }) {
   const ctx = this.ctx;
   const { cfg, log, path, imageHelpers: h } = ctx;
+  // 免审批放行标记：整段 try/catch 都要看得到（成功与失败都要报备）。
+  let reportOnly = false;
   try {
     const q = url.searchParams;
     const body = req.method === 'POST' ? ((await readBody()) ?? {}) : {};
@@ -44,7 +46,16 @@ async function image({ req, url, sendJson, readBody }) {
       sendJson({ ok: false, error: 'qq_generate_image 已在配置里关闭' }, 403); return;
     }
 
-    const permit = h.imageAllowedNow(key);
+    let permit = h.imageAllowedNow(key);
+    // MARKER: image-report-only
+    // 主人 2026-10-25 指令「开启画图模式，无需审批，只需要报备管理员」：
+    // 好友私聊要图不再排队等审批，直接放行（只放开这一档，群里非主人仍拒绝），
+    // 画完把明细报备给主人。config.socialV2.image.reportOnly=false 退回旧的人工审批。
+    if (!permit.ok && action === 'generate' && h.imageReportOnly?.() && h.imageApprovalEligible(key)) {
+      reportOnly = true;
+      permit = { ok: true, scene: 'report-only' };
+      log(`[imgapprove] 免审批放行（${key}）：${String(body.prompt ?? '').slice(0, 40)}`);
+    }
     if (!permit.ok) {
       // 好友私聊要图：不画，转成一条待审申请发给主人。其余场景仍照旧 403。
       if (action === 'generate' && h.imageApprovalEligible(key)) {
@@ -102,6 +113,7 @@ async function image({ req, url, sendJson, readBody }) {
       return;
     }
     h.markStart(key);
+    const genStartedAt = Date.now();
     log(`[reserved2] 生图请求（${permit.scene}，${key}）：${prompt.slice(0, 60)}`);
     const result = await h.generateImageNow({ prompt, size: body.size });
     // 画完就发：工具只把 url/本地路径当文本回给模型，她自己看不到图，主人也收不到。
@@ -119,8 +131,20 @@ async function image({ req, url, sendJson, readBody }) {
     } catch (error) {
       log(`[reserved2] 生图后发送失败（${key}）：${error?.message ?? error}`);
     }
+    if (reportOnly && typeof h.reportImageUsage === 'function') {
+      void h.reportImageUsage({
+        key, scene: permit.scene, prompt, size: body.size,
+        ok: true, sent, elapsedMs: Date.now() - genStartedAt
+      });
+    }
     sendJson({ ok: true, key, action, scene: permit.scene, sent, ...result });
   } catch (error) {
+    if (reportOnly && typeof h.reportImageUsage === 'function') {
+      void h.reportImageUsage({
+        key, scene: 'report-only', prompt: String(body?.prompt ?? ''),
+        size: body?.size, ok: false, error: String(error?.message ?? error)
+      });
+    }
     sendJson({ ok: false, error: '生图失败：' + (error?.message ?? error) }, 500);
   }
 }

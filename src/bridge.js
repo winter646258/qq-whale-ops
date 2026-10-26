@@ -4918,6 +4918,8 @@ async function main() {
       imageAllowedNow: (key) => imageAllowedNow(key),
       imageApprovalEligible: (key) => imageApprovalEligible(key),
       requestImageApproval: (key, prompt, size) => requestImageApproval(key, prompt, size),
+      imageReportOnly: () => imageReportOnly(),
+      reportImageUsage: (info) => reportImageUsage(info),
       getImageApprovalState: () => getImageApprovalState(),
       imageApprovalStatsOf: (st) => imageApprovalStatsOf(st),
       approveImageApproval: (st, id) => approveImageApproval(st, id),
@@ -5197,6 +5199,49 @@ async function main() {
     if (!friendSetReady || !friendSet.has(id)) return false;
     if (!allowed('private', Number(id), cfg)) return false;
     return true;
+  }
+
+  /**
+   * 生图「只报备、不审批」开关。
+   *
+   * 主人 2026-10-25 的指令（原话）：「开启画图模式，无需审批，只需要报备管理员」。
+   * 打开后好友私聊要图不再排队等主人点头，直接画，画完把「谁要的、要了什么、
+   * 花了多久、成没成、发到哪」报给主人一条消息。
+   * 想改回人工审批：config.json 里 socialV2.image.reportOnly 设 false。
+   *
+   * 边界：只放开「好友私聊」这一档。群里非主人要图仍然拒绝 —— 群成员不可控，
+   * 「谁都能喊一声就让她花钱画图」的口子不能开（理由同 imageApprovalEligible）。
+   */
+  function imageReportOnly() {
+    return cfg.socialV2?.image?.reportOnly !== false;
+  }
+
+  /** 报备一条免审批生图。失败只记日志，绝不影响出图结果本身。 */
+  async function reportImageUsage(info) {
+    const ownerKey = imageApprovalOwnerKey();
+    const prompt = String(info?.prompt ?? '');
+    const key = String(info?.key ?? '');
+    const m = /^private:(\d+)$/.exec(key);
+    const who = m ? `${imageApprovalRequesterName(m[1])}（${m[1]}）` : key;
+    const elapsed = Number(info?.elapsedMs ?? 0);
+    const lines = [
+      `🖼 免审批生图报备`,
+      `谁：${who}`,
+      `要的：${prompt.slice(0, 200)}${prompt.length > 200 ? '…' : ''}`,
+      info?.size ? `尺寸：${info.size}` : '',
+      `结果：${info?.ok ? '✅ 已画好' : '❌ 失败'}${info?.ok && info?.sent === false ? '（但没发出去，看日志）' : ''}`,
+      elapsed ? `耗时：${(elapsed / 1000).toFixed(1)}s` : '',
+      info?.error ? `错误：${String(info.error).slice(0, 300)}` : '',
+      '',
+      `（画图已设为免审批，只向你报备；想改回来：socialV2.image.reportOnly=false）`
+    ].filter((x) => x !== '');
+    log(`[imgapprove] 报备 ${who} ${info?.ok ? '成功' : '失败'}：${prompt.slice(0, 40)}`);
+    try {
+      appendImageApprovalAudit({ action: 'report-only', detail: `${key} ${info?.ok ? 'ok' : 'fail'}` });
+    } catch {}
+    if (ownerKey) {
+      await sendPlainToQQ(ownerKey, lines.join('\n')).catch(() => {});
+    }
   }
 
   /**
