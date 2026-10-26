@@ -8306,16 +8306,30 @@ async function main() {
     const model = String(cfg.dsh?.model || 'deepseek-flash');
     const effort = String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT);
     let lastError = null;
+    // 档位降级：某些模型（同一 provider 下也可能）不认当前 reasoningEffort，
+    // DSH 会报 does not support reasoning effort 直接拒绝 selectModel。
+    // 这种错误重试同一个档位没有意义，第二轮干脆不带 reasoningEffort，让 DSH 用模型自己的默认档。
+    let effortArg = effort;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        const result = unwrap(await api.sessions.selectModel({ sessionId, provider, model, reasoningEffort: effort }), 'session.selectModel');
+        const params = { sessionId, provider, model };
+        if (effortArg) params.reasoningEffort = effortArg;
+        const result = unwrap(await api.sessions.selectModel(params), 'session.selectModel');
         modelAppliedSessions.set(sessionId, modelSelectionEpoch);
-        log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'})`);
+        log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'})${effortArg ? '' : '（已放弃指定档位，改用模型默认）'}`);
         return 'applied';
       } catch (error) {
         lastError = error;
-        log(`设置会话模型失败 ${sessionId}（第 ${attempt}/2 次）: ${error?.message ?? error}`);
-        if (attempt < 2) await sleep(1000);
+        const why = String(error?.message ?? error);
+        log(`设置会话模型失败 ${sessionId}（第 ${attempt}/2 次）: ${why}`);
+        if (attempt < 2) {
+          if (/does not support reasoning effort/i.test(why) && effortArg) {
+            effortArg = '';
+            log(`模型 ${provider}/${model} 不支持档位 ${effort}，改为由 DSH 选默认档重试`);
+          } else {
+            await sleep(1000);
+          }
+        }
       }
     }
     const message = String(lastError?.message ?? lastError ?? '');
