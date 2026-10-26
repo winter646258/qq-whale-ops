@@ -9222,7 +9222,10 @@ async function main() {
       st.memberImpressions[target] = {
         traits,
         interactionCount: (Number(old.interactionCount) || 0) + 1,
-        lastSeenAt: Date.now()
+        lastSeenAt: Date.now(),
+        // MARKER: impression-per-member —— 主动追加标签本身就是在更新印象，
+        // 按成员记时间，别让「改了一个人」把整会话的计时重置掉。
+        refreshedAt: Date.now()
       };
       const impressionEntries = Object.entries(st.memberImpressions);
       if (impressionEntries.length > 50) {
@@ -10876,9 +10879,32 @@ async function main() {
     // MARKER: impression-nudge
     const impressionRefreshDays = Math.max(1, Number(cfg.socialV2?.memory?.impressionRefreshDays) || 7);
     const lastImpressionRefreshAt = Number(st.lastImpressionRefreshAt) || 0;
-    const impressionCount = Object.keys(st.memberImpressions || {}).length;
-    const impressionStale = impressionCount > 0
-      && (lastImpressionRefreshAt === 0 || Date.now() - lastImpressionRefreshAt > impressionRefreshDays * 86400 * 1000);
+    // MARKER: impression-per-member —— 2026-10-26
+    // 旧逻辑拿 lastImpressionRefreshAt 这个**会话级单值**判「该不该刷新」：
+    // 她只要改了本会话任意 1 个成员，整会话计时就重置，剩下的人再等 5 天。
+    // 实测 group:906710082 8 个人、星璃 interactionCount 已 2131 次，
+    // traits 从建库起没变过 —— 因为永远轮不到第 2 个人。
+    // 现在按成员各自的 refreshedAt 判，并点名最该改的那几个。
+    const impressionEntries = Object.entries(st.memberImpressions || {});
+    const impressionCount = impressionEntries.length;
+    const impressionRefreshMs = impressionRefreshDays * 86400 * 1000;
+    const impressionNow = Date.now();
+    // MARKER: impression-stale-by-rewrite —— 2026-10-26
+    // 只认 refreshedAt（她**真的重写过**这条印象的时间）。
+    // 早期版本用 `refreshedAt || lastSeenAt` 兜底，而 lastSeenAt 是「最近互动时间」：
+    // 活跃成员天天在刷新它 ⇒ 永远不超期。实测 group:906710082 的星璃
+    // interactionCount 已 2131（全群最活跃）、traits 从建库起一个字没变过，
+    // 却因为 lastSeenAt 一直新而永远进不了名单 —— 最该更新的那个人被永久跳过。
+    // 没有 refreshedAt 就是「从来没重写过」，一律算超期，这不算冤枉：
+    // 那些 traits 确实是建库那一刻的判断，之后没被任何人改过。
+    const staleMembers = impressionEntries
+      .map(([name, im]) => ({ name, at: Number(im?.refreshedAt) || 0 }))
+      .filter((x) => !x.at || impressionNow - x.at > impressionRefreshMs)
+      // 升序即「最久没重写的排最前」：at=0 表示从没重写过，最该先改。
+      .sort((a, b) => a.at - b.at);
+    const impressionStale = staleMembers.length > 0;
+    const staleNames = staleMembers.slice(0, 3).map((x) => x.name).join('、');
+    const staleMore = staleMembers.length > 3 ? ` 等 ${staleMembers.length} 个` : '';
     // ① 「记印象」驱动：还没留过印象、但会话已经有足够往来时，提示她开始记。
     //    门槛与冷却都可配；默认 0 条印象 + 最近消息 >= 20 条时才提，12 小时最多念一次。
     const nudgeEnabled = cfg.socialV2?.memory?.nudgeImpressions !== false;
@@ -10892,7 +10918,7 @@ async function main() {
     const memoryMaintenanceLine = shouldStartNudge
       ? `【记印象】你还没给这个地方的人留过印象。挑 1~2 个打过交道的，用 qq_memory_append（category=memberImpression，content="短标签"，extra.target="对方昵称"）各记一句——一条几个字就够（例：话多、爱怼人、爱发怪图、说话客气）。想先看看都有谁，可以用 qq_get_active_members。不用记全，也不用汇报。\n\n`
       : (shouldRefreshNudge
-        ? `【印象维护】你手上的【对群友的印象】可能已经过时了。挑 1~2 个改一下：先用 qq_memory_query 看现在的印象，再用 qq_memory_update（category=memberImpression，target=对方昵称，newContent="标签A、标签B"）把你现在的判断重写掉，一条几个字就够，别攒成一堆旧标签。改完不用汇报。\n\n`
+        ? `【印象维护】${staleNames}${staleMore} 这几个人你很久没重新看过了——印象里的互动次数一直在涨，标签还停在旧时候。挑 1~2 个改一下：先用 qq_memory_query 看现在的印象，再用 qq_memory_update（category=memberImpression，target=对方昵称，newContent="标签A、标签B"）把你现在的判断重写掉，一条几个字就够。改完不用汇报。\n\n`
         : '');
     // 念过一次就记时间（冷却用）。必须落盘，否则重启后每轮都念。
     if (shouldStartNudge || shouldRefreshNudge) st.lastImpressionNudgeAt = Date.now();

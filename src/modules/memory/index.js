@@ -114,8 +114,10 @@ async function updateMemory({ req, sendJson, readBody }) {
     }
     if (cleanNewExtra.interactionCount !== undefined) im.interactionCount = Math.max(0, Number(cleanNewExtra.interactionCount) || 0);
     if (newTarget !== oldTarget) delete st.memberImpressions[oldTarget];
+    // MARKER: impression-per-member —— 按成员记刷新时间
+    im.refreshedAt = Date.now();
     st.memberImpressions[newTarget] = im;
-    // 她真的动手重写了印象 ⇒ 重置维护计时（提醒随之消失）
+    // 会话级计时保留（兼容旧数据与「本会话刚动过」的粗判），但提醒判定已改成逐人
     st.lastImpressionRefreshAt = Date.now();
   }
   ctx.saveSocialV2State();
