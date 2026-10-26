@@ -87,7 +87,23 @@ export function capSlangEntries(entries, max = SLANG_MAX_ENTRIES) {
   const list = Array.isArray(entries) ? entries : [];
   const limit = Math.max(1, Number(max) || SLANG_MAX_ENTRIES);
   if (list.length <= limit) return { entries: list, dropped: 0 };
-  const rank = (e) => (e?.status === SLANG_STATUS.CONFIRMED ? 2 : (e?.status === SLANG_STATUS.CANDIDATE ? 1 : 0));
+  // MARKER: slang-cap-rank —— 2026-10-25 B
+  // 旧版只按 status 分 3 档，同档内按 count 排。问题：已经有释义、有语境证据的条目
+  // 会跟「刚冒出来一次」的噪音同档竞争，被 count 而不是被价值决定去留。
+  // 现在把「有没有释义」和「有多少条语境证据」也算进评分，让真学到的知识先活下来。
+  const rank = (e) => {
+    let s = 0;
+    if (e?.status === SLANG_STATUS.CONFIRMED) s += 100;
+    // MARKER: slang-reject-survive —— 拉黑的词必须活下来，否则库满时被裁掉，
+    // 下轮提取又会把它造成新 candidate，再研究一遍（这正是空转的另一半原因）。
+    // 给 20：比新候选(10)高、比已确认(100)低，黑名单不会被新词潮冲走。
+    else if (e?.status === SLANG_STATUS.REJECTED) s += 20;
+    else if (e?.status === SLANG_STATUS.CANDIDATE) s += 10;
+    if (String(e?.meaning ?? '').trim()) s += 50;
+    const ev = Array.isArray(e?.evidence) ? e.evidence.length : 0;
+    s += Math.min(20, ev) * 2;
+    return s;
+  };
   const kept = [...list]
     .sort((a, b) => rank(b) - rank(a)
       || (Number(b?.count) || 0) - (Number(a?.count) || 0)
@@ -248,15 +264,51 @@ ${chatLines}
 输出 JSON：`;
 }
 
-export function buildResearchPrompt(candidates) {
+export function buildResearchPrompt(candidates, { light = false } = {}) {
   const list = (candidates || [])
     .map((e, i) => {
+      // MARKER: slang-evidence-richer —— 2026-10-25
+      // 原来只给最后 2 条、每条截 80 字。实测模型拿这点语境只能回「未确认」，
+      // 一轮研究 3 条全部落空（18:56:59 那次）。给到 3 条 × 120 字，判断依据才够。
       const evidence = Array.isArray(e.evidence) && e.evidence.length
-        ? e.evidence.slice(-2).map((x) => `（群友语境：${escapeLearnerText(String(x.text || '').slice(0, 80))}）`).join('')
+        ? e.evidence.slice(-3).map((x) => `（群友语境：${escapeLearnerText(String(x.text || '').slice(0, 120))}）`).join('')
         : '';
       return `${i + 1}. ${escapeLearnerText(String(e.content || '').slice(0, 50))}${evidence}`;
     })
     .join('\n');
+  // MARKER: slang-light-research —— 轻量版：不联网，只凭群友语境推断。
+  // 兜底渠道跑完整联网研究要 12 分钟以上，注定超时；而黑话的含义大多能从
+  // 「群里谁在什么场合这么说」直接读出来（参考 MaiBot bw_learner 的做法）。
+  if (light) {
+    return `你是群聊黑话研究员。下面这些词已经在同一个群里反复出现，请**只依据给出的群友语境**推断它们的含义。
+不要联网，不要调用任何工具（web_search / web_fetch 一律不用），直接凭语境和你已有的中文网络用语知识作答。
+
+候选：
+${list}
+
+请输出 JSON 数组，每个元素：
+{
+  "content": "词条",
+  "meaning": "含义（简洁，适合群友理解）",
+  "usage": "使用场景/语气（可选）",
+  "example": "一个自然短句示例（可选）",
+  "risk": "是否有敏感/慎用风险（可选，没有就留空）",
+  "sources": [],
+  "confirmed": true 或 false
+}
+
+注意（三种情况分清楚，别再一律写 false）：
+- **群内特有 / 网络梗 / 简称 / 昵称 / 特定圈子说法** → meaning 写清楚（什么意思、什么语气、
+  群里怎么用），confirmed: true。这是最想要的一类。
+- **普通日常词，但你能说清它在这个群里的实际用法**（比如「嘴硬」= 明明被说中了还不承认，
+  常用来怼人）→ meaning 照样写出来，confirmed: false。我们**仍然会收录**，只是不把它
+  塞进给角色看的高优先级表。别因为"这是普通词"就整条丢掉。
+- **确实没有任何网络/群内含义、也讲不出用法的常见词**（比如「刚刚好」「那个」）→
+  meaning 留空字符串，confirmed: false。这类会被标记为无价值、不再重复研究。
+- 完全看不出语境在说什么的时候，meaning 留空，不要硬编。
+- 本次不联网，sources 一律留空数组。
+- 只输出 JSON 数组。`;
+  }
   return `你是群聊黑话研究员。请针对以下候选网络用语/黑话做**深度联网考究**：先结合给出的群友语境判断可能含义，再使用 web_search 搜索确认，并对最相关的 1~2 个结果用 web_fetch 抓取正文阅读（只读搜索/抓取，不要执行任何本地操作）。不要只依赖搜索摘要。
 
 候选：

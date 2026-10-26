@@ -1633,6 +1633,15 @@ async function main() {
   // 重建只会更慢；改为加大超时 + 研究专用退避，把频率压下来而不动会话。
   const SLANG_EXTRACT_TIMEOUT_MS = 180000;                   // 提取 turn 等待上限（兜底渠道 120s 常在边缘）
   const SLANG_RESEARCH_TIMEOUT_MS = 180000;                  // 研究 turn 等待上限
+  // MARKER: slang-light-research —— 兜底渠道上的「轻量研究」参数。
+  // 兜底渠道实测一个完整研究 turn 要 12 分钟以上，注定超时；
+  // 轻量模式不联网、只凭群友语境推断，单批只挑出现最多的 3 条，超时收到 90s。
+  // MARKER: slang-backfill-fast —— 2026-10-26 批量从 3 提到 10、超时 90s 提到 150s。
+  // 实测轻量研究一轮 3 条只要 10~25 秒，离 90s 上限远得很，3 条是白等。
+  // 1923 条无释义候选按 3 条/轮 × 10 分钟一轮要 107 小时（4.5 天）。
+  const SLANG_LIGHT_RESEARCH_TIMEOUT_MS = 150000;
+  const SLANG_LIGHT_RESEARCH_BATCH = 10;
+  const SLANG_LIGHT_RESEARCH_BACKOFF_MS = 10 * 60 * 1000;
   const SLANG_RESEARCH_TIMEOUT_BACKOFF_MS = 15 * 60 * 1000;  // 研究超时后的退避
   const slangLearnerRebuildAt = [];   // 最近的重建时间戳
   let slangLearnerBlockedUntil = 0;   // 在此之前不再创建/复用学习会话
@@ -3133,8 +3142,19 @@ async function main() {
         if (c > maxThreshold) return true;
         return thresholdsC.includes(c);
       });
-      // 一次最多补 5 条，别把学习会话压垮。
-      const batch = pending.slice(0, 5).filter((e) => !slangResearchingIds.has(e.id));
+      // MARKER: slang-prefer-unlearned —— 2026-10-25 B
+      // 实测：1930 条候选一条释义都没有，但补偿扫描却先去重研究了 count 最高的
+      // 哈基米/dsh（本来就有释义）。原因就是只按 count 排，不看「学没学到」。
+      // 现在先补没有释义的，同档内才按出现次数排。
+      pending.sort((a, b) => {
+        const am = String(a?.meaning ?? '').trim() ? 1 : 0;
+        const bm = String(b?.meaning ?? '').trim() ? 1 : 0;
+        if (am !== bm) return am - bm;
+        return (Number(b?.count) || 0) - (Number(a?.count) || 0);
+      });
+      // MARKER: slang-backfill-fast —— 一次最多补 10 条（原 5 条）。
+      // 轻量研究不联网，10 条一轮实测 40~60 秒，学习会话扛得住。
+      const batch = pending.slice(0, 10).filter((e) => !slangResearchingIds.has(e.id));
       if (!batch.length) return 0;
       log(`黑话研究：补偿扫描补入 ${batch.length} 条从未研究的候选${reason ? `（${reason}）` : ''}`);
       queueSlangTask(() => runSlangResearch(batch));
@@ -3151,16 +3171,25 @@ async function main() {
     if (!dshReady) return;
     // MARKER: slang-research-backoff —— 退避期内直接跳过，不建会话也不打日志，避免刷屏。
     if (slangResearchBlockedUntil > Date.now()) return;
-    if (slangResearchChannelIsFallback()) {
-      if (Date.now() - slangFallbackSkipLoggedAt > 3600000) {
-        slangFallbackSkipLoggedAt = Date.now();
-        log('黑话研究：当前在兜底渠道上，跳过（研究 turn 太慢，等切回主渠道后自动恢复；提取照常）');
-      }
-      return;
-    }
+    // MARKER: slang-light-research —— 2026-10-25 A+C
+    // 旧版兜底渠道直接 return，一个研究 turn 都不跑。实测 provider 长期停在 fallback，
+    // 结果 2000 条候选里只有 43 条有释义，「自我迭代」等于空转。
+    // 参考 MaiBot 的 bw_learner：黑话释义靠群友语境就能推，不必非联网深挖。
+    // 现在兜底渠道走轻量研究（不联网 / 单批 3 条 / 90s），主渠道照旧完整联网研究。
+    const lightMode = slangResearchChannelIsFallback();
     // 过滤掉已经在研究队列里的候选，避免同一批被重复排队研究。
-    const targets = candidates.filter((e) => e && !slangResearchingIds.has(e.id));
+    let targets = candidates.filter((e) => e && !slangResearchingIds.has(e.id));
     if (!targets.length) return;
+    if (lightMode) {
+      targets = [...targets]
+        .sort((a, b) => {
+          const am = String(a.meaning ?? '').trim() ? 1 : 0;
+          const bm = String(b.meaning ?? '').trim() ? 1 : 0;
+          if (am !== bm) return am - bm;          // 没释义的先研究
+          return (Number(b.count) || 0) - (Number(a.count) || 0);
+        })
+        .slice(0, SLANG_LIGHT_RESEARCH_BATCH);
+    }
     for (const e of targets) slangResearchingIds.add(e.id);
     let sessionId;
     try {
@@ -3170,22 +3199,43 @@ async function main() {
       log('黑话研究会话创建失败:', error?.message ?? error);
       return;
     }
-    const promptText = buildResearchPrompt(targets);
+    const promptText = buildResearchPrompt(targets, { light: lightMode });
     try {
       const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] });
       if (!accepted.result.ok) {
         log(`黑话研究被拒: ${accepted.result.error.code}: ${accepted.result.error.message}`);
         return;
       }
-      const output = await waitLearnerTurn(sessionId, SLANG_RESEARCH_TIMEOUT_MS);
+      const output = await waitLearnerTurn(
+        sessionId,
+        lightMode ? SLANG_LIGHT_RESEARCH_TIMEOUT_MS : SLANG_RESEARCH_TIMEOUT_MS
+      );
       const results = parseResearchJson(output);
+      // MARKER: slang-research-honest-log —— 旧版日志打的是 results.length（模型给了几条），
+      // 不是真正写进库的条数。18:53 那次明明一条没落地，日志却写「已更新 3 条」，只能靠人去查文件。
+      let written = 0;
+      let rejected = 0;
+      const missed = [];
       for (const r of results) {
         const entry = slangEntries.find((e) => e.content === r.content);
-        if (!entry) continue;
-        // 只有明确确认（confirmed: true）的结果才写入解释字段；
-        // 不确定/未确认的结果保留原状，允许后续再次研究。
-        if (r.confirmed !== true) {
-          log(`黑话研究：${r.content} 未确认，保留候选待后续研究`);
+        if (!entry) { missed.push(String(r.content ?? '')); continue; }
+        // MARKER: slang-research-noloop —— 2026-10-26
+        // 旧逻辑只有 confirmed:true 才写，其余直接 continue（不写、也不推进
+        // lastInferenceCount）。实测后果：模型判「嘴硬/躺平/看戏/#sl」是普通词 →
+        // 不写 → 计数不推进 → 补偿扫描下一轮又把同一批挑出来 → 97 次研究、
+        // 一次都没进库，库 2000 条里 0 条有释义。
+        // 现在分三档：
+        //   ① confirmed:true            → 写全字段（进注入表）
+        //   ② confirmed:false 但有释义  → 释义照样入库（通用词也有价值），
+        //                                 状态留 candidate（不占注入位），并推进计数
+        //   ③ confirmed:false 且无释义  → 判「没有黑话价值」，标 REJECTED，
+        //                                 推进计数 → 永不再研究（这就是黑名单）
+        if (r.confirmed !== true && !String(r.meaning ?? '').trim()) {
+          entry.status = SLANG_STATUS.REJECTED;
+          entry.lastInferenceCount = entry.count;
+          entry.updatedAt = new Date().toISOString();
+          rejected += 1;
+          log(`黑话研究：${r.content} 判为普通词，拉黑不再研究`);
           continue;
         }
         if (r.meaning) entry.meaning = r.meaning;
@@ -3195,12 +3245,22 @@ async function main() {
         if (Array.isArray(r.sources) && r.sources.length) entry.sources = r.sources.map((s) => String(s ?? '').trim()).filter(Boolean).slice(0, 10);
         entry.lastInferenceCount = entry.count;
         entry.updatedAt = new Date().toISOString();
+        written += 1;
+        if (r.confirmed !== true) log(`黑话研究：${r.content} 通用词入库（不标已确认，不占注入位）`);
       }
       saveSlangStore();
-      log(`黑话研究：已更新 ${results.length} 条候选解释`);
+      log(`黑话研究：模型返回 ${results.length} 条，写入 ${written} 条，拉黑 ${rejected} 条`
+        + (missed.length ? `，${missed.length} 条没匹配上词条（${missed.slice(0, 3).join('/')}）` : ''));
       slangResearchBlockedUntil = 0;
       noteSlangLearnerHealthy();  // MARKER: item7-slang
     } catch (error) {
+      // MARKER: slang-light-research —— A
+      // 轻量模式下任何失败都退避 10 分钟，否则每次提取后的补偿扫描都会把同一批
+      // 候选重新塞进队列（这正是旧 fallback 分支「每轮都试一次」的毛病）。
+      if (lightMode) {
+        slangResearchBlockedUntil = Date.now() + SLANG_LIGHT_RESEARCH_BACKOFF_MS;
+        log(`黑话轻量研究失败（${error?.message ?? error}）—— ${Math.round(SLANG_LIGHT_RESEARCH_BACKOFF_MS / 60000)} 分钟内暂停研究`);
+      }
       // MARKER: item7-slang
       // MARKER: slang-research-backoff —— 超时只压研究频率。研究会话已与提取会话分离，
       // 丢弃研究会话不影响提取。慢渠道上一轮研究 turn 可能十几分钟，超时那一刻它还堵在
@@ -9182,6 +9242,24 @@ async function main() {
   // 回合异常都可能让暂存的 @ 永远等不到那个时机（实测五条 private 全卡死）。
   // 每 30s 扫一遍，忙的跳过，不忙的直接补发。
   setInterval(sweepPendingWakeReasons, 30_000).unref?.();
+
+  // MARKER: slang-backfill-timer —— 2026-10-26
+  // 回填曾经只挂在「提取之后」：群里有新消息 → 提取 → 才顺带扫一次。
+  // 实测提取冷却 5 分钟、实际约 10 分钟一轮，一轮 3 条 ⇒ 18 条/小时。
+  // 1923 条要 4.5 天，用户报「太慢」。现在独立成定时器，不依赖群里有消息。
+  // 每 4 分钟扫一轮、每轮最多 10 条 ⇒ 约 150 条/小时，13 小时跑完。
+  // 三道闸都保留：dshReady / slang.enabled / slangResearchBlockedUntil 退避。
+  setInterval(() => {
+    try {
+      if (!dshReady) return;
+      if (cfg.slang?.enabled === false) return;
+      if (cfg.slang?.autoResearch === false) return;
+      if (slangResearchBlockedUntil > Date.now()) return;
+      sweepUnresearchedSlang({ reason: '定时回填' });
+    } catch (error) {
+      log('黑话定时回填异常:', error?.message ?? error);
+    }
+  }, 4 * 60 * 1000).unref?.();
 
   function isSocialEnabled() {
     return currentMode === 'reserved' && cfg.social?.enabled !== false;
