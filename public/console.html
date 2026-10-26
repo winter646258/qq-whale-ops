@@ -1832,7 +1832,7 @@ button:active:not(:disabled) {
 (function () {
   var el = document.getElementById('section-dashboard');
   if (!el) return;
-  var TICK_MS = 5000;
+  var TICK_MS = 20000;   // MARKER: traffic-poll
   var timer = null;
   var busy = false;
 
@@ -2658,8 +2658,18 @@ button:active:not(:disabled) {
       <div class="meta">静默时群友消息不投递 agent，仅管理员可对话。</div>
     </section>
 <section id="section-dsh" data-page="overview" class="card span-all">
+      <!-- MARKER: panel-model-switch-ui -->
       <h2 data-note="下一条消息生效">DSH 模型与思考强度</h2>
-      <div class="meta">模型：<span id="dshModelText">-</span> ｜ 提供方：<span id="dshProviderText">-</span></div>
+      <div class="meta">当前：<span id="dshModelText">-</span> ｜ 提供方：<span id="dshProviderText">-</span></div>
+      <div class="row" style="margin-top:10px">
+        <label style="flex:0 0 auto">提供方</label>
+        <select id="dshProviderSelect" style="flex:0 1 200px"></select>
+        <label style="flex:0 0 auto">模型</label>
+        <select id="dshModelSelect" style="flex:0 1 320px"></select>
+        <button id="dshModelSave">切换模型</button>
+        <span class="meta" id="dshModelMsg"></span>
+      </div>
+      <div class="meta" id="dshCatalogNote"></div>
       <div class="row" style="margin-top:10px">
         <label style="flex:0 0 auto">思考强度</label>
         <select id="dshEffortSelect" style="flex:0 1 220px"></select>
@@ -2668,6 +2678,14 @@ button:active:not(:disabled) {
       </div>
       <div class="meta" id="dshEffortNote"></div>
       <div class="meta" id="dshEffortSideEffect"></div>
+      <div class="meta" style="margin-top:8px;opacity:.75">注意：故障时 <code>switch-provider.sh</code> 会把 provider 切回降级链首，手选会被自动覆盖 —— 这是有意的保护，不是 bug。</div>
+    </section>
+<section id="section-channels" data-page="overview" class="card span-all">
+      <h2 data-note="只读">渠道健康</h2>
+      <div class="meta" id="channelsSummary">加载中…</div>
+      <div id="channelsTable" style="overflow:auto;margin-top:8px"></div>
+      <div class="meta" id="channelsCheckin"></div>
+      <div class="meta" style="opacity:.75">只读：账号名与凭据都已打码，本卡片不会读取也不会回显任何密钥。</div>
     </section>
 <section id="section-security" data-page="access" class="card">
       <h2>安全拦截通知</h2>
@@ -3143,11 +3161,29 @@ async function refreshSimPrompt() {
 }
 
 // ── DSH 模型与思考强度 ──────────────────────────────────────────────────────
+let dshGroups = [];
+let dshCatalogSource = 'none';
+
 async function refreshDshModel() {
   try {
     const r = await api('/api/dsh/model');
     document.getElementById('dshModelText').textContent = r.model || '-';
     document.getElementById('dshProviderText').textContent = r.provider || '-';
+
+    dshGroups = Array.isArray(r.groups) ? r.groups : [];
+    dshCatalogSource = r.groupsSource || 'none';
+    const psel = document.getElementById('dshProviderSelect');
+    psel.replaceChildren();
+    for (const g of dshGroups) {
+      const el = document.createElement('option');
+      el.value = g.id;
+      el.textContent = g.name && g.name !== g.id ? `${g.name}（${g.id}）` : g.id;
+      psel.appendChild(el);
+    }
+    if (r.provider) psel.value = r.provider;
+    if (!psel.value && dshGroups.length) psel.selectedIndex = 0;
+    fillDshModels(r.model);
+
     const select = document.getElementById('dshEffortSelect');
     const labels = r.labels || {};
     select.replaceChildren();
@@ -3161,6 +3197,17 @@ async function refreshDshModel() {
       select.appendChild(el);
     }
     select.value = r.reasoningEffort;
+
+    const note = document.getElementById('dshCatalogNote');
+    if (dshCatalogSource === 'dsh') {
+      note.textContent = `模型目录取自 DSH（${dshGroups.length} 个提供方）。`;
+    } else if (dshCatalogSource === 'files') {
+      note.textContent = `DSH 目录接口读不到，模型清单来自服务器上各渠道的 catalog.json（${dshGroups.length} 个提供方），状态取自最近一次探测。`;
+    } else {
+      note.textContent = '未能读取模型目录，下拉可能为空。';
+    }
+    note.className = 'meta';
+
     const parts = [];
     if (r.providerDefault) parts.push(`DSH 出厂默认是 ${r.providerDefault}`);
     parts.push(r.catalogSource === 'dsh' ? '档位取自 DSH 实际公布的能力' : '未能读取 DSH 能力，档位为内置清单');
@@ -3169,8 +3216,73 @@ async function refreshDshModel() {
       ? '注意：切换会同时写入 DSH 的全局默认（~/.dsh/settings.yaml 的 agent-default-model），也就是 Web GUI 里新建会话的默认强度也会跟着变。'
       : '';
     document.getElementById('dshEffortMsg').textContent = '';
+    document.getElementById('dshModelMsg').textContent = '';
   } catch (error) {
     document.getElementById('dshEffortMsg').textContent = '读取失败：' + (error?.message ?? error);
+  }
+}
+
+function fillDshModels(preferredModel) {
+  const psel = document.getElementById('dshProviderSelect');
+  const msel = document.getElementById('dshModelSelect');
+  const g = dshGroups.find((x) => x.id === psel.value);
+  msel.replaceChildren();
+  for (const m of (Array.isArray(g?.models) ? g.models : [])) {
+    const el = document.createElement('option');
+    el.value = m.id;
+    let label = m.name && m.name !== m.id ? `${m.name}（${m.id}）` : m.id;
+    if (m.statusText) label += ` — ${m.statusText}`;
+    el.textContent = label;
+    if (m.detail) el.title = m.detail;
+    else if (m.statusText) el.title = m.statusText;
+    msel.appendChild(el);
+  }
+  if (preferredModel && !Array.from(msel.options).some((o) => o.value === preferredModel)) {
+    const el = document.createElement('option');
+    el.value = preferredModel;
+    el.textContent = `${preferredModel} — 当前（目录中未见）`;
+    msel.appendChild(el);
+  }
+  if (preferredModel) msel.value = preferredModel;
+  if (!msel.value && msel.options.length) msel.selectedIndex = 0;
+}
+
+function fmtDay(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return '-';
+  const d = new Date(n);
+  const p = (x) => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+async function refreshChannels() {
+  const sum = document.getElementById('channelsSummary');
+  const box = document.getElementById('channelsTable');
+  try {
+    const r = await api('/api/channels');
+    if (!r.ok) throw new Error(r.error || '读取失败');
+    sum.textContent = r.summary || '';
+    sum.className = 'meta';
+    const check = new Map((r.checkin?.channels || []).map((c) => [c.provider, c.text]));
+    let html = '<table><tr><th>渠道</th><th>账号</th><th>状态</th><th>到期</th><th>模型限流</th><th>签到</th></tr>';
+    for (const a of (r.accounts || [])) {
+      const st = a.expired ? '<span class="err">已过期</span>' : (a.enabled ? '<span class="ok">启用</span>' : '停用');
+      const exp = a.expiresAt
+        ? `${esc(a.expiresText || fmtDay(a.expiresAt))}${a.expiresInDays != null ? `（${a.expiresInDays > 0 ? a.expiresInDays + ' 天' : '已到'}）` : ''}`
+        : '-';
+      const rl = (a.rateLimits || []).length
+        ? a.rateLimits.map((x) => `${esc(x.model)} 至 ${esc(x.untilText)}`).join('<br>')
+        : '-';
+      html += `<tr><td>${esc(a.provider)}</td><td>${esc(a.nickname || a.id)}</td><td>${st}</td><td>${exp}</td><td>${rl}</td><td>${esc(check.get(a.provider) || '-')}</td></tr>`;
+    }
+    html += '</table>';
+    box.innerHTML = html;
+    const ck = document.getElementById('channelsCheckin');
+    ck.textContent = r.checkin?.lastResult ? `签到：${r.checkin.lastDate || ''} ${r.checkin.lastResult}` : '';
+    ck.className = 'meta';
+  } catch (error) {
+    sum.textContent = '读取失败：' + (error?.message ?? error);
+    sum.className = 'meta err';
   }
 }
 
@@ -3335,6 +3447,24 @@ document.getElementById('roleInjectMaxSave').addEventListener('click', async () 
   msg.textContent = r.ok ? `✅ 已设为 ${r.maxInjectChars} 字符，下一条消息生效` : ('❌ ' + (r.error || '保存失败'));
   msg.className = r.ok ? 'meta ok' : 'meta err';
   if (r.ok) refreshRoles();
+});
+
+// ── DSH 模型切换（MARKER: panel-model-switch-ui）────────────────────────────
+document.getElementById('dshProviderSelect').addEventListener('change', () => fillDshModels(''));
+document.getElementById('dshModelSave').addEventListener('click', async () => {
+  const provider = document.getElementById('dshProviderSelect').value;
+  const model = document.getElementById('dshModelSelect').value;
+  const msg = document.getElementById('dshModelMsg');
+  if (!provider || !model) { msg.textContent = '没有可选模型'; msg.className = 'meta err'; return; }
+  if (!confirm(`切到 ${provider} / ${model}？\n下一条消息生效，不用重启。\n注意：也会同时改掉 DSH Web GUI 新会话的默认模型。`)) return;
+  msg.textContent = '保存中…';
+  msg.className = 'meta';
+  const r = await api('/api/dsh/model', 'POST', { provider, model });
+  msg.textContent = r.ok
+    ? `✅ 已切到 ${r.provider}/${r.model}，下一条消息生效${r.effortNote ? '｜' + r.effortNote : ''}`
+    : ('❌ ' + (r.error || '保存失败'));
+  msg.className = r.ok ? 'meta ok' : 'meta err';
+  if (r.ok) refreshDshModel();
 });
 
 // ── DSH 思考强度 ────────────────────────────────────────────────────────────
@@ -5150,10 +5280,10 @@ document.getElementById('usageClear').addEventListener('click', async () => {
 
 setConsolePage(location.hash.slice(1), { updateHash:false });
 
-refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
-setInterval(() => { refresh(); refreshSessions(); refreshPending(); refreshSocialStatus(); refreshSlang(); }, 3000);
+refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshChannels(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
+setInterval(() => { if (document.hidden) return; refresh(); refreshSessions(); refreshPending(); refreshSocialStatus(); refreshSlang(); }, 20000);
 // 用量看板只在本页可见时轮询：既保证「实时」，又不让其它页白白多打两份接口。
-setInterval(() => { if (currentConsolePage !== 'usage') return; refreshUsage(); refreshUsageChart(); refreshUsageRecent(); }, 3000);
+setInterval(() => { if (document.hidden) return; if (currentConsolePage !== 'usage') return; refreshUsage(); refreshUsageChart(); refreshUsageRecent(); }, 30000);
 // 主题切换（纯前端，不发任何请求；选择写入 localStorage，未选择时跟随系统）
 (function () {
   var root = document.documentElement;

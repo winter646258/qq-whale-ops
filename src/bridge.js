@@ -685,6 +685,13 @@ function forgetAgentToken(key) {
 // 读取 DSH 模型能力的在途 Promise：withTimeout 只做 Promise.race，不会取消底层 RPC，
 // 因此并发刷新会各自留下一个不可取消的请求。这里做去重，同一时刻只发一个。
 let modelCatalogInFlight = null;
+// MARKER: panel-model-cache
+// DSH 的 session/modelCatalog 实测要 3 秒以上，旧版 3 秒超时必然 fallback，
+// 面板的模型下拉因此永远拿不到目录。这里放宽到 8 秒，并缓存 10 分钟：
+// 控制台每次刷新都会打 /api/dsh/model，不缓存等于每刷新一次就戳一次 DSH。
+const MODEL_CATALOG_TIMEOUT_MS = 8000;
+const MODEL_CATALOG_TTL_MS = 10 * 60 * 1000;
+let modelCatalogCache = null;
 // DSH 思考强度（reasoningEffort）热切换代号。
 // 控制台改强度后递增它，让已在运行的会话在下一条消息重新 selectModel；
 // 放在模块级是为了不依赖 main() 内部声明的执行顺序（避免 TDZ）。
@@ -3460,12 +3467,21 @@ async function main() {
             readConfigObject,
             atomicWriteJson,
             loadModelCatalog: async () => {
-              // 复用同一个在飞请求 + 3 秒兜底：控制台每次刷新都会打这条接口。
+              // 复用同一个在飞请求 + 10 分钟缓存（见 panel-model-cache 注释）。
+              // 缓存必须存 **unwrap 之后** 的值：先缓存裸包会让第二个调用方拿到的是
+              // { result: ... } 外壳，读 catalog.groups 永远为空 —— 表现就是
+              // 「同一个请求里思考强度能取到 DSH 目录，模型下拉却退回本地文件」。
+              const now = Date.now();
+              if (modelCatalogCache && now - modelCatalogCache.at < MODEL_CATALOG_TTL_MS) {
+                return modelCatalogCache.value;
+              }
               if (!modelCatalogInFlight) {
-                modelCatalogInFlight = withTimeout(fetchModelCatalog(), 3000, 'session/modelCatalog')
+                modelCatalogInFlight = withTimeout(fetchModelCatalog(), MODEL_CATALOG_TIMEOUT_MS, 'session/modelCatalog')
                   .finally(() => { modelCatalogInFlight = null; });
               }
-              return unwrap(await modelCatalogInFlight, 'session.modelCatalog');
+              const value = unwrap(await modelCatalogInFlight, 'session.modelCatalog');
+              modelCatalogCache = { at: Date.now(), value };
+              return value;
             },
             noteCatalogFailure: (error) => {
               const reason = String(error?.message ?? error);

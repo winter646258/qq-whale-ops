@@ -1,3 +1,7 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
 // ── DSH 连接 / 思考强度 / 读取授权 / 重启（运维与鉴权族）────────────
 //
 // 这四条原来散落在 bridge.js 的 if 链里（L5302 / L5349 / L9066 / L9386），
@@ -15,6 +19,9 @@ const inject = ['cfg', 'log', 'stateDir', 'dshHelpers', 'agentTokenOk'];
 
 const routes = [
   { method: 'GET', path: '/api/dsh/model', kind: 'exact', handler: dshModel },
+  // MARKER: panel-model-switch
+  { method: 'POST', path: '/api/dsh/model', kind: 'exact', handler: dshModelSet },
+  { method: 'GET', path: '/api/channels', kind: 'exact', handler: channelHealth },
   { method: 'POST', path: '/api/dsh/effort', kind: 'exact', handler: dshEffort },
   { method: 'POST', path: '/api/authorize/read', kind: 'exact', handler: authorizeRead },
   { method: 'POST', path: '/api/restart', kind: 'exact', handler: restart },
@@ -78,9 +85,12 @@ async function dshModel({ req, sendJson }) {
     // 同一条失败原因只记一次：控制台每次刷新都会打这条接口，否则日志会被刷爆。
     h.noteCatalogFailure(error);
   }
+  const { groups, source: groupsSource } = await collectModelGroups(h, provider, model);
   sendJson({
     provider,
     model,
+    groups,
+    groupsSource,
     reasoningEffort: String(cfg.dsh?.reasoningEffort || h.effortDefault),
     options,
     labels,
@@ -149,6 +159,220 @@ function restart({ req, sendJson }) {
     h.releaseLock();
     process.exit(0);
   }, 500);
+}
+
+
+// ── MARKER: panel-model-switch ────────────────────────────────────────────────
+// 模型目录：优先问 DSH（权威），问不到就退回服务器上各渠道的 catalog.json。
+// 两条路都给「提供方 → 模型」两级，前端直接渲染两个下拉。
+
+const PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:@\-\/]{0,159}$/;
+
+const AVAILABILITY_LABEL = {
+  available: { ok: true, text: '可用' },
+  ok: { ok: true, text: '可用' },
+  unknown: { ok: true, text: '未探测' },
+  throttled: { ok: false, text: '限流中' },
+  'region-blocked': { ok: false, text: '地区封锁' },
+  unavailable: { ok: false, text: '不可用' },
+  deprecated: { ok: false, text: '已下线' },
+};
+
+function dshHome() {
+  return path.join(os.homedir(), '.dsh');
+}
+
+function readJsonSafe(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+/** 把 DSH 的 session/modelCatalog 结果规整成 [{id,name,models:[{id,name,status,statusText}]}] */
+function normalizeDshCatalog(catalog, h) {
+  const groups = Array.isArray(catalog?.groups) ? catalog.groups : [];
+  // 思考强度档位是**模型级**能力：同一个 provider 下有的模型支持 light、有的一个都不支持。
+  // 把 efforts 带出来，面板才能在海报选模型时把档位一起校准（见 dshModelSet）。
+  const whitelist = Array.isArray(h?.effortOptions) ? h.effortOptions : null;
+  const out = [];
+  for (const g of groups) {
+    const id = String(g?.id ?? '').trim();
+    if (!id) continue;
+    const models = (Array.isArray(g?.models) ? g.models : [])
+      .map((m) => {
+        const mid = String(m?.id ?? '').trim();
+        if (!mid) return null;
+        const efforts = (Array.isArray(m?.reasoning?.efforts) ? m.reasoning.efforts : [])
+          .map((e) => String(e?.id ?? '').trim())
+          .filter((eid) => eid && (!whitelist || whitelist.includes(eid)));
+        const defaultEffort = String(m?.reasoning?.defaultEffort ?? '').trim() || null;
+        return { id: mid, name: String(mid), status: 'available', statusText: '', efforts, defaultEffort };
+      })
+      .filter(Boolean);
+    if (!models.length) continue;
+    out.push({ id, name: String(g?.name ?? id), models });
+  }
+  return out;
+}
+
+/** 退回本地：扫 ~/.dsh/<provider>/catalog.json + availability.json */
+function readLocalModelGroups() {
+  const base = dshHome();
+  let dirs = [];
+  try {
+    dirs = fs.readdirSync(base, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const dir of dirs.sort()) {
+    if (dir.startsWith('channel-pack') || dir.includes('.bak-') || dir.startsWith('.') || dir === 'plugins' || dir === 'sessions' || dir === 'storages' || dir === 'cache' || dir === 'attachments' || dir === 'profiles') continue;
+    const catalog = readJsonSafe(path.join(base, dir, 'catalog.json'));
+    if (!catalog) continue;
+    const entries = Array.isArray(catalog.entries) ? catalog.entries : [];
+    const availability = readJsonSafe(path.join(base, dir, 'availability.json'))?.results ?? {};
+    const models = entries
+      .map((e) => (typeof e === 'string' ? e : String(e?.id ?? '')))
+      .filter(Boolean)
+      .map((mid) => {
+        const state = availability?.[mid]?.state;
+        const label = AVAILABILITY_LABEL[state] ?? { ok: true, text: '' };
+        return { id: mid, name: mid, status: state ?? 'unknown', statusText: label.text, detail: availability?.[mid]?.detail ?? '' };
+      });
+    if (!models.length) continue;
+    // 可用的排前面，未探测次之，其余按原顺序垫底
+    const rank = (m) => (AVAILABILITY_LABEL[m.status]?.ok ? (m.status === 'unknown' ? 1 : 0) : 2);
+    models.sort((a, b) => rank(a) - rank(b));
+    out.push({ id: dir, name: dir, models });
+  }
+  return out;
+}
+
+async function collectModelGroups(h, provider, model) {
+  try {
+    const groups = normalizeDshCatalog(await h.loadModelCatalog(), h);
+    if (groups.length) return { groups, source: 'dsh' };
+  } catch (error) {
+    h.noteCatalogFailure(error);
+  }
+  const groups = readLocalModelGroups();
+  // 当前在跑的 provider/model 一定要能在下拉里选到，否则保存时会把当前值弄丢
+  const current = groups.find((g) => g.id === provider);
+  if (!current) groups.unshift({ id: provider, name: provider, models: [{ id: model, name: model, status: 'current', statusText: '当前', efforts: [], defaultEffort: null }] });
+  else if (!current.models.some((m) => m.id === model)) current.models.unshift({ id: model, name: model, status: 'current', statusText: '当前', efforts: [], defaultEffort: null });
+  return { groups, source: groups.length ? 'files' : 'none' };
+}
+
+/** 切换模型：只写 config.json 的 dsh.provider/model，再递增代号让下一条消息重新 selectModel。 */
+async function dshModelSet({ req, sendJson, readBody }) {
+  if (rejectAgent({ req, sendJson })) return;
+  const h = this.ctx.dshHelpers;
+  const cfg = this.ctx.cfg;
+  const body = await readBody();
+  const provider = String(body.provider ?? '').trim();
+  const model = String(body.model ?? '').trim();
+  if (!PROVIDER_ID_RE.test(provider)) { sendJson({ ok: false, error: 'provider 不合法' }, 400); return; }
+  if (!PROVIDER_ID_RE.test(model)) { sendJson({ ok: false, error: 'model 不合法' }, 400); return; }
+  // 思考强度和模型是绑定的：DSH 会因为「该模型不支持某个档位」直接拒绝 selectModel
+  // （session/model-unavailable: does not support reasoning effort "light"），
+  // 结果是切完之后这个会话**每条消息都发不出去**。所以切模型时顺手把档位校准到
+  // 这个模型公布的能力范围内，宁可自动改档，也不要让面板一按就把助手按哑。
+  let reasoningEffort = String(cfg.dsh?.reasoningEffort || h.effortDefault);
+  let effortAdjusted = false;
+  let effortNote = '';
+  try {
+    const groups = normalizeDshCatalog(await h.loadModelCatalog(), h);
+    const entry = (groups.find((g) => g.id === provider)?.models ?? []).find((m) => m.id === model);
+    const efforts = Array.isArray(entry?.efforts) ? entry.efforts : [];
+    if (efforts.length && !efforts.includes(reasoningEffort)) {
+      const next = entry.defaultEffort && efforts.includes(entry.defaultEffort) ? entry.defaultEffort : efforts[0];
+      effortAdjusted = true;
+      effortNote = `该模型不支持档位 ${reasoningEffort}，已自动改为 ${next}`;
+      reasoningEffort = next;
+    } else if (efforts.length && efforts.includes(reasoningEffort)) {
+      effortNote = `档位 ${reasoningEffort} 该模型支持`;
+    }
+  } catch (error) {
+    // 目录取不到就不动档位：宁可切模型失败被日志记下来，也不要瞎猜一个档位。
+    h.noteCatalogFailure?.(error);
+    effortNote = '模型目录读取失败，档位保持原值';
+  }
+  // fail-fast：配置损坏时直接 500，绝不回写（与白名单/档位接口同语义）
+  const file = h.readConfigObject(h.configFile);
+  file.dsh = { ...(file.dsh ?? {}), provider, model, ...(effortAdjusted ? { reasoningEffort } : {}) };
+  h.atomicWriteJson(h.configFile, file);
+  cfg.dsh = { ...(cfg.dsh ?? {}), provider, model, ...(effortAdjusted ? { reasoningEffort } : {}) };
+  h.bumpModelSelectionEpoch();
+  this.ctx.log(`控制台：DSH 模型已切到 ${provider}/${model}（对已有会话于下一条消息生效）${effortAdjusted ? '；' + effortNote : ''}`);
+  sendJson({ ok: true, provider, model, reasoningEffort, effortAdjusted, effortNote, note: '下一条消息生效' });
+}
+
+/** 把名字里的邮箱/手机号打码：面板只展示，不该把账号原文摊在屏幕上。 */
+function maskNickname(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return '';
+  const at = s.indexOf('@');
+  if (at > 0) {
+    const head = s.slice(0, at);
+    const keep = head.slice(0, Math.min(2, head.length));
+    return `${keep}***@${s.slice(at + 1)}`;
+  }
+  if (/^\d{5,}$/.test(s)) return `${s.slice(0, 3)}****${s.slice(-2)}`;
+  if (s.length <= 4) return s;
+  return `${s.slice(0, 2)}***${s.slice(-2)}`;
+}
+
+function fmtDay(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const d = new Date(n);
+  const p = (x) => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 渠道健康：只读。数据源 ~/.dsh/channel-pack/{state,auto-checkin}.json，凭据一律不返回。 */
+function channelHealth({ req, sendJson }) {
+  if (rejectAgent({ req, sendJson })) return;
+  const pack = path.join(dshHome(), 'channel-pack');
+  const state = readJsonSafe(path.join(pack, 'state.json'));
+  if (!state) { sendJson({ ok: false, error: '读不到 channel-pack/state.json' }, 500); return; }
+  const checkin = readJsonSafe(path.join(pack, 'auto-checkin.json')) ?? {};
+  const now = Date.now();
+  const accounts = (Array.isArray(state.accounts) ? state.accounts : []).map((a) => {
+    const rateLimits = Object.entries(a?.modelRateLimits ?? {})
+      .map(([m, until]) => ({ model: String(m), until: Number(until), untilText: fmtDay(until) }))
+      .filter((x) => Number.isFinite(x.until) && x.until > now);
+    const exp = Number(a?.expiresAt);
+    const expired = Number.isFinite(exp) && exp > 0 && exp < now;
+    const expiresInDays = Number.isFinite(exp) && exp > 0 ? Math.round((exp - now) / 86400000) : null;
+    return {
+      id: String(a?.id ?? ''),
+      provider: String(a?.provider ?? ''),
+      nickname: maskNickname(a?.nickname),
+      enabled: a?.enabled !== false,
+      refreshable: a?.refreshable === true,
+      expiresAt: Number.isFinite(exp) ? exp : null,
+      expiresText: fmtDay(exp),
+      expiresInDays,
+      expired,
+      rateLimits,
+    };
+  });
+  const providers = new Set(accounts.map((a) => a.provider));
+  const expiredCount = accounts.filter((a) => a.expired).length;
+  const disabledCount = accounts.filter((a) => !a.enabled).length;
+  const limitCount = accounts.filter((a) => a.rateLimits.length).length;
+  sendJson({
+    ok: true,
+    at: now,
+    summary: `${providers.size} 个渠道 / ${accounts.length} 个账号 ｜ 过期 ${expiredCount} ｜ 停用 ${disabledCount} ｜ 有模型限流 ${limitCount}`,
+    accounts,
+    checkin: {
+      enabled: checkin.enabled === true,
+      lastDate: checkin.lastDate ?? '',
+      lastResult: checkin.lastResult ?? '',
+      lastAt: Number(checkin.lastAt) || null,
+      channels: (Array.isArray(checkin.channels) ? checkin.channels : []).map((c) => ({ provider: String(c?.provider ?? ''), text: String(c?.text ?? '') })),
+    },
+  });
 }
 
 export default { name: 'ops', title: 'DSH 连接与运维', inject, routes };
