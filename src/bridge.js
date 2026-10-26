@@ -1513,9 +1513,19 @@ function allowed(kind, id, cfg) {
   // 若先判白名单，非空白名单会让本档位永远不可达——「好友都能聊」就成了空话。
   // 语义：friendOnly 只放宽**被动收消息**；「主动找谁」由 proactiveAllowed() 用白名单单独把关。
   if (kind === 'private' && cfg.friendOnly === true) {
-    if (!friendSetReady) return false;      // 好友列表未就绪 ⇒ fail-closed（谁也不理）
+    // MARKER: friendonly-whitelist-first —— 2026-10-26
+    // 旧写法在这里直接 `if (!friendSetReady) return false;`，把**白名单也一起挡了**：
+    // 2026-10-26 07:15 那次重启后好友列表刷新卡死（见下方 refreshFriends 的超时兜底），
+    // friendSetReady 一直 false，结果 08:46:52 / 10:03:26 主人自己发的两条私聊都被
+    // 打成「忽略未授权会话 private:1124721191」丢掉了。
+    // 白名单（cfg.allow.private）是**显式配置的授权**，证据强度高于运行时抓到的好友列表：
+    // 好友列表只是个动态快照，抓不到不代表这个人不该被理。所以先查白名单。
+    const allowListEarly = cfg.allow[kind] ?? cfg.allow[kind + 's'] ?? [];
+    if (allowListEarly.map(String).includes(s)) return true;
+    if (!friendSetReady) return false;      // 好友列表未就绪 ⇒ 非白名单的人一律 fail-closed
     if (friendSet.has(s)) return true;      // 是好友 ⇒ 可以发消息进来
-    // 不是好友：仍可被显式白名单放行（例如刚加好友但列表还没刷新到）
+    // 不是好友、也不在白名单：拒绝
+    return false;
   }
 
   const allowList = cfg.allow[kind] ?? cfg.allow[kind + 's'] ?? [];
@@ -12213,11 +12223,27 @@ async function main() {
     // 去抖：事件侧的「刚加好友」补拉与定时刷新共用这一把闸，避免并发重复请求。
     // 定时刷新会把 friendRefreshPending 归零，所以正常周期刷新不受影响。
     let friendRefreshPending = false;
+    let friendRefreshAt = 0;
+    // MARKER: friend-refresh-timeout —— 2026-10-26
+    // 惨案：`friendRefreshPending` 只是个布尔闸，一旦 `bot.request` 里的
+    // `await this.connect()` 挂住（SDK 的 connectPromise 共享，WS 起不来时那个 promise
+    // 可能既不 resolve 也不 reject，而 request 的超时计时器是**在 connect 之后**才装的），
+    // 这个闸就永久卡在 true —— 之后每一次定时刷新都 `return` 掉。
+    // 后果：friendSetReady 永远是 false，friendOnly 档位下私聊全部被拒（含主人）。
+    // 两个补丁：① 闸卡住超过 45 秒就当它废了、强制放行下一轮；
+    //          ② 显式给 request 传 timeoutMs，别依赖 SDK 默认值。
+    const FRIEND_REFRESH_STUCK_MS = 45 * 1000;
+    const FRIEND_REQUEST_TIMEOUT_MS = 20 * 1000;
     const refreshFriends = async (reason = '定时') => {
-      if (friendRefreshPending) return;
+      const stuckFor = Date.now() - friendRefreshAt;
+      if (friendRefreshPending) {
+        if (stuckFor < FRIEND_REFRESH_STUCK_MS) return;
+        log(`[friendOnly] 上一轮刷新已卡住 ${Math.round(stuckFor / 1000)}s，强制重置闸门（${reason}）`);
+      }
       friendRefreshPending = true;
+      friendRefreshAt = Date.now();
       try {
-        const data = await bot.request('get_friend_list', {});
+        const data = await bot.request('get_friend_list', {}, { timeoutMs: FRIEND_REQUEST_TIMEOUT_MS });
         const list = Array.isArray(data) ? data
           : (Array.isArray(data?.data) ? data.data : []);
         rememberFriendNames(list);  // MARKER: image-approval-friendnames
@@ -12234,6 +12260,7 @@ async function main() {
         log(`[friendOnly] 好友列表刷新失败：${error?.message ?? error}`);
       } finally {
         friendRefreshPending = false;
+        friendRefreshAt = 0;
       }
     };
     // 暴露给 handleIncoming：命中「非好友」时立刻补拉一次
