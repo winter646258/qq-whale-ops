@@ -78,3 +78,7 @@ audio/
 /diary/*.jsonl
 /diary/*.md.bak-*
 /album/
+
+# 2026-10-26：曾误入库并含明文密钥（已改写历史抹除）。同类文件一律不入库。
+config.json.pre-*
+*.pre-*
