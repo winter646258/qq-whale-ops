@@ -2687,6 +2687,358 @@ async function main() {
     });
   }
 
+  // ── 视觉兜底（2026-10-25）──────────────────────────────────────────
+  // 主模型（deepseek/deepseek-v4.1-flash）只吃文本，群里一进来图片整条投递就失败：
+  //   session/attachment-invalid: Model "..." does not support image input
+  // 所以图片进来先看当前模型吃不吃图，不吃就用独立的视觉会话说成文字再塞进 prompt。
+  // 结果按图片 sha256 缓存 7 天 —— 群里的表情包/梗图会被反复发，同一份字节只花一次钱。
+  //
+  // 选型依据（2026-10-25 用 state/images 里三张真实群图实测）：
+  //   dots-studio/dots-3-note-preview:free  13~22s 中文 OCR 逐字准、细节多（首选）
+  //   nvidia/nemotron-3.5-super-vl:free     11~46s 整体描述好但 OCR 会漏/会猜（备选）
+  // 别再写回 deepseek-ai/*、z-ai/*、moonshotai/*、kimi-*、mimo-*：这些当前全走
+  // ai.dtyg123.dpdns.org（已 ENOTFOUND），mimo 另外还 Free usage limit reached。
+  const VISION_PROMPT = [
+    '用中文简要描述这张图，我要拿去在 QQ 群里聊天用，所以实用优先：',
+    '1) 画面主体是什么（人物/动物/物件/截图，二次元或梗图要说明是什么梗图类型）；',
+    '2) 图里所有可见文字逐字读出来，没有就写「无文字」；',
+    '3) 整体情绪或氛围（可爱、暴躁、阴阳怪气、搞笑、治愈等）。',
+    '不超过 150 字。不要客套话，不要 markdown，不要「这张图片显示」这种开头。'
+  ].join('\n');
+
+  const VISION_CACHE_FILE = path.join(STATE_DIR, 'vision-cache.json');
+  const VISION_SESSION_FILE = path.join(STATE_DIR, 'vision-sessions.json');
+  const VISION_DEFAULT_MODELS = [
+    'dots-studio/dots-3-note-preview:free',
+    'nvidia/nemotron-3.5-super-vl:free'
+  ];
+
+  let visionCache = { version: 1, entries: {} };
+  try {
+    const saved = readJsonSafe(VISION_CACHE_FILE, null);
+    if (saved && typeof saved === 'object' && saved.entries && typeof saved.entries === 'object') {
+      visionCache = { version: 1, entries: saved.entries };
+    }
+  } catch {}
+  const visionSessionIds = new Map(); // model -> sessionId（进程内）
+
+  function isVisionSession(sessionId) {
+    for (const id of visionSessionIds.values()) {
+      if (id === sessionId) return true;
+    }
+    return false;
+  }
+
+  function visionModelChain() {
+    const list = Array.isArray(cfg.vision?.models) ? cfg.vision.models : [];
+    const cleaned = list.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim());
+    return cleaned.length ? cleaned : VISION_DEFAULT_MODELS;
+  }
+
+  function persistVisionCache() {
+    try {
+      const entries = visionCache.entries ?? {};
+      const keys = Object.keys(entries);
+      const cap = 800;
+      if (keys.length > cap) {
+        keys.sort((a, b) => Number(entries[a]?.at ?? 0) - Number(entries[b]?.at ?? 0));
+        for (const k of keys.slice(0, keys.length - cap)) delete entries[k];
+      }
+      atomicWriteJson(VISION_CACHE_FILE, { version: 1, entries });
+    } catch (error) {
+      log(`[vision] 缓存写入失败：${error?.message ?? error}`);
+    }
+  }
+
+  /** 取模型目录（带 10 分钟缓存），只用来判断「当前模型吃不吃图」。 */
+  async function currentModelCatalog() {
+    if (modelCatalogCache && Date.now() - modelCatalogCache.at < MODEL_CATALOG_TTL_MS) {
+      return modelCatalogCache.value;
+    }
+    if (!modelCatalogInFlight) {
+      modelCatalogInFlight = withTimeout(fetchModelCatalog(), MODEL_CATALOG_TIMEOUT_MS, 'session/modelCatalog')
+        .finally(() => {
+          modelCatalogInFlight = null;
+        });
+    }
+    const value = unwrap(await modelCatalogInFlight, 'session.modelCatalog');
+    modelCatalogCache = { at: Date.now(), value };
+    return value;
+  }
+
+  /** 目录里模型描述的格式是「vision + text input · 1024K」或「text input · 128K」。 */
+  function modelSupportsVision(provider, model, catalog) {
+    try {
+      const groups = catalog?.groups ?? [];
+      const group = groups.find((g) => String(g?.id ?? '') === String(provider))
+        ?? groups.find((g) => (g?.models ?? []).some((m) => String(m?.id) === String(model)));
+      const hit = (group?.models ?? []).find((m) => String(m?.id) === String(model));
+      const desc = String(hit?.description ?? '');
+      if (!desc) return false;
+      return /vision|image input|multimodal/i.test(desc);
+    } catch {
+      return false;
+    }
+  }
+
+  async function ensureVisionSession(model) {
+    const known = visionSessionIds.get(model);
+    if (known) {
+      learnerSessions.add(known);
+      api.events.follow(known);
+      return known;
+    }
+    const preset = resolvePresetName(cfg.vision?.preset || cfg.agentPreset, { strict: true });
+    if (!preset) throw new Error('视觉会话缺少已验证的安全 preset，拒绝创建');
+    const saved = readJsonSafe(VISION_SESSION_FILE, null);
+    const dir = path.join(STATE_DIR, 'vision-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    let workspaceId = saved && typeof saved === 'object' ? String(saved.__workspaceId ?? '') : '';
+    if (!workspaceId) {
+      const ws = unwrap(await api.workspace.create({ path: dir }), 'vision workspace.create');
+      workspaceId = ws.workspace.workspaceId;
+    }
+    const value = unwrap(await api.sessions.create({ workspaceId, agentPreset: preset }), 'vision session.create');
+    const sessionId = value.sessionId;
+    api.events.follow(sessionId);
+    unwrap(await api.sessions.selectModel({
+      sessionId,
+      provider: String(cfg.vision?.provider || cfg.dsh?.provider || 'our-free-model'),
+      model
+    }), 'vision selectModel');
+    learnerSessions.add(sessionId);
+    visionSessionIds.set(model, sessionId);
+    try {
+      atomicWriteJson(VISION_SESSION_FILE, { __workspaceId: workspaceId, __updatedAt: Date.now() });
+    } catch {}
+    log(`[vision] 视觉会话已创建：${model} -> ${sessionId}`);
+    return sessionId;
+  }
+
+  /** 等一次视觉 turn。返回 {promise, cancel}，cancel 用于 prompt 没被接受时摘掉等待。 */
+  function waitVisionTurn(sessionId, timeoutMs) {
+    let timer = null;
+    const drop = () => {
+      const arr = learnerWaiters.get(sessionId) ?? [];
+      const idx = arr.findIndex((w) => w.timer === timer);
+      if (idx >= 0) arr.splice(idx, 1);
+      if (arr.length === 0) learnerWaiters.delete(sessionId);
+      if (timer) clearTimeout(timer);
+    };
+    const promise = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        drop();
+        reject(new Error(`视觉识别超时（${timeoutMs}ms）`));
+      }, timeoutMs);
+      const arr = learnerWaiters.get(sessionId) ?? [];
+      arr.push({ resolve, reject, timer });
+      learnerWaiters.set(sessionId, arr);
+    });
+    return { promise, cancel: drop };
+  }
+
+  async function runVisionTurn(model, part) {
+    const timeoutMs = Math.max(15000, Number(cfg.vision?.timeoutMs ?? 90000));
+    let sessionId = await ensureVisionSession(model);
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const handle = waitVisionTurn(sessionId, timeoutMs);
+      const accepted = await api.sessions.prompt({
+        sessionId,
+        mode: 'queue',
+        content: [
+          { type: 'text', text: VISION_PROMPT },
+          {
+            type: 'image',
+            mediaType: String(part?.mediaType || 'image/png'),
+            data: String(part?.data ?? ''),
+            name: String(part?.name || 'qq-image.png')
+          }
+        ]
+      });
+      if (!accepted.result.ok) {
+        handle.cancel();
+        const why = `${accepted.result.error.code}: ${accepted.result.error.message}`;
+        if (attempt === 1 && /not[- ]?found|unavailable|不存在/i.test(why)) {
+          visionSessionIds.delete(model);
+          sessionId = await ensureVisionSession(model);
+          continue;
+        }
+        throw new Error(why);
+      }
+      const text = await handle.promise;
+      const trimmed = String(text ?? '').trim();
+      if (!trimmed) throw new Error('视觉模型返回空文本');
+      return trimmed;
+    }
+    throw new Error('视觉会话重建后仍然失败');
+  }
+
+  async function describeImage(part) {
+    const data = String(part?.data ?? '');
+    if (!data) throw new Error('图片数据为空');
+    const hash = crypto.createHash('sha256').update(data).digest('hex');
+    const ttl = Math.max(0, Number(cfg.vision?.cacheTtlMs ?? 604800000));
+    const hit = visionCache.entries?.[hash];
+    if (hit && typeof hit.text === 'string' && Date.now() - Number(hit.at ?? 0) < ttl) {
+      log(`[vision] 命中缓存 ${hash.slice(0, 8)}（${hit.text.length} 字，${hit.model ?? '?'}）`);
+      return hit.text;
+    }
+    let lastError = null;
+    for (const model of visionModelChain()) {
+      try {
+        const text = await runVisionTurn(model, part);
+        visionCache.entries[hash] = { text, at: Date.now(), model };
+        persistVisionCache();
+        log(`[vision] ${model} 识别成功 ${hash.slice(0, 8)}：${text.slice(0, 40)}`);
+        return text;
+      } catch (error) {
+        lastError = error;
+        log(`[vision] ${model} 识别失败（${hash.slice(0, 8)}）：${error?.message ?? error}`);
+      }
+    }
+    throw lastError ?? new Error('没有可用的视觉模型');
+  }
+
+  /** 主模型不吃图时，把 image part 换成文字；吃图就原样返回。 */
+  // MARKER: vision-helpers
+  // 当前模型到底能不能直接看图（判据只有模型目录 description 里的 modality 文案）。
+  async function currentModelSeesImages() {
+    try {
+      const catalog = await currentModelCatalog();
+      return modelSupportsVision(String(cfg.dsh?.provider || ''), String(cfg.dsh?.model || ''), catalog);
+    } catch (error) {
+      log(`[vision] 判定模型视觉能力失败，按「不吃图」处理：${error?.message ?? error}`);
+      return false;
+    }
+  }
+
+  // 把 fetchMediaData / resolveMediaList 产出的图片项批量转成文字。
+  // 返回的每一项都**不再带 data**：调用方（MCP 工具）看到没有 data 就只输出 text，
+  // 于是不吃图的主模型永远不会收到 image block（那会让整轮直接失败）。
+  async function transcribeMediaImages(images) {
+    const list = Array.isArray(images) ? images : [];
+    const parts = [];
+    const slots = [];
+    for (const img of list) {
+      if (img?.data && (img?.mimeType || img?.mediaType)) {
+        const mediaType = String(img.mimeType ?? img.mediaType);
+        parts.push({ type: 'image', mediaType, data: String(img.data), name: String(img.name ?? `m${slots.length + 1}`) });
+        slots.push(img);
+      } else {
+        parts.push(null);
+        slots.push(img);
+      }
+    }
+    const bridged = await transcodeImagesForTextModel(parts.filter(Boolean));
+    const texts = bridged.filter((p) => p?.type === 'text').map((p) => String(p.text ?? ''));
+    const out = [];
+    let cursor = 0;
+    for (const img of list) {
+      if (img?.data && (img?.mimeType || img?.mediaType)) {
+        const text = texts[cursor++] ?? '（未取到描述）';
+        out.push({ ...img, data: undefined, mimeType: undefined, mediaType: undefined, text });
+      } else {
+        out.push(img);
+      }
+    }
+    return out;
+  }
+
+  // 唤醒时把「这条消息带的图」直接代看并写进 prompt。
+  // 为什么需要：reserved2 模式下图片**根本不进 prompt**，只在文本里提示「去调 qq_get_message_images」。
+  // 她常常想不起来调，主人看到的就是「她没看见图」。这里主动把描述塞给她，省掉那次工具调用。
+  async function describeUnreadMediaInline(key) {
+    if (cfg.vision?.enabled === false) return '';
+    const budget = Math.max(0, Math.min(3, Number(cfg.vision?.maxImagesPerWake ?? 2)));
+    if (budget === 0) return '';
+    let st;
+    try { st = getSocialV2State(key); } catch { return ''; }
+    const pool = Array.isArray(st?.unread) ? st.unread : [];
+    const hits = pool.filter((m) => Array.isArray(m?.media) && m.media.length > 0).slice(-budget);
+    if (!hits.length) return '';
+    const lines = [];
+    const media = [];
+    const pending = [];
+    for (const m of hits) {
+      if (m.visionText) { lines.push(`【图片内容·消息${m.seq ?? m.messageId ?? ''}】${m.visionText}`); continue; }
+      pending.push(m);
+      for (const item of m.media) media.push(item);
+    }
+    if (media.length) {
+      try {
+        const parts = await resolveMediaList(media);
+        const bridged = await transcodeImagesForTextModel(parts);
+        const txt = bridged.filter((p) => p?.type === 'text').map((p) => String(p.text ?? '')).join(' ').trim();
+        if (txt) {
+          lines.push(txt);
+          for (const m of pending) m.visionText = txt;
+          try { saveSocialV2State(); } catch {}
+        }
+      } catch (error) {
+        log(`[vision] 唤醒内联代看失败（${key}）：${error?.message ?? error}`);
+      }
+    }
+    if (!lines.length) return '';
+    log(`[vision] 唤醒内联代看 ${hits.length} 条消息（${key}）`);
+    return `\n\n【图片已代看】当前模型不能直接看图，下面这些图已由视觉模型转成文字，不需要再调用 qq_get_message_images：\n${lines.join('\n')}`;
+  }
+
+  async function transcodeImagesForTextModel(parts) {
+    const list = Array.isArray(parts) ? parts : [];
+    const imgCount = list.filter((p) => p?.type === 'image').length;
+    if (imgCount > 0) {
+      log(`[vision] 进入转写：${imgCount} 张图，当前模型 ${cfg.dsh?.provider ?? '?'}/${cfg.dsh?.model ?? '?'}，兜底链 ${JSON.stringify(cfg.vision?.models ?? VISION_DEFAULT_MODELS)}`);
+    }
+    if (cfg.vision?.enabled === false) return list;
+    if (!list.some((p) => p?.type === 'image')) return list;
+    let supports = false;
+    try {
+      const catalog = await currentModelCatalog();
+      supports = modelSupportsVision(String(cfg.dsh?.provider || ''), String(cfg.dsh?.model || ''), catalog);
+    } catch (error) {
+      log(`[vision] 取模型目录失败，按「不吃图」处理：${error?.message ?? error}`);
+    }
+    if (supports) {
+      log('[vision] 当前模型本身支持看图，原样投递');
+      return list;
+    }
+    const budget = Math.max(1, Number(cfg.vision?.maxImagesPerMessage ?? 3));
+    const picks = [];
+    let index = 0;
+    for (const p of list) {
+      if (p?.type !== 'image') continue;
+      index += 1;
+      picks.push({ part: p, index });
+    }
+    const results = await Promise.all(picks.map(async ({ part, index: i }) => {
+      if (i > budget) return { index: i, skip: true };
+      try {
+        return { index: i, text: await describeImage(part) };
+      } catch (error) {
+        return { index: i, error: String(error?.message ?? error) };
+      }
+    }));
+    const byIndex = new Map(results.map((r) => [r.index, r]));
+    const out = [];
+    let seen = 0;
+    for (const p of list) {
+      if (p?.type !== 'image') {
+        out.push(p);
+        continue;
+      }
+      seen += 1;
+      const r = byIndex.get(seen);
+      if (!r || r.skip) {
+        out.push({ type: 'text', text: `[图片${seen}（超过单条识别上限 ${budget} 张，这张没看）]` });
+      } else if (r.text) {
+        out.push({ type: 'text', text: `[图片${seen}的内容] ${r.text}` });
+      } else {
+        out.push({ type: 'text', text: `[图片${seen}：没认出来（${String(r.error ?? '').slice(0, 60)}）。你看不到这张图，别硬猜里面有什么]` });
+      }
+    }
+    return out;
+  }
+
   async function runSlangExtraction(key, opts = {}) {
     if (cfg.slang?.enabled === false) return;
     if (!dshReady) return;
@@ -7570,6 +7922,18 @@ async function main() {
   }
 
   async function resolveMediaList(mediaList) {
+    // MARKER: media-diag
+    // 「图到底到没到」是排查「她说没看见」的第一现场。以前日志里看不出这件事，
+    // 只能靠猜。现在每条带媒体的消息都会留下一行段类型，一眼可判。
+    try {
+      const kinds = (Array.isArray(mediaList) ? mediaList : []).map((m) => String(m?.kind ?? '?'));
+      if (kinds.length > 0) {
+        log(`[media] 收到 ${kinds.length} 个媒体：${kinds.join(',')}`
+          + (kinds.includes('mface') ? `（表情包名：${(Array.isArray(mediaList) ? mediaList : []).filter((m) => m?.kind === 'mface').map((m) => String(m.summary ?? '').slice(0, 20) || '(无名)').join(' / ')}）` : ''));
+      }
+    } catch (error) {
+      log(`[media] 诊断日志异常（已忽略）：${error?.message ?? error}`);
+    }
     const parts = [];
     let index = 0;
     let totalBytes = 0;
@@ -9099,11 +9463,26 @@ async function main() {
       if (wakeSnapshot) {
         promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
       }
+      // MARKER: vision-inline
+      // 唤醒回合主动把图说成文字塞进 prompt（限 maxImagesPerWake 张，默认 2）。
+      // 失败绝不影响唤醒本身 —— 代看只是增强，不是主链路。
+      try {
+        promptText += await describeUnreadMediaInline(key);
+      } catch (error) {
+        log(`[vision] 唤醒内联代看异常（已忽略）：${error?.message ?? error}`);
+      }
     }
     let content = [{ type: 'text', text: withSlangContext(promptText) }];
     if (Array.isArray(opts.media) && opts.media.length > 0) {
       const imageParts = await resolveMediaList(opts.media);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
+      // MARKER: vision-bridge-2
+      // 这条路径（社交模式管理员私聊 / 主动唤醒 / 所有 deliverPrompt 调用）
+      // 以前**完全没做**「不吃图就把图说成文字」的转换：直接 resolveMediaList 拿到
+      // image part 就投，不吃图的主模型必然回 session/attachment-invalid
+      // （does not support image input），整条消息被拒 —— 她的表现就是「根本没看见图」。
+      // handleIncoming 那条路早已接上，这条路漏了，这才是实测「测了还是没有」的真因。
+      const bridged2 = await transcodeImagesForTextModel(imageParts);
+      content = [{ type: 'text', text: withSlangContext(promptText) }, ...bridged2];
     }
     // 媒体解析成功后再标记退场，避免解析异常时残留退场标记。
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
@@ -11563,7 +11942,11 @@ async function main() {
     let content = [{ type: 'text', text: withSlangContext(promptText) }];
     if (Array.isArray(mediaList) && mediaList.length > 0) {
       const imageParts = await resolveMediaList(mediaList);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
+      // MARKER: vision-bridge
+      // 当前模型不吃图就把图说成文字再投 —— 否则整条消息会被
+      // session/attachment-invalid（does not support image input）拒绝，她一个字都收不到。
+      const bridged = await transcodeImagesForTextModel(imageParts);
+      content = [{ type: 'text', text: withSlangContext(promptText) }, ...bridged];
     }
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
     const accepted = await api.sessions.prompt({
@@ -11794,7 +12177,7 @@ async function main() {
                     }
                   }
                   // 旧学习会话 turn 结束后从集合移除，避免残留
-                  if (frame.sessionId !== slangLearnerSessionId && frame.sessionId !== slangResearchSessionId) learnerSessions.delete(frame.sessionId);
+                  if (frame.sessionId !== slangLearnerSessionId && frame.sessionId !== slangResearchSessionId && !isVisionSession(frame.sessionId)) learnerSessions.delete(frame.sessionId);
                 }
               }
               continue;
@@ -12564,6 +12947,12 @@ async function main() {
     readConfigObject,    // 读 config.json 为对象
     atomicWriteJson,     // 原子写 JSON
     configFile: path.join(ROOT, 'config.json'),
+  });
+  // MARKER: vision-ctx
+  // message-image 模块要用它把图换成文字（模块禁止 import bridge.js）。
+  Object.assign(moduleCtx, {
+    currentModelSeesImages,
+    transcribeMediaImages,
   });
   startDshWatch();
   startSnowlumaWatch();

@@ -61,7 +61,22 @@ const messageImage = wrap(async function messageImage({ req, url, sendJson }) {
     return undefined;
   }
   try {
-    const images = await ctx.fetchMediaData(media);
+    let images = await ctx.fetchMediaData(media);
+    // MARKER: vision-endpoint
+    // 关键：把「图」换成「图的文字描述」，并且**抹掉 data/mimeType**。
+    // MCP 侧 qq_get_message_images 的判定是 `if (img?.data && img?.mimeType)` 才塞 image block，
+    // 没有 data 就走 else 分支输出 `[图片N 描述]` —— 于是不吃图的主模型也不会因为
+    // session/attachment-invalid 整轮失败。这一处修完，所有取图工具（消息图/表情图/自拍图）都跟着好。
+    try {
+      const sees = await ctx.currentModelSeesImages();
+      if (!sees && Array.isArray(images) && images.length > 0) {
+        ctx.log(`[vision] 取图端点代看：${images.length} 项（模型不吃图，转文字返回）`);
+        images = await ctx.transcribeMediaImages(images);
+      }
+    } catch (error) {
+      // 代看失败也不能让取图整体 500 —— 退回原样返回，至少她能拿到原图（视觉模型能用）。
+      ctx.log(`[vision] 取图端点代看失败（退回原响应）：${error?.message ?? error}`);
+    }
     sendJson({ ok: true, messageId, media, images });
   } catch (error) {
     ctx.log(`图片查询失败 ${key} ${messageId}: ${error?.message ?? error}`);
