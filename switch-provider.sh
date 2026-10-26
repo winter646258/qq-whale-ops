@@ -246,13 +246,32 @@ try:
     d = json.load(open(p))
 except Exception:
     d = {}
-d.setdefault('history', []).append({
-    'at': int(time.time() * 1000),
-    'from': frm,
-    'to': to,
-    'reason': reason,
-})
-d['lastSwitchAt'] = int(time.time() * 1000)
+# MARKER: history-collapse —— 2026-10-25
+# 原来每调一次就 append 一条，文件只增不减。实测 496 条里 431 条是 from==to 的
+# 自环（chain-exhausted 独占 419 条）——那根本不是「切换」，是整条链都试穿了。
+# 现在改成：连续相同的 (from,to,reason) 只更新时间戳并累加 n，不再新增行。
+# 诊断价值不丢（还能看出「这段时间一直在 chain-exhausted」和发生过多少次），
+# 但文件不再无限膨胀。
+now = int(time.time() * 1000)
+hist = d.setdefault('history', [])
+last = hist[-1] if hist else None
+if last and last.get('from') == frm and last.get('to') == to and last.get('reason') == reason:
+    last['at'] = now
+    last['n'] = int(last.get('n') or 1) + 1
+else:
+    hist.append({
+        'at': now,
+        'from': frm,
+        'to': to,
+        'reason': reason,
+    })
+# 硬上限兜底：万一别的 reason 轮着刷，也不会撑爆。
+# 定 600 是为了「不删已有」——线上当前 497 条，第一版设 300 会在第一次写入时
+# 就把老记录切掉 197 条，那等于偷偷删数据，跟「只堵不删」不符。
+HISTORY_MAX = 600
+if len(hist) > HISTORY_MAX:
+    del hist[:len(hist) - HISTORY_MAX]
+d['lastSwitchAt'] = now
 d['role'] = 'main' if to == main_provider else 'fallback'
 json.dump(d, open(p, 'w'), ensure_ascii=False, indent=2)
 PY
