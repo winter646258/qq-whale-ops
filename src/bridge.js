@@ -11244,7 +11244,11 @@ async function main() {
     // 旧版把 question 放进 HIGH_PRIORITY，而 question 的判定本身很松（见 isDirectedAtAi），
     // 等于「任何带『你…吗』的闲聊都能无限唤醒」。private / atMention 是确定性信号，保留豁免；
     // question 是概率性信号，必须受限流约束。
-    const HIGH_PRIORITY = new Set(['private', 'atMention']);
+    // MARKER: wake-limit-deterministic —— nameMention / poke 补进豁免。
+    // 起因（2026-10-25 实测）：906710082 一小时额度用光后，叫名字被丢 8 次、
+    // 拍一拍被丢 2 次，用户体感就是「叫了不理」。这两个和 probability 不同类：
+    // probability 是「猜她可能想说」，叫名字 / 拍一拍是「明确在叫她」，属确定性信号。
+    const HIGH_PRIORITY = new Set(['private', 'atMention', 'nameMention', 'poke']);
     const isExplicit = exemptHigh && HIGH_PRIORITY.has(reasonBase);
     if (!isExplicit) {
       // MARKER: per-group-override
