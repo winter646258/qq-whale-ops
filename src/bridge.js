@@ -10659,6 +10659,41 @@ async function main() {
     return hay;
   }
 
+  // MARKER: bot-noise-filter —— 机器生成的报错模板不触发唤醒。
+  // 为什么需要：群里「阿鲸♪」(2643088326) 的 agent 网关余额不足，每 60 秒往群里刷一条
+  // 「⚠️ agent 处理出错：Insufficient Balance (request_id: ...)」。实测 2026-10-27 07:32~07:37
+  // 六分钟刷 14 条，而 QQ 的 get_group_member_list 对它返回 is_robot=false（该群 137 个成员
+  // 里一个 is_robot=true 都没有），所以 bot-mutex 那套「按机器人身份拦截」看不见它，
+  // 每条报错都会把她叫醒一次、烧一次 token。
+  // 这里按「机器模板特征」兜底：命中即不唤醒。只挡唤醒，不挡消息入库——
+  // 她主动 qq_get_unread_messages 时照样看得到，只是不再被这些模板叫起来。
+  const BOT_NOISE_LOG_MS = 5 * 60 * 1000;
+  const botNoiseSeen = new Map(); // key -> { n, lastLog }
+  const BOT_NOISE_DEFAULT_PATTERNS = [
+    '⚠️\\s*agent\\s*处理出错',
+    'Insufficient\\s+Balance',
+    'request_id:\\s*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-',
+    'session/attachment-invalid',
+    'gateway/(?:service-unavailable|input-invalid|version-mismatch|not-found)',
+    '\\bTaskGetGroupMemberList\\b',
+  ];
+  function botNoisePatterns() {
+    const raw = cfg.socialV2?.botNoise?.patterns;
+    if (Array.isArray(raw) && raw.length) return raw.map(String).filter(Boolean);
+    return BOT_NOISE_DEFAULT_PATTERNS;
+  }
+  function looksLikeBotNoiseV2(text) {
+    if (cfg.socialV2?.botNoise?.enabled === false) return null;
+    const t = String(text ?? '');
+    if (!t) return null;
+    for (const p of botNoisePatterns()) {
+      try {
+        if (new RegExp(p, 'i').test(t)) return p;
+      } catch { /* 配置里的坏正则跳过，不因为一条写错就整体失效 */ }
+    }
+    return null;
+  }
+
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
     if (kind === 'private') return 'private';
     // MARKER: mute-aware-skip —— 禁言期间这个群发不出任何东西，唤醒只会白烧 token。
@@ -10678,6 +10713,23 @@ async function main() {
       const gid = key.slice(key.indexOf(':') + 1);
       refreshGroupBotIds(gid);
       if (isKnownBot(gid, event?.user_id)) return null;
+    }
+    // MARKER: bot-noise-filter —— 按文本特征兜住「没被 QQ 标记成机器人、但其实是机器」的发信人。
+    // 放在 anyMessage / atMention 之前：这类模板连「@了她」都不该叫醒她。
+    if (kind === 'group') {
+      const noise = looksLikeBotNoiseV2(plainContent);
+      if (noise) {
+        const now = Date.now();
+        const rec = botNoiseSeen.get(key) || { n: 0, lastLog: 0 };
+        rec.n += 1;
+        if (now - rec.lastLog > BOT_NOISE_LOG_MS) {
+          rec.lastLog = now;
+          log(`[bot-noise] ${key} 跳过机器报错 ${rec.n} 条（命中「${noise}」），不唤醒`);
+          rec.n = 0;
+        }
+        botNoiseSeen.set(key, rec);
+        return null;
+      }
     }
     const tr = st.wakeConfig?.triggers ?? {};
     if (tr.anyMessage) return 'anyMessage';
