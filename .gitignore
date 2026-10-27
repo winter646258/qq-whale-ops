@@ -86,3 +86,7 @@ config.json.pre-*
 # 2026-10-26：视觉模型对比用的临时脚本，不入库
 /bench*.mjs
 /check_vision_logic.mjs
+src/*.bak.*
+src/*.pre-*
+backup-systemd-*
+*.pre
