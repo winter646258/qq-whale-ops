@@ -26,6 +26,63 @@ function rejectV2(moduleCtx, { req, sendJson, key, tool, what }) {
   return false;
 }
 
+// MARKER: group-members-route
+// 群成员列表（v2 读工具 qq_get_group_members 的后端）。
+//
+// 为什么是 v2 形态：qq-chat-v2 预设第 6 条明确叫模型用 qq_get_group_members 拿 QQ 号去 @ 人，
+// 而旧的无令牌版本在 reserved2 下必然 403 —— 预设教模型用一个永远失败的工具，每次白烧一步。
+//
+// 鉴权口径与其它 v2 读工具一致，但**多一条 closed-agent 分支**：
+// 管理员私聊里代理没有会话令牌，此时按 allowed('group', …) 判，而不是 v2SessionAllowed。
+// ⚠️ 无令牌时也不能跳过白名单 —— 否则它就变成任意群成员枚举入口。
+async function groupMembers(moduleCtx, { req, url, sendJson }) {
+  const key = String(url.searchParams.get('key') ?? '').trim();
+  const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
+  const m = /^group:(\d+)$/.exec(key);
+  if (!m) { sendJson({ ok: false, error: '群成员只能按 group:群号 查询' }, 400); return; }
+  const gid = Number(m[1]);
+  const token = req.headers['x-agent-token'];
+  if (token && !moduleCtx.agentTokenOk(key, token)) {
+    sendJson({ ok: false, error: 'agent token 无效' }, 403);
+    return;
+  }
+  const inRange = moduleCtx.currentMode() === 'closed-agent'
+    ? moduleCtx.allowed('group', gid, moduleCtx.cfg)
+    : moduleCtx.v2SessionAllowed(key);
+  if (!inRange) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+  if (token && !moduleCtx.v2ToolEnabled('getGroupMembers')) {
+    sendJson({ ok: false, error: '工具未启用：qq_get_group_members' }, 403);
+    return;
+  }
+  let raw;
+  try {
+    const response = await moduleCtx.bot().request('get_group_member_list', { group_id: gid });
+    if (!response || response.status !== 'ok' || response.retcode !== 0) {
+      throw new Error(response?.wording || response?.retcode || 'unknown');
+    }
+    raw = response.data;
+  } catch (wsError) {
+    // WS 不可用时走 OneBot HTTP —— 群成员是"等特定的人"这类即时需求，不能因为重连窗口就瞎。
+    try {
+      raw = await moduleCtx.onebotHttpAction('get_group_member_list', { group_id: gid });
+    } catch (httpError) {
+      sendJson({ ok: false, error: `获取群成员失败：${wsError?.message ?? wsError}；HTTP 兜底也失败：${httpError?.message ?? httpError}` }, 502);
+      return;
+    }
+  }
+  const list = Array.isArray(raw) ? raw : (raw?.data ?? []);
+  const members = list
+    .slice(0, limit)
+    .map((x) => ({
+      userId: String(x.user_id ?? ''),
+      nickname: moduleCtx.truncateText(x.nickname ?? '', 40),
+      card: moduleCtx.truncateText(x.card ?? '', 40),
+      ...(x.role ? { role: String(x.role) } : {})
+    }))
+    .filter((x) => x.userId);
+  sendJson({ ok: true, key, count: list.length, returned: members.length, truncated: list.length > members.length, members });
+}
+
 function toolLog(ctx, { req, url, sendJson }) {
   const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200));
   sendJson({ ok: true, entries: ctx.readToolLog(limit) });
@@ -93,7 +150,8 @@ export default {
   title: '控制台巡检：工具日志 / AI 反馈 / 我的最近 / 活跃成员',
   inject: ['cfg', 'log', 'fs', 'agentTokenOk', 'v2SessionAllowed', 'v2ToolEnabled',
     'readToolLog', 'readFeedbackEntries', 'toolLogFile', 'feedbackFile', 'atomicWriteJson',
-    'getSocialV2State', 'readThroughSeqV2'],
+    'getSocialV2State', 'readThroughSeqV2',
+    'bot', 'onebotHttpAction', 'allowed', 'currentMode', 'truncateText'],
   routes: [
     { method: 'GET', path: '/api/socialV2/tool-log', kind: 'exact', handler: wrap(toolLog) },
     { method: 'POST', path: '/api/socialV2/tool-log/clear', kind: 'exact', handler: wrap((ctx, p) => { if (rejectAgent(p)) return; return toolLogClear(ctx, p); }) },
@@ -101,5 +159,6 @@ export default {
     { method: 'POST', path: '/api/socialV2/feedback-clear', kind: 'exact', handler: wrap((ctx, p) => { if (rejectAgent(p)) return; return feedbackClear(ctx, p); }) },
     { method: 'GET', path: '/api/socialV2/my-recent', kind: 'exact', handler: wrap(myRecent) },
     { method: 'GET', path: '/api/socialV2/active-members', kind: 'exact', handler: wrap(activeMembers) },
+    { method: 'GET', path: '/api/socialV2/group-members', kind: 'exact', handler: wrap((ctx, payload) => groupMembers(ctx, payload)) },
   ],
 };

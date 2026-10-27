@@ -208,6 +208,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
   qq_list_voices: 'sendVoice',
+  qq_get_group_members: 'getGroupMembers',
   // 下面这些曾经漏登记。漏一个不是"多注册一个工具"那么轻：桥接那边按 `v2ToolEnabled(flag)`
   // 在**调用期**一律 403，而这里不登记就等于"控制台显示已关闭、模型每次请求仍收到它的完整
   // 描述与参数 schema，然后调用它、再拿到 403"——既白烧 token（本文件开头 176 行起就是为省这份
@@ -258,6 +259,27 @@ const disabledTools = [];
   };
 }
 
+// MARKER: legacy-read-mode-gate
+// 旧只读工具（qq_list_groups / qq_get_group_history）没有会话令牌，只放行 closed-agent。
+//
+// 为什么必须在**注册期**就砍掉（而不是只在调用期 403）：每个工具的描述 + 参数 schema
+// 都随 system prompt 在每一次请求里重发；reserved2 下它们必然 403，却照样占着字节，
+// 还会诱导模型误调（实测 turn10 有过一次 qq_get_group_members → 403，白烧一步）。
+//
+// ⚠️ 为什么读 state/mode.json 而**不**去问 /api/status：注册发生在模块加载期，
+// 走网络就得用 top-level await；而本文件会被若干离线回归用 vm / new Function 求值，
+// 那里没有 TLA —— 会直接 ReferenceError: await is not defined，把整批断言打红。
+const bootBridgeMode = (() => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'mode.json'), 'utf8'));
+    return String(parsed?.mode ?? '').trim();
+  } catch { return ''; }
+})();
+const registerLegacyReadTools = bootBridgeMode === '' || bootBridgeMode === 'closed-agent';
+if (!registerLegacyReadTools) {
+  console.error(`[snowluma-safe] 当前桥接模式 ${bootBridgeMode}：不注册旧只读工具（qq_list_groups / qq_get_group_history），改用带令牌的 v2 读工具`);
+}
+
 server.tool(
   'qq_status',
   '查询 QQ 机器人登录状态与账号信息（只读）。',
@@ -274,6 +296,7 @@ server.tool(
   }
 );
 
+if (registerLegacyReadTools) {
 server.tool(
   'qq_list_groups',
   '列出机器人所在的全部 QQ 群（只读）：群号、群名。',
@@ -301,33 +324,38 @@ server.tool(
   }
 );
 
+}
+
+// MARKER: group-members-v2-tool
+// 群成员列表：v2 形态（key + token），不再是无令牌的旧只读工具。
+//
+// 为什么改：qq-chat-v2 预设第 6 条明确叫模型用 qq_get_group_members 拿 QQ 号去 @ 人，
+// 但旧版在 reserved2 下必然 403 —— 预设教模型用一个永远失败的工具，每次白烧一步。
+// 改成 v2 后同一个名字在两种模式下都成立（closed-agent 里 token 不传即可）。
 server.tool(
   'qq_get_group_members',
-  '列出指定群的成员列表（只读）：QQ 号、昵称、群名片。',
-  { groupId: z.union([z.number(), z.string()]).describe('群号') },
-  async ({ groupId }) => {
-    const g = String(groupId);
+  '列出指定群的成员（只读）：QQ 号、昵称、群名片。等特定的人、要 @ 某个人、或需要确认谁在群里时用；QQ 号取返回里的 userId。只返回白名单群，且只读取桥接允许的会话。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号'),
+    token: z.string().optional().describe('会话令牌（见唤醒提示中的【会话令牌】；closed-agent 模式不需要）'),
+    limit: z.number().optional().describe('最多返回多少成员，默认 50，最大 100')
+  },
+  async ({ key, token, limit }) => {
     try {
-      if (!(await legacyReadToolAllowed())) {
-        return { content: [{ type: 'text', text: '旧只读工具仅在封闭 agent（管理员私聊）模式可用；其它模式请使用带会话令牌的 v2 读工具' }], isError: true };
-      }
+      const q = new URLSearchParams({ key });
+      if (limit != null) q.set('limit', String(limit));
+      // token 可选：closed-agent（管理员私聊）里代理没有会话令牌，走的是操作者路径；
+      // 桥接那边的白名单/模式判定对这条请求同样生效（不依赖 header 是否存在）。
+      const data = await agentApi(`/api/socialV2/group-members?${q.toString()}`, token ? { headers: { 'x-agent-token': token } } : {});
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
-      return { content: [{ type: 'text', text: `无法确认当前模式，拒绝读取：${error?.message ?? error}` }], isError: true };
-    }
-    const a = getAccess();
-    if (!isAllowed(a.allowGroups, a.denyGroups, g, a.allowAllWhenEmpty)) {
-      return { content: [{ type: 'text', text: `拒绝：群 ${g} 不在只读白名单中` }], isError: true };
-    }
-    try {
-      const data = await onebot('get_group_member_list', { group_id: Number(g) });
-      const list = (Array.isArray(data) ? data : (data?.data ?? [])).map((m) => ({ user_id: m.user_id, nickname: m.nickname, card: m.card }));
-      return { content: [{ type: 'text', text: serializeModelData(list) }] };
-    } catch (error) {
-      return { content: [{ type: 'text', text: `查询失败：${error?.message ?? error}` }], isError: true };
+      return { content: [{ type: 'text', text: `获取群成员失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );
 
+
+if (registerLegacyReadTools) {
 server.tool(
   'qq_get_group_history',
   '获取指定群的最近消息历史（只读）。messageSeq 可选：从该消息序号往前取。注意：是否可用取决于 SnowLuma 是否实现 get_group_msg_history。',
@@ -355,6 +383,8 @@ server.tool(
     }
   }
 );
+
+}
 
 server.tool(
   'qq_send_group_message',
