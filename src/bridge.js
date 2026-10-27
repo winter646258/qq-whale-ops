@@ -21,8 +21,9 @@ import { extractMemories, scopeForText } from './auto-memory.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
-import { compactModelMessage } from './qq-model-view.js';
+import { compactModelMessage, describeAge } from './qq-model-view.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+import { normalizeImageForModel } from './media-normalize.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
@@ -11073,10 +11074,25 @@ async function main() {
     const maxChars = bounded('wakeMaxChars', 6000, 500, 20000);
     const maxUnread = bounded('wakeMessageLimit', 12, 1, 100);
     const maxRecent = bounded('wakeRecentLimit', 4, 0, 20);
-    const packet = { messages: [], recent: [], unreadCount: st.unread.length, includedUnreadCount: 0, readThroughSeq: readThroughSeqV2(st), partial: st.unread.length > 0 };
+    // 一次快照只取一次 now：同一批消息的 ago 必须彼此可比。
+    const snapNow = Date.now();
+    const newestIncoming = [...(Array.isArray(st.unread) ? st.unread : [])].reverse()
+      .find((m) => m && !m.isSelf) || null;
+    const newestAgo = newestIncoming ? describeAge(newestIncoming.time, snapNow) : '';
+    const packet = {
+      messages: [],
+      recent: [],
+      // now / newestAgo 让模型不必自己换算：最新一条多旧，直接写在快照头上。
+      now: localClockText(snapNow),
+      ...(newestAgo ? { newestAgo } : {}),
+      unreadCount: st.unread.length,
+      includedUnreadCount: 0,
+      readThroughSeq: readThroughSeqV2(st),
+      partial: st.unread.length > 0
+    };
     const tryAdd = (field, msg) => {
       const previousThrough = packet.readThroughSeq;
-      packet[field].push(compactModelMessage(msg));
+      packet[field].push(compactModelMessage(msg, { now: snapNow }));
       packet.includedUnreadCount = packet.messages.length;
       packet.readThroughSeq = readThroughSeqV2(st, [...packet.messages, ...packet.recent]);
       packet.partial = packet.messages.length < st.unread.length;
@@ -11202,6 +11218,88 @@ async function main() {
     const value = Number(st.lastIncomingAt);
     const elapsedMs = Number.isFinite(value) && value > 0 ? Math.max(0, Date.now() - value) : 0;
     return { purpose: 'reply', quietMs, remainingQuietMs: Math.max(0, quietMs - elapsedMs) };
+  }
+
+  // ── 时间感：先看消息多旧，再决定怎么开口 ──────────────────────────────────
+  //
+  // 现象（操作者报告 + 会话实证）：AI 沉睡很久后被唤醒，看到一小时前的话仍然当成"刚发的"去接，
+  // 甚至抢进早已散场的话题。根因有两层：
+  //   ① 模型看到的时间是裸 epoch（`time: 1792294529471`），它根本算不出"这是 38 分钟前"
+  //      → 已由 qq-model-view.js 换成 `at`/`ago`；
+  //   ② 提示词里**没有任何一条规则**告诉它"旧消息不该按实时对话接"。
+  // 这里补第二层：把「现在 / 最新一条多旧 / 唤醒原因那条多旧」算好直接写进去，并给分档规则。
+  // 阈值可调（config.json 的 socialV2.wake.staleChatMinutes / staleSilentMinutes）。
+  // MARKER: time-sense
+  const pad2 = (n) => (n < 10 ? `0${n}` : String(n));
+
+  /** 本地 HH:MM（与消息 at 字段同一口径）。 */
+  function localClockText(ms) {
+    const d = new Date(Number(ms));
+    if (!Number.isFinite(d.getTime())) return '';
+    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  }
+
+  function timeSenseCfg() {
+    const wake = cfg.socialV2?.wake ?? {};
+    const boundedMin = (value, fallback, min, max) => {
+      const n = Number(value);
+      return Number.isFinite(n) && n >= min ? Math.min(max, Math.round(n)) : fallback;
+    };
+    const chatMin = boundedMin(wake.staleChatMinutes, 10, 1, 600);
+    // 「默认不回」必须不早于「不算实时对话」，否则两档规则会互相打架。
+    const silentMin = Math.max(chatMin, boundedMin(wake.staleSilentMinutes, 120, 5, 2880));
+    return { chatMin, silentMin };
+  }
+
+  /** 唤醒原因里带的本地 seq（形如 `atMention@seq194`），没有就 null。 */
+  function wakeReasonSeq(reason) {
+    const match = /@seq(\d+)$/.exec(String(reason ?? '').trim());
+    if (!match) return null;
+    const seq = Number(match[1]);
+    return Number.isSafeInteger(seq) && seq > 0 ? seq : null;
+  }
+
+  function findV2MessageBySeq(st, seq) {
+    if (!st || !Number.isSafeInteger(seq)) return null;
+    for (const list of [st.unread, st.recentMessages]) {
+      const hit = (Array.isArray(list) ? list : []).find((m) => m && m.seq === seq);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  /**
+   * 【时间感】规则块。没有可判断的消息时返回空串（引导/定时唤醒不必背这段）。
+   *
+   * 注意阈值必须和 timeSenseCfg 一致，否则模型会看到自相矛盾的两档。
+   */
+  function buildTimeSenseLine(st) {
+    const now = Date.now();
+    const newest = [...(Array.isArray(st.unread) ? st.unread : [])].reverse().find((m) => m && !m.isSelf)
+      || [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf)
+      || null;
+    if (!newest) return '';
+    const ageStr = describeAge(newest.time, now);
+    if (!ageStr) return '';
+    const { chatMin, silentMin } = timeSenseCfg();
+    const sender = String(newest.sender || '未知');
+    const ageMin = Math.max(0, Math.floor((now - Number(newest.time)) / 60000));
+    const staleNow = ageMin >= chatMin;
+    const tooOld = ageMin >= silentMin;
+    const lines = [
+      `【时间感：先看消息多旧，再决定怎么开口】现在 ${localClockText(now)}；最新一条来自「${sender}」，是 ${ageStr} 之前发的（${localClockText(newest.time)}）。`,
+      '- 消息里的 at 是本地时间、ago 是距现在多久；开口前先确认最新那条的 ago，不要凭感觉当成"刚刚"。',
+      `- ${chatMin} 分钟以内：正常接，当实时对话。`
+    ];
+    // 中间档只在两档阈值真的分开时才写：silentMin === chatMin 时写「60～60 分钟」是自相矛盾的废话。
+    if (silentMin > chatMin) {
+      lines.push(`- ${chatMin}～${silentMin} 分钟：可以接，但别用"刚""哈哈哈刚看到"这类实时语气；先确认这个话题还在不在、对方还在不在。`);
+    }
+    lines.push(`- 超过 ${silentMin} 分钟：默认不回，直接 qq_mark_read 收尾；只有当那条明确是找你/提问你、而且回答现在仍然有用时才回，并且开头要带时间感（"这条我才看到""过了挺久才看到"）。`);
+    if (staleNow) {
+      lines.push(`⚠️ 本次属于「旧账」：最新消息已经是 ${ageStr} 前，${tooOld ? `超过 ${silentMin} 分钟` : `超过 ${chatMin} 分钟`}。不要用秒回语气，也不要把别人的旧话题当现在的事接。`);
+    }
+    return `${lines.join('\n')}\n\n`;
   }
 
   function buildWakePromptV2(key, reason) {
@@ -11409,7 +11507,14 @@ async function main() {
     } catch (error) {
       log('[turn-budget] grace 注入跳过：', error?.message ?? error);
     }
-    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine;
+    // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
+    const timeSenseLine = buildTimeSenseLine(st);
+    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
+    const triggeredSeq = wakeReasonSeq(reason);
+    const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
+    const triggeredAgo = triggeredMsg ? describeAge(triggeredMsg.time, Date.now()) : '';
+    const triggeredLine = triggeredAgo ? `（触发这条是 ${triggeredAgo} 前发的${triggeredMsg?.sender ? `，来自「${triggeredMsg.sender}」` : ''}，不是刚刚）` : '';
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -11430,11 +11535,11 @@ async function main() {
       return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'atMention') {
-      return `${base}【唤醒】${key}\n原因：有人在群里 @ 了你 —— 这是明确点名找你，不是路过的话题。\n先去未读消息里找到那条 @，看清是谁、说了什么，然后直接回应它。回应简短自然即可（一到两小句），不要只观察不吭声；确实没什么可回的，用一句话接住也行。`;
+      return `${base}【唤醒】${key}${triggeredLine}\n原因：有人在群里 @ 了你 —— 这是明确点名找你，不是路过的话题。\n先去未读消息里找到那条 @，看清是谁、说了什么，然后直接回应它。回应简短自然即可（一到两小句），不要只观察不吭声；确实没什么可回的，用一句话接住也行。`;
     }
     if (reason === 'private') {
       const who = key === `private:${cfg.ownerQQ}` ? '主人' : '对方';
-      return `${base}【唤醒】${key}\n原因：${who}在私聊里给你发消息了 —— 私聊就是明确找你。\n先看未读，直接回，别晾着。`;
+      return `${base}【唤醒】${key}${triggeredLine}\n原因：${who}在私聊里给你发消息了 —— 私聊就是明确找你。\n先看未读，直接回，别晾着。`;
     }
     if (reason === 'share') {
       // MARKER: share-prompt
@@ -11455,9 +11560,9 @@ async function main() {
 如果这件事牵扯到别人的私事、你觉得不该外传，这次就不说，直接收尾也可以。`;
     }
         if (reason === 'poke') {
-      return `${base}【唤醒】${key}\n原因：有人拍了一拍你。\n先看未读/最近消息里的 [拍一拍] 事件，认出是谁拍的、后缀写了什么，再自然回应一句；也可以用 qq_send_poke 回一个拍一拍。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
+      return `${base}【唤醒】${key}${triggeredLine}\n原因：有人拍了一拍你。\n先看未读/最近消息里的 [拍一拍] 事件，认出是谁拍的、后缀写了什么，再自然回应一句；也可以用 qq_send_poke 回一个拍一拍。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
-    return `${base}【唤醒】${key}\n原因：${reason}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；${preSleepEnabledNow ? '决定潜水前必须按上面的【沉睡前强制等待】先等够观察窗口。' : '想收工就直接设置 wakeConfig 收尾，不用先等观察窗口。'}`;
+    return `${base}【唤醒】${key}${triggeredLine}\n原因：${reason}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；${preSleepEnabledNow ? '决定潜水前必须按上面的【沉睡前强制等待】先等够观察窗口。' : '想收工就直接设置 wakeConfig 收尾，不用先等观察窗口。'}`;
   }
 
   function buildWakeReminderPromptV2(key) {
