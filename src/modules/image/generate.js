@@ -27,10 +27,18 @@ async function image({ req, url, sendJson, readBody }) {
   const { cfg, log, path, imageHelpers: h } = ctx;
   // 免审批放行标记：整段 try/catch 都要看得到（成功与失败都要报备）。
   let reportOnly = false;
+  // MARKER: image-catch-scope（2026-10-27）
+  // key / body 也必须在 try 之外声明。原先它们是 try 内的 const，而 catch 里要用
+  // 它们调 reportImageUsage —— 一旦 try 里出错，catch 自己先抛 ReferenceError：
+  //   ① 真正的错误被吃掉（日志只剩 "key is not defined"）；
+  //   ② sendJson 那行永远执行不到，客户端拿不到响应，回合白白耗到超时被掐。
+  // 实测代价：private:2627346728 一个回合烧了 608s / 9 步后中止。
+  let key = '';
+  let body = {};
   try {
     const q = url.searchParams;
-    const body = req.method === 'POST' ? ((await readBody()) ?? {}) : {};
-    const key = String(body.key ?? q.get('key') ?? '').trim();
+    body = req.method === 'POST' ? ((await readBody()) ?? {}) : {};
+    key = String(body.key ?? q.get('key') ?? '').trim();
     const action = String(body.action ?? q.get('action') ?? 'generate').trim();
     if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
     if (req.headers['x-agent-token'] && !h.agentTokenOkOrOwnerDelegate(key, req.headers['x-agent-token'])) {

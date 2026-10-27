@@ -1025,7 +1025,11 @@ function loadConfig() {
       turnBudget: {
         maxSteps: 40,        // 单回合工具调用次数上限
         maxMs: 600000,       // 单回合时长上限（10 分钟）
-        maxSends: 8          // 单回合发送条数上限
+        maxSends: 8,         // 单回合发送条数上限
+        // 主人私聊专用放宽（见 turnBudgetCfg 的 owner-turn-budget）。
+        // 不写 = 跟全局一致；写了就是「主人至少这么多」，只升不降。
+        // ownerMaxSends: 20,
+        // ownerMaxMs: 1200000
       },
       feedback: {
         maxLength: 500,
@@ -3605,6 +3609,7 @@ async function main() {
     const pick = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : d);
     // 正常回合 2–10 分钟 / 10–15 次工具 / 2–4 条发送，这里留 3–4 倍余量
     let maxSends = pick(b.maxSends, 8);
+    let maxMs = pick(b.maxMs, 600000);
     // MARKER: per-group-override —— 单个群单独收紧每轮发送条数。
     // 优先级：按群覆盖 > 全局。只降低不抬高（Math.min），避免覆盖成了开后门。
     const keyStr = String(key ?? '');
@@ -3613,7 +3618,19 @@ async function main() {
       const n = Number(ov?.turnMaxSends);
       if (Number.isFinite(n) && n > 0) maxSends = Math.min(maxSends, Math.floor(n));
     }
-    return { maxSteps: pick(b.maxSteps, 40), maxMs: pick(b.maxMs, 600000), maxSends };
+    // MARKER: owner-turn-budget —— 主人私聊单独放宽每轮条数 / 时长。
+    // 方向与群覆盖相反：那边是「收紧防刷屏」（Math.min），这边是「信任授予」（Math.max）。
+    // 语义是「主人至少这么多条」：全局值往上调，owner 跟着涨；全局往下调，owner 仍按
+    // ownerMaxSends 给（因为那是显式的信任授予）。所以要收紧主人，改的是 ownerMaxSends
+    // 本身或删掉它，不是改全局 —— 别指望调小 maxSends 能连带把主人按住。
+    // 起因（2026-10-26 21:26:07 实测）：private:1124721191 只跑了 97s / 4 步就发满 6 条被
+    // 「发送 6 条 > 5」掐掉 —— 全局 5 条是按群聊防刷屏定的，主人私聊里这是误伤。
+    const ownerKey = cfg.ownerQQ ? `private:${String(cfg.ownerQQ)}` : '';
+    if (ownerKey && keyStr === ownerKey) {
+      maxSends = Math.max(maxSends, pick(b.ownerMaxSends, maxSends));
+      maxMs = Math.max(maxMs, pick(b.ownerMaxMs, maxMs));
+    }
+    return { maxSteps: pick(b.maxSteps, 40), maxMs, maxSends };
   }
   function turnBudgetFor(sessionId) {
     let entry = turnBudgetLedger.get(sessionId);
@@ -9052,12 +9069,51 @@ async function main() {
    * 判定 ended 的分支）—— 那一轮收工，额度立刻收回。下面的时间判据只是兜底：
    * 万一 turn/end 事件丢了，别让闸门永远开着。
    */
+  // MARKER: per-key-turn-context —— 「当前回合」必须按会话分开存。
+  // 旧版只有一个 globalThis.__qqTurnContext 槽，注释里假设「本来同一时刻只有一个回合在跑」。
+  // 线上早就不是了：群 906710082 / 群 201188739 / 好几个私聊同时在跑，后开始的回合把先开始的
+  // 那个顶掉，于是先那个会话调生图工具就被判成「这个会话不是当前正在进行的那个」。
+  // 2026-10-27 15:46:52 实测：管理员私聊额度已授予（日志有「授予额度」），随后静默拒绝
+  // —— 那条分支连日志都不打，线上一点痕迹都没有，主人「又试了两回」就是两回同一句。
+  // 现在 active / ended 都按 key 存 Map；globalThis 那对旧槽继续写，只为不打断别的读法。
+  function turnCtxMap(name) {
+    if (!(globalThis[name] instanceof Map)) globalThis[name] = new Map();
+    return globalThis[name];
+  }
+  function activeTurnCtx(key) {
+    return turnCtxMap('__qqTurnContexts').get(String(key)) || null;
+  }
+  function endedTurnCtx(key) {
+    return turnCtxMap('__qqTurnContextEnds').get(String(key)) || null;
+  }
+  function setActiveTurnCtx(ctx) {
+    const m = turnCtxMap('__qqTurnContexts');
+    m.set(String(ctx.key), ctx);
+    // 只留最近 80 个：回合结束会删自己的，这里是防某个 key 的 end 事件丢了导致无界增长。
+    if (m.size > 80) {
+      for (const k of [...m.keys()]) {
+        if (m.size <= 80) break;
+        if (k !== String(ctx.key)) m.delete(k);
+      }
+    }
+    globalThis.__qqTurnContext = ctx;
+  }
+  function endActiveTurnCtx(key) {
+    const k = String(key);
+    const mine = activeTurnCtx(k);
+    if (!mine) return false;
+    turnCtxMap('__qqTurnContextEnds').set(k, { key, reason: String(mine.reason || ''), at: Date.now() });
+    turnCtxMap('__qqTurnContexts').delete(k);
+    if (globalThis.__qqTurnContext && String(globalThis.__qqTurnContext.key) === k) globalThis.__qqTurnContext = null;
+    return true;
+  }
+
   function imageAllowedNow(key) {
-    let ctx = globalThis.__qqTurnContext;
+    let ctx = activeTurnCtx(key);
     if (!ctx) {
       // 回合刚结束的宽限：同一个会话、90 秒内，还允许画。
       // 安全不靠这里，靠下面的 imageSceneFor（主人真的 @ 过才成立）。
-      const ended = globalThis.__qqTurnContextEnded;
+      const ended = endedTurnCtx(key);
       const graceMs = Number(cfg.socialV2?.image?.turnGraceMs) || 90000;
       const fresh = ended && String(ended.key) === String(key) && Date.now() - Number(ended.at || 0) <= graceMs;
       if (!fresh) {
@@ -9081,6 +9137,9 @@ async function main() {
       return { ok: false, why: '这一轮对话过去太久了，先跟主人说句话再画' };
     }
     if (String(ctx.key) !== String(key)) {
+      // per-key 之后这里理论上不会命中；留着当兜底，但必须留痕 ——
+      // 线上那次静默拒绝就是因为这条分支不打日志，主人试几回都只有同一句话，无从查起。
+      log(`[image] 拒绝 ${key}：回合上下文属于 ${ctx.key}（不是这个会话）`);
       return { ok: false, why: '这个会话不是当前正在进行的那个' };
     }
     const scene = imageSceneFor(key, String(ctx.reason || ''));
@@ -9838,8 +9897,9 @@ async function main() {
   async function deliverPromptNow(key, promptText, opts = {}) {
     if (!isSessionAllowedInCurrentMode(key)) throw new Error(`当前模式不允许会话 ${key}`);
     // 「这一轮是谁在说话」——生图闸门要用（见 imageSceneFor）。
-    // 不恢复旧值：本来同一时刻只有一个回合在跑，覆盖比栈更诚实。
-    globalThis.__qqTurnContext = { key, reason: String(opts.wakeReason || ''), at: Date.now() };
+    // 按会话各存一份（多会话并发，见 per-key-turn-context）；旧的全局槽同时写，兼容别的读法。
+    setActiveTurnCtx({ key, reason: String(opts.wakeReason || ''), at: Date.now() });
+    turnCtxMap('__qqTurnContextEnds').delete(String(key));
     globalThis.__qqTurnContextEnded = null;
     log(`[image] 授予额度（${key}，${opts.wakeReason || '无原因'}）`);
     // Recheck queued wakes at dispatch time: no model call while paused/disabled
@@ -12927,17 +12987,12 @@ async function main() {
               v2TurnStartAt.delete(frame.sessionId);
               // 回合收工就交还生图额度：这一轮已经结束，不该被下一轮借用。
               // 生图闸门「跟着回合走」靠的就是这一行（另见 imageAllowedNow）。
-              if (globalThis.__qqTurnContext && String(globalThis.__qqTurnContext.key) === String(key)) {
+              if (endActiveTurnCtx(key)) {
                 log(`[image] 收回额度（${key}）`);
                 // 回合收工不等于「立刻不许画」：她可能正处在收尾阶段才想起要图。
                 // 真正的安全闸是 imageSceneFor（主人确实 @ 过），这里只是怕跨轮借用。
                 // reason 必须一起存：宽限分支要拿它判 byMention。
-                globalThis.__qqTurnContextEnded = {
-                  key,
-                  reason: String(globalThis.__qqTurnContext.reason || ''),
-                  at: Date.now()
-                };
-                globalThis.__qqTurnContext = null;
+                globalThis.__qqTurnContextEnded = endedTurnCtx(key);
               }
               { // MARKER: turn-budget-end
                 const budget = turnBudgetLedger.get(frame.sessionId);
