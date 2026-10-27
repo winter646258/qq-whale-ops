@@ -12228,7 +12228,12 @@ async function main() {
       const now = Date.now();
       if ((queuedHintAt.get(key) ?? 0) + QUEUE_HINT_COOLDOWN_MS < now) {
         queuedHintAt.set(key, now);
-        await sendToQQ(key, '⏳ 系统服务重启中，消息已排队，恢复后自动处理。');
+        // MARKER: restart-hint-admin-only —— 2026-10-26
+        // 原来这条直接 sendToQQ(key)，群友也看得见「系统服务重启中，消息已排队」。
+        // 桥接自己的运行状态属于内部技术信息，只该让主人知道；群里发这个
+        // 既没用又掉人设（用户 m04087：「这个话也不要发到群里来了」）。
+        // 与「⚠️ 消息未被接受」「⏹️ 回合已中止」保持同一套做法。
+        await notifyAdminOnly('⏳ 系统服务重启中，消息已排队', '恢复后自动处理', key);
       }
       log(`DSH 不可用，消息入队 (${key})`);
       return;
