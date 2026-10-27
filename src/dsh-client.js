@@ -293,6 +293,9 @@ function waitWithSignal(promise, signal) {
   });
 }
 
+// MARKER: corrupt-unfollow —— 会话日志损坏的识别特征（DSH 侧不可自愈）
+const SESSION_LOG_CORRUPT_RE = /is corrupt|stored log is corrupt|SessionFormatError|turn\/end crosses an open compaction/i;
+
 export class NodeApiClient extends AbstractApiClient {
   constructor(baseUrl, timeoutMs, auth) {
     super(timeoutMs);
@@ -878,7 +881,13 @@ export class NodeApiClient extends AbstractApiClient {
           streamToSession.delete(msg.streamId);
           followed.delete(sessionId);
           // 只有已不存在的会话才永久取消订阅；临时服务错误必须在重连后重试。
-          if (msg.error?.code === 'session/not-found') this._desiredFollows.delete(sessionId);
+          // MARKER: corrupt-unfollow —— 2026-10-27
+          // 会话日志损坏（SessionFormatError）也是永久态：DSH 读不出来，重订阅一万次
+          // 都是同一个错。原来只认 session/not-found，损坏会话返回 gateway/internal，
+          // 于是它永远留在 _desiredFollows 里，每次重连都重开一条流并重报一次错。
+          if (msg.error?.code === 'session/not-found' || SESSION_LOG_CORRUPT_RE.test(String(msg.error?.message ?? ''))) {
+            this._desiredFollows.delete(sessionId);
+          }
           enqueue({
             kind: 'frame',
             envelope: { rpcId: msg.streamId, payload: { type: 'stream/error', error: msg.error } }

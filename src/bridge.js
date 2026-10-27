@@ -5396,6 +5396,14 @@ async function main() {
    * 复制一遍既容易走样，也容易在其中一处忘了给 sourceKey。
    * 绝不抛错 —— 通知失败只能记日志，不能污染调用方的主流程。
    */
+  // MARKER: notify-admin-throttle —— 2026-10-27
+  // 实测事故：group:906710082 的会话损坏，同一错误每 3 秒触发一次，
+  // 一小时往管理员私聊推了几十条一模一样的「消息未被接受」，把主人的私聊刷成了日志。
+  // 技术报错本来就只该给管理员看，但「只看一次」和「看八十六次」是两回事。
+  // 同一来源 + 同一标题在窗口内只发第一条；之后再出现只累计，等下一条发出时带上次数。
+  const NOTIFY_ADMIN_MIN_GAP_MS = 5 * 60 * 1000;
+  const notifyAdminSeen = new Map(); // `${sourceKey}|${headline}` -> { lastSentAt, suppressed }
+
   async function notifyAdminOnly(headline, detail, sourceKey) {
     const src = String(sourceKey ?? '').trim();
     const ownerKey = cfg.ownerQQ ? `private:${String(cfg.ownerQQ)}` : '';
@@ -5405,8 +5413,19 @@ async function main() {
       log(`⚠️ ${headline}：未配置 ownerQQ，诊断信息只留在日志里`);
       return;
     }
+    const throttleKey = `${src ?? ''}|${headline}`;
+    const seen = notifyAdminSeen.get(throttleKey);
+    const now = Date.now();
+    if (seen && now - seen.lastSentAt < NOTIFY_ADMIN_MIN_GAP_MS) {
+      seen.suppressed += 1;
+      return;
+    }
+    const extra = seen && seen.suppressed > 0
+      ? `（此前同类报错已重复 ${seen.suppressed} 次，已省略；${Math.round(NOTIFY_ADMIN_MIN_GAP_MS / 60000)} 分钟内不再重复发）`
+      : '';
+    notifyAdminSeen.set(throttleKey, { lastSentAt: now, suppressed: 0 });
     try {
-      await sendToQQ(ownerKey, `${headline}${where}：${detail}`);
+      await sendToQQ(ownerKey, `${headline}${where}：${detail}${extra}`);
     } catch (error) {
       log(`${headline} 通知管理员失败（已忽略）：${error?.message ?? error}`);
     }
@@ -8545,6 +8564,18 @@ async function main() {
   // 返回 'applied' | 'not-found' | 'failed'。
   // 'not-found' 表示 DSH 侧会话已经不存在（DSH 重启、异常退出、归档竞态），
   // 本地映射已失效，调用方必须退役重建，否则每条消息都会对着一个不存在的会话重试。
+  // MARKER: session-corrupt-detect —— 2026-10-27
+  // 实测事故：group:906710082 的 DSH 会话文件损坏（39MB，SessionFormatError:
+  // turn/end crosses an open compaction）。ensureChatModel 只认 not-found 是终态，
+  // corrupt 被判成 'failed' 后原样返回旧会话 → 每 3 秒重试同一个坏会话，永远失败，
+  // 每失败一次就往管理员私聊推一条「消息未被接受」，今天刷了 86 条。
+  // 会话日志一旦损坏，DSH 侧不可能自愈，只能退役重建。
+  function sessionLogCorrupt(message) {
+    const m = String(message ?? '');
+    if (!m) return false;
+    return /is corrupt|stored log is corrupt|SessionFormatError|turn\/end crosses an open compaction/i.test(m);
+  }
+
   async function ensureChatModel(sessionId) {
     if (modelAppliedSessions.get(sessionId) === modelSelectionEpoch) return 'applied';
     const provider = String(cfg.dsh?.provider || 'deepseek-official');
@@ -8583,6 +8614,12 @@ async function main() {
       modelAppliedSessions.set(sessionId, modelSelectionEpoch);
       return 'not-found';
     }
+    if (sessionLogCorrupt(message)) {
+      // 会话日志损坏同样是终态：DSH 读不出这个会话，重试一万次也不会好。
+      log(`会话 ${sessionId} 的日志已损坏（SessionFormatError），按会话失效处理：${message.slice(0, 200)}`);
+      modelAppliedSessions.set(sessionId, modelSelectionEpoch);
+      return 'not-found';
+    }
     return 'failed';
   }
 
@@ -8600,7 +8637,7 @@ async function main() {
         // DSH 侧会话已不存在（DSH 重启、异常退出、归档竞态）：本地映射已经失效，
         // 必须退役并重建，否则每条消息都会对着一个不存在的会话重试 selectModel。
         if (applied === 'not-found') {
-          log(`会话 ${key} 在 DSH 侧已不存在，退役本地映射并在本次调用中重建`);
+          log(`会话 ${key} 在 DSH 侧已不存在或已损坏，退役本地映射并在本次调用中重建`);
           retireSession(key);
         } else {
           if (epoch !== sessionEpoch || !isCurrentSession(key, existing)) throw new Error('会话创建期间已重置或权限已变化');
@@ -13226,7 +13263,21 @@ async function main() {
             await sendToQQ(key, `🔐 agent 请求审批：${safeToolName}${reason}\n回复「通过」或「拒绝」`);
             await registerPending(key, { kind: 'approval', rpcId: envelope.rpcId, sessionId: frame.sessionId, clientId: frame.clientId, eventId: frame.eventId, toolName: frame.toolName });
           } else if (frame.type === 'stream/error') {
-            log('事件流错误:', frame.error);
+            // MARKER: corrupt-stream-retire —— 2026-10-27
+            // 会话日志损坏时 DSH 永远读不出来，本地映射必须立刻退役重建；
+            // 否则每条消息都对着同一个坏会话重试，失败一次就推一条「消息未被接受」给管理员。
+            const errMsg = String(frame.error?.message ?? '');
+            if (sessionLogCorrupt(errMsg)) {
+              const badKey = reverse.get(frame.sessionId);
+              log(`会话流报会话日志损坏，退役并重建：${frame.sessionId}${badKey ? `（${badKey}）` : ''}`);
+              if (badKey) retireSession(badKey);
+              else {
+                modelAppliedSessions.set(frame.sessionId, modelSelectionEpoch);
+                api.events.forget?.(frame.sessionId);
+              }
+            } else {
+              log('事件流错误:', frame.error);
+            }
           }
         }
       } catch (error) {
