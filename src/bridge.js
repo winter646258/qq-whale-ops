@@ -1430,6 +1430,11 @@ async function segmentsToText(segments, options = {}) {
       }
       case 'face': out.push(`[表情${d.id ?? ''}]`); break;
       case 'image': out.push('[图片]'); break;
+      // 市场表情（mface）在部分网关实现里出现：有 summary 就用它，别让模型只看到 "[mface]"。
+      case 'mface':
+      case 'marketface':
+        out.push(`[表情${d.summary ? `:${d.summary}` : ''}]`);
+        break;
       case 'record': out.push('[语音]'); break;
       case 'video': out.push('[视频]'); break;
       case 'file': out.push(`[文件${d.name ?? ''}]`); break;
@@ -1472,11 +1477,49 @@ async function segmentsToText(segments, options = {}) {
 
 // 从 OneBot 消息段中提取图片/表情元数据（不下载字节，仅记录定位信息）。
 // 供一代自动内联、二代按需工具、控制台/日志使用。
+  // ── 表情包 CDN 兜底（MARKER: emoji-cdn） ──────────────────────────────────
+  //
+  // 市场表情 / 收藏表情**不在网关缓存里**：`get_image` 对它们必然 not found。
+  // 唯一稳的取法是按 emoji_id 拼 CDN 地址直接抓。以前只认 get_image，
+  // 结果所有表情都取不到字节，模型只能看到一句「[表情包:名字]」。
+  function sanitizeMediaSummary(value, max = 60) {
+    const s = String(value ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim();
+    if (!s) return '';
+    return s.length > max ? `${s.slice(0, max)}…` : s;
+  }
+
+  /** 从 `f9-f96bf2…d93c3530d5eb148f55206fb1.gif` 里抠出 32 位 hex 的 emoji_id。 */
+  function emojiIdFromFileName(file) {
+    const match = /(?:^|[^0-9a-f])([0-9a-f]{32})\.(?:gif|png|jpe?g|webp)$/i.exec(String(file ?? '').trim());
+    return match ? match[1] : '';
+  }
+
+  /**
+   * emoji_id → CDN 候选地址。
+   *
+   * **必须校验成十六进制**：emoji_id 来自对方消息段，直接拼进 URL 等于把
+   * 「用户可控字符串 → 服务器出站请求」的洞敞开（SSRF / 任意 URL）。
+   */
+  function emojiCdnCandidates(emojiId) {
+    const id = String(emojiId ?? '').trim();
+    if (!/^[0-9a-f]{16,64}$/i.test(id)) return [];
+    return [`https://gxh.vip.qq.com/club/item/parcel/item/${id.slice(0, 2)}/${id}/raw300.gif`];
+  }
+
 function extractMediaFromSegments(segments) {
   const media = [];
   for (const seg of segments ?? []) {
     if (!seg || typeof seg !== 'object') continue;
     const d = seg.data ?? {};
+    // MARKER: emoji-fields
+    // emoji_id / emoji_package_id / key 是表情包唯一的兜底定位信息：
+    // get_image 取不到时只能靠 emoji_id 拼 CDN，丢了它就彻底取不到字节。
+    // 线上是 image 段 + emoji_id（sub_type 可能是 0），部分网关用 mface 段。
+    const emojiFields = {
+      emojiId: String(d.emoji_id ?? d.emojiId ?? ''),
+      emojiPackageId: String(d.emoji_package_id ?? d.emojiPackageId ?? ''),
+      emojiKey: String(d.key ?? '')
+    };
     if (seg.type === 'image') {
       media.push({
         kind: 'image',
@@ -1486,24 +1529,30 @@ function extractMediaFromSegments(segments) {
         // 而 SDK 的类型描述的是**内部元素**、拼作 `subType`。两个都读，别只认一个
         // —— 只读 camelCase 的话这里会永远是空串，而且不会有任何报错。
         subType: (d.sub_type ?? d.subType) != null ? String(d.sub_type ?? d.subType) : '',
-        summary: String(d.summary ?? '')
+        summary: sanitizeMediaSummary(d.summary),
+        ...emojiFields
       });
     } else if (seg.type === 'face') {
       media.push({
         kind: 'face',
-        faceId: String(d.id ?? '')
+        faceId: String(d.id ?? ''),
+        url: String(d.url ?? ''),
+        summary: sanitizeMediaSummary(d.summary)
       });
     } else if (seg.type === 'mface' || seg.type === 'marketface') {
       // MARKER: mface-media
       // QQ 的「收藏表情 / 商城表情」走 mface 段，不是 image 也不是 face。
       // 以前这里没分支 → 整段直接蒸发：mediaList 为空，她连「这里有个表情」都不知道，
       // 只会被告知「没看见」。summary 形如「[表情包:我是吃白饭的大肥鱼]」。
+      // kind 统一叫 'sticker'（与 image/face 并列），本地老代码认 'mface' 的地方
+      // 用 isStickerKind() 兼容，见下面三处消费点。
       media.push({
-        kind: 'mface',
+        kind: 'sticker',
         file: String(d.file ?? ''),
         url: String(d.url ?? ''),
-        summary: String(d.summary ?? d.text ?? ''),
-        emojiId: String(d.emoji_id ?? d.emojiId ?? '')
+        subType: '1',
+        summary: sanitizeMediaSummary(d.summary ?? d.text),
+        ...emojiFields
       });
     }
   }
@@ -7972,9 +8021,106 @@ async function main() {
     return /^[\w.+=@-]+$/.test(s);
   }
 
+  // ── 喂给模型的那一份：体积与动图形态归一化 ──────────────────────────────
+  //
+  // MARKER: model-media-normalize —— 2026-10-27 从 v0.2.1-r1 回补
+  //
+  // 为什么必须在这里动手（而不是"让 DSH 自己处理"）：
+  //   ① DSH 的 MCP 图片入口用正则校验 base64，实测量级 ≥4,474,880 字符
+  //      （原始字节 ≥3.20 MiB）必抛 RangeError: Maximum call stack size exceeded，
+  //      工具结果被降级成 `[image unavailable: … Maximum call stack size exceeded …]`
+  //      —— 模型只看到一行看不懂的英文错误。
+  //      而下面的 MAX_MEDIA_BYTES 是**抓取**上限（4 MiB），故意留着不动：
+  //      得先把大图抓下来，才有机会压小它。
+  //   ② DSH 对 image/gif 一律归一化成单帧，模型永远只看第一帧，且不知道那是动图。
+  //      动图在桥接侧抽帧拼图后，信息量反而更高（实测 4.83MB/200 帧 → 92KB/269ms）。
+  //
+  // 上限默认值见 media-normalize.js 的 MEDIA_DEFAULTS；config.json 的 socialV2.media 可覆盖。
+  // ⚠️ 只用于**喂模型**的出口。collectStickerV2 走 fetchOneBotImage 的原始字节，不能经过这里，
+  //    否则收藏下来的表情会变成拼图/降采样版本。
+  const modelMediaLimits = (() => {
+    const m = cfg.socialV2?.media ?? {};
+    return {
+      enabled: m.normalize !== false,
+      maxModelBytes: m.maxModelBytes,
+      maxLongEdge: m.maxLongEdge,
+      gifFrames: m.gifFrames,
+      gifTile: m.gifTile,
+      timeoutMs: m.normalizeTimeoutMs,
+      ffmpegPath: process.env.FFMPEG_PATH || cfg.socialV2?.voice?.ffmpegPath || null
+    };
+  })();
+
+  /**
+   * 把一张已抓到的图片整理成模型可安全消费的形态。
+   * @returns {Promise<{ok:boolean, buffer?:Buffer, mimeType?:string, note?:string, error?:string}>}
+   *          ok=false 表示"压不到可用体积"——调用方必须把它变成一句可读的失败原因，
+   *          绝不发注定被 DSH 丢掉的字节（那样模型只会看到看不懂的英文错误）。
+   */
+  async function toModelMedia(buffer, mimeType, label = '图片') {
+    const out = await normalizeImageForModel(buffer, mimeType, { ...modelMediaLimits, label });
+    if (!out.ok) {
+      log(`[media] ${label} 不提供：${out.error}`);
+      return out;
+    }
+    if (out.note) log(`[media] ${label}: ${out.note}`);
+    return out;
+  }
+
+  /** 是不是有效图片 + 像素不超上限。统一出口，别再每处各写一遍。
+   *  必须留在 main() 内部：它依赖 getImageDimensions / mimeFromBuffer /
+   *  MAX_MEDIA_PIXELS，这三个都定义在本作用域里。放到顶层就会 ReferenceError，
+   *  而调用处的 try/catch 会把它变成「表情永远取不到字节」。 */
+  function acceptImageBuffer(buf, label = '图片') {
+    if (!buf || !buf.length) return null;
+    if (!looksLikeImageBuffer(buf)) {
+      log(`${label}不是有效图片（PNG/JPEG/GIF/WebP），已跳过`);
+      return null;
+    }
+    const dims = getImageDimensions(buf);
+    if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
+      log(`${label}像素超限，已跳过（${dims.width}x${dims.height}）`);
+      return null;
+    }
+    return { buffer: buf, mimeType: mimeFromBuffer(buf) };
+  }
+
   async function fetchOneBotImage(media) {
-    // 优先使用 OneBot get_image 获取网关侧信息；只有 file 是安全缓存文件名时才允许交给网关。
-    if (media.kind === 'image' && media.file && isProbablySafeImageFileRef(media.file)) {
+    // MARKER: sticker-cdn-first
+    // 表情包（市场/收藏表情）优先走 CDN：get_image 对市场表情必然失败
+    // （SnowLuma 缓存里没有该文件），先试 URL 能省一次失败往返，也更可靠。
+    // 普通图片反过来：先 get_image（本地缓存最快），失败再抓 URL。
+    const emojiId = String(media.emojiId || emojiIdFromFileName(media.file) || '');
+    const isSticker = media.kind === 'sticker' || media.kind === 'mface' || !!emojiId || String(media.subType || '') === '1';
+    const label = isSticker ? '表情' : '图片';
+    const failures = [];
+    const urls = [];
+    const pushUrl = (raw) => {
+      const s = String(raw ?? '').trim();
+      if (!/^https?:\/\//i.test(s) || urls.includes(s)) return;
+      urls.push(s);
+    };
+    pushUrl(media.url);
+    for (const candidate of emojiCdnCandidates(emojiId)) pushUrl(candidate);
+
+    const tryUrls = async () => {
+      for (const url of urls) {
+        try {
+          const fetched = await safeFetchBuffer(url, MAX_MEDIA_BYTES);
+          const accepted = acceptImageBuffer(fetched.buffer, `${label} URL `);
+          if (accepted) return { ...accepted, mimeType: accepted.mimeType || mimeFromUrl(url) };
+          failures.push(`${url} 不是有效图片`);
+        } catch (error) {
+          failures.push(`${url}: ${error?.message ?? error}`);
+        }
+      }
+      return null;
+    };
+
+    // 只有 file 是安全缓存文件名时才允许交给网关（防任意路径/内网 URL 注入）。
+    const tryGetImage = async () => {
+      if (!(media.kind === 'image' || media.kind === 'sticker' || media.kind === 'mface')) return null;
+      if (!media.file || !isProbablySafeImageFileRef(media.file)) return null;
       try {
         const info = await bot.getImage({ file: String(media.file) });
         const obj = info && typeof info === 'object' ? info : {};
@@ -7982,26 +8128,19 @@ async function main() {
         if (base64) {
           // 粗略估计 base64 解码后大小，超限直接拒绝，避免超大字符串撑爆内存
           if (base64.length * 3 / 4 <= MAX_MEDIA_BYTES) {
-            const buf = Buffer.from(base64, 'base64');
-            if (buf.length > 0 && looksLikeImageBuffer(buf)) {
-              const dims = getImageDimensions(buf);
-              if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
-                log(`get_image 返回的图片像素超限，已跳过（${dims.width}x${dims.height}）`);
-              } else {
-                return { buffer: buf, mimeType: mimeFromBuffer(buf) };
-              }
-            }
+            const accepted = acceptImageBuffer(Buffer.from(base64, 'base64'), 'get_image 返回的图片');
+            if (accepted) return accepted;
           } else {
             log(`get_image 返回的图片 base64 超限，已跳过（${Math.round(base64.length * 3 / 4 / 1024)}KB）`);
           }
         }
         if (obj.url) {
-          const fetched = await safeFetchBuffer(String(obj.url), MAX_MEDIA_BYTES);
-          const dims = getImageDimensions(fetched.buffer);
-          if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
-            log(`get_image URL 图片像素超限，已跳过（${dims.width}x${dims.height}）`);
-          } else {
-            return { buffer: fetched.buffer, mimeType: mimeFromBuffer(fetched.buffer) || mimeFromUrl(obj.url) };
+          try {
+            const fetched = await safeFetchBuffer(String(obj.url), MAX_MEDIA_BYTES);
+            const accepted = acceptImageBuffer(fetched.buffer, 'get_image URL 图片');
+            if (accepted) return { ...accepted, mimeType: accepted.mimeType || mimeFromUrl(obj.url) };
+          } catch (error) {
+            failures.push(`get_image url: ${error?.message ?? error}`);
           }
         }
         if (typeof obj.file === 'string' && !obj.file.startsWith('base64://') && fs.existsSync(obj.file) && isSafeLocalMediaPath(obj.file)) {
@@ -8009,32 +8148,24 @@ async function main() {
           if (stat.size > MAX_MEDIA_BYTES) {
             log(`本地图片文件超限，已跳过（${Math.round(stat.size / 1024)}KB）`);
           } else {
-            const buf = fs.readFileSync(obj.file);
-            const dims = getImageDimensions(buf);
-            if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
-              log(`本地图片像素超限，已跳过（${dims.width}x${dims.height}）`);
-            } else {
-              return { buffer: buf, mimeType: mimeFromBuffer(buf) };
-            }
+            const accepted = acceptImageBuffer(fs.readFileSync(obj.file), '本地图片');
+            if (accepted) return accepted;
           }
         }
       } catch (error) {
-        log(`get_image 解析失败: ${error?.message ?? error}`);
+        failures.push(`get_image: ${error?.message ?? error}`);
       }
-    }
-    // 其次直接用消息段里的 URL
-    if (media.url) {
-      try {
-        const fetched = await safeFetchBuffer(String(media.url), MAX_MEDIA_BYTES);
-        const dims = getImageDimensions(fetched.buffer);
-        if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
-          log(`图片 URL 像素超限，已跳过（${dims.width}x${dims.height}）`);
-        } else {
-          return { buffer: fetched.buffer, mimeType: mimeFromBuffer(fetched.buffer) || mimeFromUrl(media.url) };
-        }
-      } catch (error) {
-        log(`图片 URL 抓取失败: ${error?.message ?? error}`);
-      }
+      return null;
+    };
+
+    // 注意：这里返回的是**原始字节**，归一化由调用方 toModelMedia 做。
+    // collectStickerV2 直接调本函数 → 收藏下来的表情必须是原图，不能被降采样/拼图。
+    const result = isSticker
+      ? (await tryUrls()) ?? (await tryGetImage())
+      : (await tryGetImage()) ?? (await tryUrls());
+    if (result) return result;
+    if (failures.length) {
+      log(`[media] ${label}获取失败（${failures.length} 次尝试）：${failures.slice(0, 3).join(' | ')}`);
     }
     return null;
   }
@@ -8074,8 +8205,11 @@ async function main() {
     try {
       const kinds = (Array.isArray(mediaList) ? mediaList : []).map((m) => String(m?.kind ?? '?'));
       if (kinds.length > 0) {
+        const stickerNames = (Array.isArray(mediaList) ? mediaList : [])
+          .filter((m) => m?.kind === 'mface' || m?.kind === 'sticker')
+          .map((m) => String(m.summary ?? '').slice(0, 20) || '(无名)');
         log(`[media] 收到 ${kinds.length} 个媒体：${kinds.join(',')}`
-          + (kinds.includes('mface') ? `（表情包名：${(Array.isArray(mediaList) ? mediaList : []).filter((m) => m?.kind === 'mface').map((m) => String(m.summary ?? '').slice(0, 20) || '(无名)').join(' / ')}）` : ''));
+          + (stickerNames.length ? `（表情包名：${stickerNames.join(' / ')}）` : ''));
       }
     } catch (error) {
       log(`[media] 诊断日志异常（已忽略）：${error?.message ?? error}`);
@@ -8092,35 +8226,46 @@ async function main() {
       if (!media || typeof media !== 'object') continue;
       if (media.kind === 'face') {
         const face = await fetchFaceMedia(media);
-        if (face.buffer) {
-          if (totalBytes + face.buffer.length > MAX_MEDIA_BYTES) {
+        const prep = face.buffer ? await toModelMedia(face.buffer, face.mimeType, `表情#${media.faceId ?? index}`) : null;
+        if (prep?.ok) {
+          if (totalBytes + prep.buffer.length > MAX_MEDIA_BYTES) {
             parts.push({ type: 'text', text: `[表情${index}（图片总大小超限，已跳过）]` });
             continue;
           }
-          totalBytes += face.buffer.length;
+          totalBytes += prep.buffer.length;
           if (face.text) parts.push({ type: 'text', text: face.text });
-          parts.push({ type: 'image', mediaType: face.mimeType || 'image/png', data: face.buffer.toString('base64'), name: `face-${media.faceId}.${(face.mimeType || 'png').split('/')[1]}` });
+          if (prep.note) parts.push({ type: 'text', text: `（${prep.note}）` });
+          parts.push({ type: 'image', mediaType: prep.mimeType, data: prep.buffer.toString('base64'), name: `face-${media.faceId}.${(prep.mimeType || 'png').split('/')[1]}` });
+        } else if (prep && !prep.ok) {
+          // 压不到可用体积：明确说明原因，别让模型对着「获取失败」瞎猜。
+          parts.push({ type: 'text', text: `[表情${index}（${prep.error}）]` });
         } else {
           parts.push({ type: 'text', text: face.text || `[表情#${media.faceId}]` });
         }
       } else {
-        // mface 的 summary 已经是「[表情包:名字]」格式，先剥壳再用，别套成双层
+        // 表情包的 summary 已经是「[表情包:名字]」格式，先剥壳再用，别套成双层。
+        // kind 现在统一叫 'sticker'，老的 'mface' 也一并认（有历史消息/存档里的旧值）。
+        const isSticker = media.kind === 'sticker' || media.kind === 'mface';
         const rawSummary = String(media.summary ?? '')
           .replace(/^\[表情包[:：]?/, '')
           .replace(/\]$/, '')
           .trim();
-        const label = media.kind === 'mface'
+        const label = isSticker
           ? (rawSummary ? `[表情包:${rawSummary}]` : '[表情包]')
           : `[图片${index}]`;
         const img = await fetchOneBotImage(media);
-        if (img?.buffer) {
-          if (totalBytes + img.buffer.length > MAX_MEDIA_BYTES) {
+        const prep = img?.buffer ? await toModelMedia(img.buffer, img.mimeType, label) : null;
+        if (prep?.ok) {
+          if (totalBytes + prep.buffer.length > MAX_MEDIA_BYTES) {
             parts.push({ type: 'text', text: `${label}（图片总大小超限，已跳过）` });
             continue;
           }
-          totalBytes += img.buffer.length;
+          totalBytes += prep.buffer.length;
           parts.push({ type: 'text', text: label });
-          parts.push({ type: 'image', mediaType: img.mimeType || 'image/jpeg', data: img.buffer.toString('base64'), name: `qq-image-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}` });
+          if (prep.note) parts.push({ type: 'text', text: `（${prep.note}）` });
+          parts.push({ type: 'image', mediaType: prep.mimeType, data: prep.buffer.toString('base64'), name: `qq-image-${index}.${(prep.mimeType || 'image/jpeg').split('/')[1]}` });
+        } else if (prep && !prep.ok) {
+          parts.push({ type: 'text', text: `${label}（${prep.error}）` });
         } else {
           parts.push({ type: 'text', text: `${label}（图片取不到，只看到名字）` });
         }
@@ -8136,48 +8281,66 @@ async function main() {
     for (const media of Array.isArray(mediaList) ? mediaList : []) {
       index += 1;
       if (index > MAX_MEDIA_COUNT) {
-        out.push({ index, kind: media?.kind === 'face' ? 'face' : 'image', text: `（超过单条上限 ${MAX_MEDIA_COUNT}，已跳过）` });
+        out.push({ index, kind: media?.kind === 'face' ? 'face' : (media?.kind === 'sticker' || media?.kind === 'mface' ? 'sticker' : 'image'), text: `（超过单条上限 ${MAX_MEDIA_COUNT}，已跳过）` });
         continue;
       }
       if (!media || typeof media !== 'object') continue;
       if (media.kind === 'face') {
         const face = await fetchFaceMedia(media);
-        if (face.buffer) {
-          if (totalBytes + face.buffer.length > MAX_MEDIA_BYTES) {
+        const prep = face.buffer ? await toModelMedia(face.buffer, face.mimeType, `表情#${media.faceId ?? index}`) : null;
+        if (prep?.ok) {
+          if (totalBytes + prep.buffer.length > MAX_MEDIA_BYTES) {
             out.push({ index, kind: 'face', faceId: media.faceId ? String(media.faceId) : undefined, text: '（图片总大小超限，已跳过）' });
             continue;
           }
-          totalBytes += face.buffer.length;
+          totalBytes += prep.buffer.length;
           out.push({
             index,
             kind: 'face',
             faceId: media.faceId ? String(media.faceId) : undefined,
-            mimeType: face.mimeType || 'image/png',
-            data: face.buffer.toString('base64'),
-            text: face.text || ''
+            mimeType: prep.mimeType,
+            data: prep.buffer.toString('base64'),
+            text: [face.text || '', prep.note ? `（${prep.note}）` : ''].filter(Boolean).join(' ')
           });
+        } else if (prep && !prep.ok) {
+          out.push({ index, kind: 'face', faceId: media.faceId ? String(media.faceId) : undefined, text: `（获取失败：${prep.error}）` });
         } else {
           out.push({ index, kind: 'face', faceId: media.faceId ? String(media.faceId) : undefined, text: face.text || `[表情#${media.faceId}]` });
         }
       } else {
+        // MARKER: sticker-fields-out
+        // 表情包必须把 kind/emojiId/summary/subType 一并交出去：
+        // 只给 data 的话，MCP 侧（qq_get_message_images）与日志都分不清
+        // 「这是群友发的梗图表情」还是「一张普通照片」，也就没法告诉模型那张图叫什么。
+        const kind = (media.kind === 'sticker' || media.kind === 'mface') ? 'sticker' : 'image';
+        const noun = kind === 'sticker' ? '表情' : '图片';
+        const base = {
+          index,
+          kind,
+          ...(media.file ? { file: String(media.file) } : {}),
+          ...(media.url ? { url: String(media.url) } : {}),
+          ...(media.emojiId ? { emojiId: String(media.emojiId) } : {}),
+          ...(media.summary ? { summary: String(media.summary) } : {}),
+          ...(media.subType ? { subType: String(media.subType) } : {})
+        };
         const img = await fetchOneBotImage(media);
-        if (img?.buffer) {
-          if (totalBytes + img.buffer.length > MAX_MEDIA_BYTES) {
-            out.push({ index, kind: 'image', file: media.file ? String(media.file) : undefined, url: media.url ? String(media.url) : undefined, text: '（图片总大小超限，已跳过）' });
+        const prep = img?.buffer ? await toModelMedia(img.buffer, img.mimeType, `${noun}${index}`) : null;
+        if (prep?.ok) {
+          if (totalBytes + prep.buffer.length > MAX_MEDIA_BYTES) {
+            out.push({ ...base, text: `（${noun}总大小超限，已跳过）` });
             continue;
           }
-          totalBytes += img.buffer.length;
+          totalBytes += prep.buffer.length;
           out.push({
-            index,
-            kind: 'image',
-            file: media.file ? String(media.file) : undefined,
-            url: media.url ? String(media.url) : undefined,
-            mimeType: img.mimeType || 'image/jpeg',
-            data: img.buffer.toString('base64'),
-            text: ''
+            ...base,
+            mimeType: prep.mimeType,
+            data: prep.buffer.toString('base64'),
+            text: prep.note ? `（${prep.note}）` : ''
           });
+        } else if (prep && !prep.ok) {
+          out.push({ ...base, text: `（${noun}获取失败：${prep.error}）` });
         } else {
-          out.push({ index, kind: 'image', file: media.file ? String(media.file) : undefined, url: media.url ? String(media.url) : undefined, text: '（图片获取失败）' });
+          out.push({ ...base, text: `（${noun}获取失败）` });
         }
       }
     }
