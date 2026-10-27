@@ -1030,6 +1030,9 @@ function loadConfig() {
         // 不写 = 跟全局一致；写了就是「主人至少这么多」，只升不降。
         // ownerMaxSends: 20,
         // ownerMaxMs: 1200000
+        // 好友私聊（非主人）的每轮条数放宽（见 friend-turn-budget）。
+        // 同样只升不降；不写 = 跟全局一致。
+        // privateMaxSends: 8,
       },
       feedback: {
         maxLength: 500,
@@ -3630,6 +3633,14 @@ async function main() {
       maxSends = Math.max(maxSends, pick(b.ownerMaxSends, maxSends));
       maxMs = Math.max(maxMs, pick(b.ownerMaxMs, maxMs));
     }
+    // MARKER: friend-turn-budget —— 好友私聊（非主人）也放宽每轮条数。
+    // 需求（2026-10-27）：主人在私聊里还是老撞 5 条，好友同样。全局 5 条是按群里防刷屏定的，
+    // 一对一聊天里纯属误伤 —— 私聊没有"刷屏打扰一屋子人"的问题。
+    // 与群覆盖方向相反（Math.max），语义同样是「至少这么多条」，只升不降。
+    // 只放宽条数，不动 maxMs：私聊没必要跟着变长，那是另一件事。
+    if (keyStr.startsWith('private:') && keyStr !== ownerKey) {
+      maxSends = Math.max(maxSends, pick(b.privateMaxSends, maxSends));
+    }
     return { maxSteps: pick(b.maxSteps, 40), maxMs, maxSends };
   }
   function turnBudgetFor(sessionId) {
@@ -3851,6 +3862,16 @@ async function main() {
     if (!restored) return;
     collectors.set(sessionId, collector);
     log(`重连后恢复了进行中的回合（${sessionId}，turn ${[...open].join(',')}）`);
+    // MARKER: turn-context-restore —— 恢复回合的同时要把「当前回合上下文」登记回去。
+    // 起因（2026-10-27 16:52:58 实测）：重启后 session-c603df85（private:1124721191）的回合被
+    // 上面这段恢复了，但 __qqTurnContexts 是空的 —— 那个还在跑的回合去调生图工具，被
+    // imageAllowedNow 判成「没有回合上下文」直接拒掉。回复保住了，额度丢了。
+    // 修法：用 sessionId→key 的反查表把 ctx 补回来；已经有 ctx 的不覆盖（运行中的重连别打架）。
+    const convKey = reverse.get(sessionId);
+    if (convKey && !activeTurnCtx(convKey)) {
+      setActiveTurnCtx({ key: convKey, reason: 'resume', at: Date.now() });
+      log(`重连后恢复了回合上下文（${convKey} <- ${sessionId}）`);
+    }
   }
 
   // 唤醒“防卡死”租约：正常应在 turn/end 时删除 pendingWakeKeys；若 DSH 接受了但一直没回合结束，

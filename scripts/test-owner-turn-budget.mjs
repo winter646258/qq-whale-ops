@@ -103,6 +103,29 @@ console.log('场景6 垃圾配置不炸（字符串 / 负数 / 0 / null）');
   }
 }
 
+console.log('场景7 privateMaxSends: 8 —— 好友私聊放宽，主人/群各按各的');
+{
+  const cfg = cfgWith({ ...base, ownerMaxSends: 20, privateMaxSends: 8 });
+  check('好友私聊 → 8', () => assert.equal(resolve(cfg, FRIEND).maxSends, 8));
+  check('主人 → 20（不被好友档位盖回去）', () => assert.equal(resolve(cfg, OWNER).maxSends, 20));
+  check('群收紧覆盖仍然生效 → 3', () => assert.equal(resolve(cfg, GROUP_TIGHT).maxSends, 3));
+  check('普通群仍是 5（私聊放宽不外溢到群）', () => assert.equal(resolve(cfg, GROUP_PLAIN).maxSends, 5));
+  check('好友 maxMs 不动 → 600000', () => assert.equal(resolve(cfg, FRIEND).maxMs, 600000));
+}
+
+console.log('场景8 privateMaxSends 比全局小：不降');
+{
+  const cfg = cfgWith({ ...base, maxSends: 12, privateMaxSends: 3 });
+  check('好友 → 12（不是 3）', () => assert.equal(resolve(cfg, FRIEND).maxSends, 12));
+}
+
+console.log('场景9 没配 ownerQQ 时 privateMaxSends 照样对所有私聊生效');
+{
+  const cfg = { socialV2: { turnBudget: { ...base, privateMaxSends: 8 } } };
+  check('私聊 → 8', () => assert.equal(resolve(cfg, FRIEND).maxSends, 8));
+  check('群 → 5', () => assert.equal(resolve(cfg, GROUP_PLAIN).maxSends, 5));
+}
+
 if (failed) {
   console.log(`\n❌ ${failed} 项失败`);
   process.exit(1);
