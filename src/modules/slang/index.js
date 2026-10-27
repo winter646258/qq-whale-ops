@@ -321,7 +321,9 @@ async function updateConfig({ sendJson, readBody }) {
     merged.extractCooldownMs = Math.max(0, Math.round(Number(merged.extractCooldownMs) || 0));
   }
   if (merged.injectMax !== undefined) {
-    merged.injectMax = Math.min(30, Math.max(1, Math.round(Number(merged.injectMax) || 1)));
+    // MARKER: slang-limit-200 —— 库里已确认条目会持续增长，30 条的天花板
+    // 会让「本群优先」后的中低频群梗永远进不来（实测「杂鱼」排第 44）。
+    merged.injectMax = Math.min(200, Math.max(1, Math.round(Number(merged.injectMax) || 1)));
   }
   if (merged.autoResearch !== undefined) merged.autoResearch = merged.autoResearch === true;
   if (merged.learnerPreset !== undefined) merged.learnerPreset = String(merged.learnerPreset ?? '').trim();
@@ -394,19 +396,35 @@ async function aiQuery({ req, url, sendJson }) {
   if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
   const ctx = this.ctx;
   if (rejectAi({ ctx, req, sendJson, key, tool: 'slangQuery', what: 'qq_slang_query' })) return;
-  const list = ctx.slangHelpers.confirmedList().filter((e) => {
-    if (!q) return true;
-    return e.content.toLowerCase().includes(q)
-      || e.meaning.toLowerCase().includes(q)
-      || e.usage.toLowerCase().includes(q)
-      || e.example.toLowerCase().includes(q);
-  });
+  // MARKER: slang-query-fullsearch —— 2026-10-26
+  // 实测问题：原来先 confirmedList()（已经按 injectMax 截断成 8 条）再按 q 过滤，
+  // 等于「只在这 8 条里搜」。她查「杂鱼」（全库第 44 位，count=4）永远是 0 条命中，
+  // 体感就是「群里讲的黑话一直没学到」。改成先全库过滤、再按次数排序截断。
+  const h = ctx.slangHelpers;
+  const byCount = (a, b) => (Number(b.count) || 0) - (Number(a.count) || 0);
+  const allConfirmed = (h.entries() || []).filter(
+    (e) => e.status === h.SLANG_STATUS.CONFIRMED && e.content && e.meaning
+  );
+  const picked = q
+    ? allConfirmed
+      .filter((e) => (
+        String(e.content ?? '').toLowerCase().includes(q)
+        || String(e.meaning ?? '').toLowerCase().includes(q)
+        || String(e.usage ?? '').toLowerCase().includes(q)
+        || String(e.example ?? '').toLowerCase().includes(q)
+      ))
+      .sort(byCount)
+      .slice(0, 50)
+    : allConfirmed
+      .sort(byCount)
+      .slice(0, Math.max(1, Math.min(200, Number(ctx.cfg.slang?.injectMax) || 8)));
+  const list = picked.map((e) => h.publicEntry(e));
   sendJson({
     ok: true,
     key,
     total: list.length,
     entries: list,
-    block: ctx.slangHelpers.buildContext(ctx.slangHelpers.entries(), ctx.cfg.slang?.injectMax ?? 8)
+    block: ctx.slangHelpers.buildContext(ctx.slangHelpers.entries(), ctx.cfg.slang?.injectMax ?? 8, key)
   });
 }
 

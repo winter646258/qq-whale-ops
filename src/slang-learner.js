@@ -74,9 +74,54 @@ export function normalizeSlangEntry(raw) {
         : ev))
       : [],
     lastInferenceCount: Math.max(0, Number(entry.lastInferenceCount) || 0),
+    // MARKER: slang-auto-promote —— 自动晋升的时间戳。
+    // 有它且 status 又变回 candidate，说明是**人工降下来**的，晋升逻辑不再碰它。
+    promotedAt: String(entry.promotedAt || ''),
     createdAt: String(entry.createdAt || nowIso()),
     updatedAt: String(entry.updatedAt || nowIso()),
   };
+}
+
+/**
+ * MARKER: slang-auto-promote —— 2026-10-26
+ *
+ * 补一个从第一天就缺失的环节：**没有任何代码把词条标成 CONFIRMED**。
+ *
+ * 实测（2026-10-26）：库内 2000 条、342 条有释义、CONFIRMED 0 条；而
+ * `buildSlangContext` 只认 CONFIRMED，所以黑话表**一次都没进过提示词**。
+ * 旧的研究分支只在 `r.confirmed === true` 时写 meaning 字段，从不改 status，
+ * 于是「模型说这词是真的」被存进了释义，却永远卡在 candidate 注入不了。
+ * 4.4 万行日志里 `【群聊黑话表】` 出现 0 次，就是这个洞的证据。
+ *
+ * 两件事一起做才能闭环：
+ *   ① 研究时模型判 confirmed:true → 直接升 CONFIRMED（见 src/bridge.js 研究分支）
+ *   ② 模型判 false 但给了释义的通用词 → 留在 candidate 攒次数，够格后自动晋升
+ *
+ * 晋升条件（三条同时满足）：状态是 candidate、有释义、出现次数 >= minCount。
+ * 之所以卡 minCount：注入位只有 injectMax 个（默认 8），得让真在群里流通的词先上。
+ *
+ * 人工否决走 REJECTED（晋升只碰 candidate）；人工把已晋升的改回 candidate 时，
+ * promotedAt 还在，本条不再被自动晋升 —— 否则主人刚降下去就被下一轮 save 顶回来。
+ *
+ * @returns {{promoted: number, contents: string[]}} 原地修改 entries，同时返回摘要
+ */
+export function promoteSlangEntries(entries, { minCount = 3 } = {}) {
+  const list = Array.isArray(entries) ? entries : [];
+  const floor = Math.max(1, Number(minCount) || 3);
+  const promoted = [];
+  const now = nowIso();
+  for (const e of list) {
+    if (!e || e.status !== SLANG_STATUS.CANDIDATE) continue;
+    if (!String(e.meaning ?? '').trim()) continue;
+    if ((Number(e.count) || 0) < floor) continue;
+    // 已经被自动晋升过、后来又变回 candidate 的：是人工降的，不要再顶上去。
+    if (String(e.promotedAt ?? '').trim()) continue;
+    e.status = SLANG_STATUS.CONFIRMED;
+    e.promotedAt = now;
+    e.updatedAt = now;
+    promoted.push(String(e.content ?? ''));
+  }
+  return { promoted: promoted.length, contents: promoted };
 }
 
 /**
@@ -225,13 +270,37 @@ export function mergeEvidence(current, incoming) {
   return merged.slice(-20);
 }
 
-export function buildSlangContext(entries, max = 8) {
+// MARKER: slang-per-key —— 2026-10-26
+// 实测问题：全局按 count 排序时，group:906710082 一家占了 116/120 条已确认词条，
+// 其他群自己的梗（如 group:201188739 的「杂鱼」count=4、排全局第 44）永远挤不进
+// injectMax 个注入位 —— 那个群天天在说的词，她一次都没见过。
+// 改成：给了 key 就先把「evidence 里出现过这个会话」的词挑出来排在前面，
+// 再用全局高频补满剩余名额；没给 key 时行为与以前完全一致。
+export function buildSlangContext(entries, max = 8, key = '') {
+  const limit = Math.max(1, Math.min(200, Number(max) || 8));
   const confirmed = (entries || [])
-    .filter((e) => e.status === SLANG_STATUS.CONFIRMED && e.content && e.meaning)
-    .sort((a, b) => (b.count || 0) - (a.count || 0))
-    .slice(0, Math.max(1, Math.min(30, Number(max) || 8)));
+    .filter((e) => e.status === SLANG_STATUS.CONFIRMED && e.content && e.meaning);
   if (!confirmed.length) return '';
-  const lines = confirmed.map((e) => {
+  const byCount = (a, b) => (b.count || 0) - (a.count || 0);
+  const sessionKey = String(key || '').trim();
+  let ordered;
+  if (sessionKey) {
+    const mine = [];
+    const rest = [];
+    for (const e of confirmed) {
+      const evs = Array.isArray(e.evidence) ? e.evidence : [];
+      const inThis = evs.some((ev) => ev && String(ev.key ?? '') === sessionKey);
+      (inThis ? mine : rest).push(e);
+    }
+    mine.sort(byCount);
+    rest.sort(byCount);
+    ordered = mine.concat(rest);
+  } else {
+    ordered = confirmed.sort(byCount);
+  }
+  const confirmedList = ordered.slice(0, limit);
+  if (!confirmedList.length) return '';
+  const lines = confirmedList.map((e) => {
     const clean = (s) => escapeLearnerText(String(s ?? '').replace(/\[CQ:/gi, '[CQ：'));
     let line = `- ${clean(e.content)}：${clean(e.meaning)}`;
     if (e.usage) line += `（用法：${clean(e.usage)}）`;

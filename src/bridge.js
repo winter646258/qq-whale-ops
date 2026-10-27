@@ -51,6 +51,7 @@ import {
   parseResearchJson,
   createSlangEntry,
   mergeEvidence,
+  promoteSlangEntries,
   SLANG_STATUS,
   SLANG_MAX_ENTRIES
 } from './slang-learner.js';
@@ -1624,7 +1625,7 @@ async function main() {
       invalidateLearnerSession: () => invalidateSlangLearnerSession(),
       // 阶段25：AI 工具面（原 if 链里的 slang/query、slang/submit）
       confirmedList: () => confirmedSlangListV2(),
-      buildContext: (entries, max) => buildSlangContext(entries, max),
+      buildContext: (entries, max, key) => buildSlangContext(entries, max, key),
       allowSubmit: (key) => allowSlangSubmit(key),
       publicEntry: (e) => publicSlangEntry(e),
       mergeEvidence: (oldList, addList) => mergeEvidence(oldList, addList),
@@ -2551,6 +2552,18 @@ async function main() {
       return;
     }
     try {
+      // MARKER: slang-auto-promote —— 每次落盘前先跑一遍自动晋升：
+      // candidate + 有释义 + 出现≥3 次 → CONFIRMED（进注入表）。
+      // 放在 save 之前而不是加载之后：新提取的词也能当轮就参与判断。
+      try {
+        const promo = promoteSlangEntries(slangEntries);
+        if (promo.promoted > 0) {
+          log(`黑话库自动晋升 ${promo.promoted} 条 → 可进黑话表：${promo.contents.slice(0, 6).join('/')}`
+            + (promo.contents.length > 6 ? '…' : ''));
+        }
+      } catch (promoError) {
+        log('黑话自动晋升失败（已忽略，不影响落盘）:', promoError?.message ?? promoError);
+      }
       const result = saveSlang(SLANG_FILE, slangEntries);
       if (result?.dropped > 0) {
         slangEntries = result.entries;
@@ -3252,8 +3265,18 @@ async function main() {
         if (Array.isArray(r.sources) && r.sources.length) entry.sources = r.sources.map((s) => String(s ?? '').trim()).filter(Boolean).slice(0, 10);
         entry.lastInferenceCount = entry.count;
         entry.updatedAt = new Date().toISOString();
+        // MARKER: slang-promote-on-confirm —— 2026-10-26
+        // 旧代码在这里只写 meaning，从不改 status。实测后果：模型这半天判了
+        // 约 248 次 confirmed:true，释义全存进去了，status 却一直是 candidate，
+        // 而 buildSlangContext 只认 CONFIRMED —— 学到的东西一次都没进过提示词。
+        // 模型明确说「这词是真的」时，状态必须跟上，否则研究白花钱。
+        if (r.confirmed === true) {
+          entry.status = SLANG_STATUS.CONFIRMED;
+          entry.promotedAt = new Date().toISOString();
+        }
         written += 1;
-        if (r.confirmed !== true) log(`黑话研究：${r.content} 通用词入库（不标已确认，不占注入位）`);
+        if (r.confirmed !== true) log(`黑话研究：${r.content} 通用词入库（留候选，攒够次数自动晋升）`);
+        else log(`黑话研究：${r.content} 已确认，进黑话表`);
       }
       saveSlangStore();
       log(`黑话研究：模型返回 ${results.length} 条，写入 ${written} 条，拉黑 ${rejected} 条`
@@ -3351,7 +3374,9 @@ async function main() {
 
   // 已确认黑话的公开列表（按出现次数排序，最多 injectMax 条）。
   function confirmedSlangListV2() {
-    const max = Math.max(1, Math.min(30, Number(cfg.slang?.injectMax) || 8));
+    // MARKER: slang-limit-200 —— 与 slang-learner.js 的 buildSlangContext 同步放开。
+    // 控制台写配置时也允许到 200（modules/slang/index.js 同改）。
+    const max = Math.max(1, Math.min(200, Number(cfg.slang?.injectMax) || 8));
     return slangEntries
       .filter((e) => e.status === SLANG_STATUS.CONFIRMED && e.content && e.meaning)
       .sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0))
@@ -3359,12 +3384,12 @@ async function main() {
       .map(publicSlangEntry);
   }
 
-  function withSlangContext(promptText) {
+  function withSlangContext(promptText, key = '') {
     const now = new Date();
     const timeLine = `【当前时间】${now.toLocaleString('zh-CN', { hour12: false })}（${Intl.DateTimeFormat().resolvedOptions().timeZone}）`;
     const parts = [timeLine];
     if (cfg.slang?.enabled !== false) {
-      const block = buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8);
+      const block = buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8, key);
       if (block) parts.push(block);
     }
     return parts.join('\n\n') + '\n\n' + promptText;
@@ -5010,7 +5035,7 @@ async function main() {
       buildStickerStrategyHint: () => buildStickerStrategyHint(),
       confirmedSlangList: () => confirmedSlangListV2(),
       slangEntries: () => slangEntries,
-      buildSlangContext: (entries, max) => buildSlangContext(entries, max),
+      buildSlangContext: (entries, max, key) => buildSlangContext(entries, max, key),
       voiceLibrary: () => voiceLibrary(),
       voiceCfg: () => voiceCfg(),
       // —— 映射表（reset 时逐个清） ——
@@ -9628,7 +9653,7 @@ async function main() {
         log(`[vision] 唤醒内联代看异常（已忽略）：${error?.message ?? error}`);
       }
     }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
+    let content = [{ type: 'text', text: withSlangContext(promptText, key) }];
     if (Array.isArray(opts.media) && opts.media.length > 0) {
       const imageParts = await resolveMediaList(opts.media);
       // MARKER: vision-bridge-2
@@ -9638,7 +9663,7 @@ async function main() {
       // （does not support image input），整条消息被拒 —— 她的表现就是「根本没看见图」。
       // handleIncoming 那条路早已接上，这条路漏了，这才是实测「测了还是没有」的真因。
       const bridged2 = await transcodeImagesForTextModel(imageParts);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...bridged2];
+      content = [{ type: 'text', text: withSlangContext(promptText, key) }, ...bridged2];
     }
     // 媒体解析成功后再标记退场，避免解析异常时残留退场标记。
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
@@ -12122,14 +12147,14 @@ async function main() {
       }
       throw error;
     }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
+    let content = [{ type: 'text', text: withSlangContext(promptText, key) }];
     if (Array.isArray(mediaList) && mediaList.length > 0) {
       const imageParts = await resolveMediaList(mediaList);
       // MARKER: vision-bridge
       // 当前模型不吃图就把图说成文字再投 —— 否则整条消息会被
       // session/attachment-invalid（does not support image input）拒绝，她一个字都收不到。
       const bridged = await transcodeImagesForTextModel(imageParts);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...bridged];
+      content = [{ type: 'text', text: withSlangContext(promptText, key) }, ...bridged];
     }
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
     const accepted = await api.sessions.prompt({
