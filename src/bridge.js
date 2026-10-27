@@ -11957,6 +11957,51 @@ async function main() {
       return;
     }
 
+    // MARKER: status-cmd-admin
+    // `#sl` 原本由 SnowLuma 网关自带（谁发都回，会泄漏版本号/运行时长给群友）。
+    // 2026-10-27 起网关侧 socialV2 以外的地方关掉（onebot_<uin>.json 的
+    // statusCommand.enabled=false），改由桥接接管：只有管理员能用，群友发就当没看见。
+    if (String(plainContent ?? '').trim().toLowerCase() === '#sl') {
+      if (!isOwner) {
+        appendActivity(`${key}（群友状态命令已忽略）${event.user_id}：${plainContent.slice(0, 40)}`);
+        return;
+      }
+      try {
+        const [vs, st] = await Promise.all([
+          bot.raw('get_version_info').catch(() => null),
+          bot.raw('get_status').catch(() => null)
+        ]);
+        const ver = String(vs?.data?.app_version ?? vs?.app_version ?? '').replace(/-node$/, '');
+        const online = st?.data?.online ?? st?.online;
+        const good = st?.data?.good ?? st?.good;
+        const sec = Number(st?.data?.time ?? st?.time ?? 0);
+        const fmtUp = (ms) => {
+          const t = Math.max(0, Math.floor(ms / 1000));
+          const d = Math.floor(t / 86400);
+          const h = Math.floor((t % 86400) / 3600);
+          const mi = Math.floor((t % 3600) / 60);
+          const s = t % 60;
+          if (d > 0) return `${d}天 ${h}小时 ${mi}分钟`;
+          if (h > 0) return `${h}小时 ${mi}分钟`;
+          if (mi > 0) return `${mi}分钟 ${s}秒`;
+          return `${s}秒`;
+        };
+        const rows = [
+          'SnowLuma 状态',
+          `版本: ${ver || '未知'}`,
+          '平台: linux-x64',
+          `运行时长: ${sec > 0 ? fmtUp(sec * 1000) : '未知'}`,
+          `账号: ${online ? '在线' : '离线'}${good === false ? '（链路异常）' : ''}`,
+          `桥接: 已运行 ${fmtUp(Math.floor(process.uptime() * 1000))}`
+        ];
+        await sendToQQ(key, rows.join('\n'));
+      } catch (error) {
+        log(`[status-cmd] 读取网关状态失败：${error?.message ?? error}`);
+        await sendToQQ(key, `读取状态失败：${error?.message ?? error}`);
+      }
+      return;
+    }
+
     // 管理命令：仅管理员（ownerQQ）可用，且由桥接直接执行（硬性，不经过模型）
     if (plainContent.startsWith('/')) {
       if (!isOwner) {
