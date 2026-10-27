@@ -1862,25 +1862,36 @@ async function main() {
     if (!force && stickerSyncedAt && now - stickerSyncedAt < ttl) {
       return { entries: stickerEntries, syncedAt: stickerSyncedAt, fromCache: true };
     }
+    const count = Math.min(500, Math.max(1, Number(cfg.socialV2?.sticker?.maxListCount) || 100));
+    // MARKER: sticker-http-fallback
+    // 先把一次同步的「合并 + 落盘」收成一个函数，WS 与 HTTP 两条路共用，
+    // 避免两份逻辑漂移（曾经就是因为只有一份 WS 路径，WS 一抖表情库就时有时无）。
+    const applyFetched = (fetched, via) => {
+      // 只有拿到合法数组才允许合并；data 缺失/异常时不能拿空数组清空本地 QQ 表情库。
+      if (!Array.isArray(fetched)) {
+        throw new Error(`fetch_custom_face_detail(${via}) 返回 data 不是数组，已放弃同步`);
+      }
+      stickerEntries = mergeStickerLibrary(stickerEntries, fetched, { complete: fetched.length < count });
+      stickerSyncedAt = Date.now();
+      saveStickerStoreSafe();
+      log(`[sticker] 已同步 QQ 收藏表情 ${fetched.length} 个（本地库 ${stickerEntries.length} 条，通道 ${via}）`);
+      return { entries: stickerEntries, syncedAt: stickerSyncedAt, fromCache: false, via };
+    };
     try {
-      const count = Math.min(500, Math.max(1, Number(cfg.socialV2?.sticker?.maxListCount) || 100));
       const response = await bot.request('fetch_custom_face_detail', { count });
       if (!response || response.status !== 'ok' || response.retcode !== 0) {
         throw new Error(`fetch_custom_face_detail 失败: ${response?.wording || response?.retcode || 'unknown'}`);
       }
-      // 只有拿到合法数组才允许合并；data 缺失/异常时不能拿空数组清空本地 QQ 表情库。
-      if (!Array.isArray(response.data)) {
-        throw new Error('fetch_custom_face_detail 返回 data 不是数组，已放弃同步');
+      return applyFetched(response.data, 'ws');
+    } catch (wsError) {
+      // WS 挂了（重连窗口）不该让表情库整个空掉 —— 同一个网关的 HTTP 口通常还活着。
+      try {
+        const data = await onebotHttpAction('fetch_custom_face_detail', { count });
+        return applyFetched(data, 'http');
+      } catch (httpError) {
+        log(`[sticker] 同步收藏表情失败（WS: ${wsError?.message ?? wsError}；HTTP: ${httpError?.message ?? httpError}）`);
+        return null;
       }
-      const fetched = response.data;
-      stickerEntries = mergeStickerLibrary(stickerEntries, fetched, { complete: fetched.length < count });
-      stickerSyncedAt = Date.now();
-      saveStickerStoreSafe();
-      log(`[sticker] 已同步 QQ 收藏表情 ${fetched.length} 个（本地库 ${stickerEntries.length} 条）`);
-      return { entries: stickerEntries, syncedAt: stickerSyncedAt, fromCache: false };
-    } catch (error) {
-      log(`[sticker] 同步收藏表情失败: ${error?.message ?? error}`);
-      return null;
     }
   }
 
@@ -3858,6 +3869,7 @@ async function main() {
     modeAllowed: (key, kind, id, config, mode) => modeAllowed(key, kind, id, config, mode),
     redactKnownTokensOnly: (value) => redactKnownTokensOnly(value),
     bot: () => bot,
+    onebotHttpAction: (action, params) => onebotHttpAction(action, params),
     SENSITIVE_RE,
     escapeCqText: (value) => escapeCqText(value),
   });
@@ -7838,6 +7850,34 @@ async function main() {
 
   // images：本地图片绝对路径数组。为空时行为与旧版完全一致（只发文本）。
   // 存在的理由见 /api/socialV2/image 的 generate 分支 —— 生图工具只回路径，必须由这里发出去。
+  // MARKER: onebot-http-action
+  // WS action 的 HTTP 兜底。为什么需要：WS 重连窗口里 bot.request 必抛
+  // 「SnowLuma WebSocket closed before opening」，而同一个网关的 HTTP 口一直可用
+  // （onebotSend / fetch_ptt_text 早就这么走了）。实测 fetch_custom_face_detail
+  // 33 次同步里 16 次失败（约 48%），全是 WS closed —— 表现就是"收藏表情时有时无"。
+  async function onebotHttpAction(action, params = {}) {
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    let res;
+    try {
+      res = await fetch(`${httpUrl}/${action}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+        },
+        body: JSON.stringify(params),
+        signal: AbortSignal.timeout(15000)
+      });
+    } catch (error) {
+      throw new Error(`OneBot HTTP ${action} 连接失败: ${error?.message ?? error}`);
+    }
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+      throw new Error(`OneBot HTTP ${action} 失败: ${body.wording || body.retcode || res.status}`);
+    }
+    return body.data;
+  }
+
   async function onebotSend(kind, id, message, replyToMessageId, atUserId = null, images = []) {
     const segments = [];
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
