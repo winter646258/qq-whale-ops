@@ -6,27 +6,50 @@
 //   每一跳重定向重新校验，响应体按字节流限量读取。
 // - 查询词做基础清洗：去 CQ 码、控制字符、超长截断。
 //
-// ── v0.3 改了什么，以及为什么 ────────────────────────────────────────────
+// ── v0.4 合并了什么，以及为什么 ──────────────────────────────────────────
 //
-// 1）只有 Bing，而且不提供引擎选项。
-//    实测云上到 duckduckgo / google / searx / api.duckduckgo 全部不可达（HTTP 000），
-//    只有 cn.bing.com 是 200 且 0.2s。给一个「选引擎」的参数只会让她选了也白选。
+// 两边的实现各有各的好，合并而不是二选一：
 //
-// 2）描述不再写「仅用于理解网络用语/梗/黑话的含义」。
-//    那是老版本的自我设限，后果是：这个工具上线至今被调用 0 次
-//    （grep web_search /var/log/qqbridge.log = 0）。工具本身是好的 —— 实测同一段
-//    解析逻辑能从 Bing 稳定拿到 10 条带标题/URL/摘要的结果，是说明书把它关起来了。
+// 1）搜索主干改用 **DSH 同一路 DeepSeek 联网搜索**（src/web-search.js）。
+//    远程版这么做的理由是对的：结果更准，而且不把群里的词原样发给搜索引擎广告网络。
+//    凭据链 config → 环境变量 → DSH 的 .credentials.yaml，实测服务器上走第三条能通
+//    （2026-10-27 实测：4.6s 返回 8 条结果）。DeepSeek 不可用时自动回退 Bing。
 //
-// 3）新增 count / freshness / site。
-//    时效过滤用的是 Bing 的一组魔数（filters=ex1:"ez1" 这类），含义别去猜，
-//    照抄即可 —— 实测 ex1:"ez1" 返回 200 且 10 条结果。
+// 2）保留本地版的 count / freshness / site 三个参数。
+//    DeepSeek 的服务端搜索工具不支持这三个，但本地 Bing 版支持 —— 特别是 freshness
+//    用的那组魔数（filters=ex1:"ez1" 这类）实测可用，问「最近」「今天」时缺它就废了。
+//    所以：给了 site 或 freshness 就直接走 Bing（只有它能表达这两个条件），
+//    否则走 DeepSeek 优先路径。
 //
-// 4）web_fetch 返回剥干净的正文，不再是 HTML 原文。
+// 3）web_fetch 保留本地版的正文提取（stripToText）。
 //    一个 100KB 的页面里经常 80KB 是 script/style，对模型是纯噪声、还烧 token。
+//
+// 4）搜索词上限本地 200 字符 / 远程 120。取后者更长的那个：中文查询按字符算，
+//    120 有时不够描述一个具体的梗。
+import path from 'node:path';
 import { safeFetch } from './safe-fetch.js';
+import { webSearch } from './web-search.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+
+/**
+ * 项目根目录（用于读 config.json 的 webSearch 段）。
+ *
+ * 不能用 `import.meta.url`：离线测试会把本文件塞进 vm 上下文执行（那里没有 import.meta，
+ * 直接是语法错误）。DSH 以 `node <本文件绝对路径>` 启动 MCP，所以 argv[1] 就是本文件；
+ * 取它的上一级 `src/` 的父目录即可。取不到时退回 cwd（测试环境正好从仓库根运行）。
+ */
+function projectRoot() {
+  try {
+    const entry = String(process.argv[1] ?? '');
+    if (entry) {
+      const dir = path.dirname(path.resolve(entry));
+      if (path.basename(dir) === 'src') return path.dirname(dir);
+    }
+  } catch {}
+  return process.cwd();
+}
 
 function sanitizeQuery(query) {
   return String(query ?? '')
@@ -86,41 +109,42 @@ const FRESHNESS = Object.freeze({
   year: 'ex1:"ez4"',
 });
 
-async function bingSearch(query, { count = 8, freshness, site } = {}) {
-  const url = new URL('https://cn.bing.com/search');
-  url.searchParams.set('q', site ? `site:${site} ${query}` : query);
-  if (freshness && FRESHNESS[freshness]) url.searchParams.set('filters', FRESHNESS[freshness]);
-  // 搜索页比普通网页肥得多，给 512K 字符的额度；正文解析只取前 20 条。
-  const res = await safeFetch(url.toString(), 512000);
-  if (res.statusCode < 200 || res.statusCode >= 300) throw new Error(`搜索服务 HTTP ${res.statusCode}`);
-  const html = res.body;
+/**
+ * 统一搜索入口。
+ *
+ * 不再自己抓 Bing HTML —— 那份解析原本和 `web-search.js` 里的是两份实现，
+ * Bing 一改版就只能修一处，另一处静默返回空（看起来像「搜不到」）。
+ * 现在 site / freshness 已下沉到 `web-search.js` 的统一搜索里。
+ */
+async function search(query, { count, freshness, site } = {}) {
   const limit = Math.min(Math.max(1, Number(count) || 8), 20);
-  const results = [];
-  const blocks = html.split('<li class="b_algo"').slice(1);
-  for (const block of blocks) {
-    const hrefMatch = block.match(/<a[^>]+href="(https?:\/\/[^"]+)"/i);
-    if (!hrefMatch) continue;
-    const urlStr = decodeHtml(hrefMatch[1]);
-    const titleMatch = block.match(/<h2[^>]*>([\s\S]*?)<\/h2>/i);
-    const title = titleMatch ? decodeHtml(titleMatch[1]) : '';
-    const snippetMatch = block.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
-    const snippet = snippetMatch ? decodeHtml(snippetMatch[1]) : '';
-    if (urlStr && title) results.push({ title, url: urlStr, snippet });
-    if (results.length >= limit) break;
-  }
-  return { query, engine: 'bing', count: results.length, results };
+  // site / freshness 只有 Bing 能表达，直接指定 provider，不做无谓的 DeepSeek 尝试。
+  // 注意：条数走 config.maxResults，不是顶层 count —— webSearch 只读 config。
+  const result = await webSearch(query, {
+    provider: site || freshness ? 'bing' : undefined,
+    config: { maxResults: limit },
+    ...(site ? { site } : {}),
+    ...(freshness ? { freshness } : {}),
+    root: projectRoot()
+  });
+  const results = Array.isArray(result?.results) ? result.results.slice(0, limit) : [];
+  return {
+    ...result,
+    results,
+    ...(results.length ? {} : { note: result?.note || '没有搜到结果（可以直接说搜不到，或换个说法再试一次）' })
+  };
 }
 
-const server = new McpServer({ name: 'web-search-safe', version: '0.3.0' });
+const server = new McpServer({ name: 'web-search-safe', version: '0.4.0' });
 
 server.tool(
   'web_search',
-  '上网搜索。想知道什么都没问题：实事、新闻、天气、人物、作品、概念、价格、教程、某句话的出处。返回若干条标题 + 链接 + 摘要；摘要不够就挑一条用 web_fetch 打开细看。搜索是有延迟的，别用连续搜索代替思考。',
+  '上网搜索。想知道什么都没问题：实事、新闻、天气、人物、作品、概念、价格、教程、某句话的出处。优先走 DeepSeek 联网搜索（结果更准、不把查询词发给搜索引擎广告网络），不可用时自动回退 Bing。返回若干条标题 + 链接 + 摘要；摘要不够就挑一条用 web_fetch 打开细看。搜索是有延迟的，别用连续搜索代替思考。',
   {
     query: z.string().describe('搜索词，正常写字就行（和你在搜索框里打的一样）'),
     count: z.number().optional().describe('要几条结果，1~20，默认 8'),
-    freshness: z.enum(['day', 'week', 'month', 'year']).optional().describe('只要最近这段时间的：day/week/month/year。问「最近」「今天」这类时效问题时就带上'),
-    site: z.string().optional().describe('只在某个站里搜，填域名，例：zhihu.com、github.com、bilibili.com'),
+    freshness: z.enum(['day', 'week', 'month', 'year']).optional().describe('只要最近这段时间的：day/week/month/year。问「最近」「今天」这类时效问题时就带上（此时走 Bing）'),
+    site: z.string().optional().describe('只在某个站里搜，填域名，例：zhihu.com、github.com、bilibili.com（此时走 Bing）'),
   },
   async ({ query, count, freshness, site }) => {
     const clean = sanitizeQuery(query);
@@ -128,7 +152,7 @@ server.tool(
       return { content: [{ type: 'text', text: '搜索词为空，已拒绝。' }], isError: true };
     }
     try {
-      const result = await bingSearch(clean, { count, freshness, site: sanitizeQuery(site) });
+      const result = await search(clean, { count, freshness, site: sanitizeQuery(site) });
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     } catch (error) {
       return {
