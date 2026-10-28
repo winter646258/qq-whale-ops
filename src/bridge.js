@@ -3825,7 +3825,21 @@ async function main() {
     const known = Object.entries(st.memberImpressions || {})
       .map(([who, v]) => ({ who, text: String((Array.isArray(v?.traits) ? v.traits.slice(-1)[0] : '') ?? '') }))
       .filter((x) => x.text);
-    const promptText = buildSettlePrompt({ key, isGroup: String(key).startsWith('group:'), lines, impressions: known });
+    // MARKER: settle-portrait
+    // 把她的自述也递给结算：要判断「对某人的看法有没有真的变」，得先知道以前怎么看。
+    let selfViewText = '';
+    try {
+      selfViewText = String(formatPortraitForPrompt(portraitStore()) || '');
+    } catch (error) {
+      log(`[settle] 自述读取失败：${error?.message ?? error}`);
+    }
+    const promptText = buildSettlePrompt({
+      key,
+      isGroup: String(key).startsWith('group:'),
+      lines,
+      impressions: known,
+      selfView: selfViewText
+    });
 
     settleRunning = true;
     let settleDone = false;
@@ -3891,12 +3905,28 @@ async function main() {
           const who = resolveImpressionWho({ key, impressions: st.memberImpressions || {}, who: item.who });
           if (who && applyMemberImpression(st, who, item.text)) wroteImp += 1;
         }
+        // MARKER: settle-portrait-write
+        // 自述走 portrait-store 的 addPortrait：它自己会校验 facet、限条数、查重。
+        // 一条写不进去就跳过这一条，别让自述的问题拖垮整轮结算。
+        let wroteSelf = 0;
+        for (const item of plan.portraits) {
+          try {
+            const store = portraitStore();
+            addPortrait(store, { subject: item.subject, facet: item.facet, text: item.text });
+            savePortraitSafe(store, '画像');
+            wroteSelf += 1;
+          } catch (error) {
+            log(`[settle] 自述写入失败（${item.subject}/${item.facet}）：${error?.message ?? error}`);
+          }
+        }
         settleDone = true;
         st.lastSettleAt = Date.now();
-        if (wroteMood || wroteImp) saveSocialV2State();
+        if (wroteMood || wroteImp || wroteSelf) saveSocialV2State();
         const moodNote = wroteMood ? `「${plan.mood.label}」` : '无变化';
         const skipNote = plan.skippedImpressions ? `（${plan.skippedImpressions} 条超限没写）` : '';
-        log(`[settle] ${key} 结算完成：情绪${moodNote}，印象 ${wroteImp} 条${skipNote}`);
+        const selfNote = wroteSelf ? `，自述 ${wroteSelf} 条` : '';
+        const skipSelfNote = plan.skippedPortraits ? `（${plan.skippedPortraits} 条自述超限没写）` : '';
+        log(`[settle] ${key} 结算完成：情绪${moodNote}，印象 ${wroteImp} 条${skipNote}${selfNote}${skipSelfNote}`);
         return;
       }
     } catch (error) {

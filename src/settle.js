@@ -28,6 +28,8 @@ export const SETTLE_DEFAULTS = Object.freeze({
   maxChars: 6000,
   // 一次最多写几条印象（写多了会把 40 字/人的标签墙冲垮）。
   maxImpressions: 3,
+  // 一次最多写几条自述（portrait）。自述是「长期看法」，宁少不滥。
+  maxPortraits: 2,
   timeoutMs: 120000,
   preset: ''
 });
@@ -53,6 +55,7 @@ export function settleCfg(cfg = {}) {
     maxMessages: num(raw.maxMessages, d.maxMessages, { min: 4, max: 400 }),
     maxChars: num(raw.maxChars, d.maxChars, { min: 500, max: 40000 }),
     maxImpressions: num(raw.maxImpressions, d.maxImpressions, { min: 0, max: 10 }),
+    maxPortraits: num(raw.maxPortraits, d.maxPortraits, { min: 0, max: 6 }),
     timeoutMs: num(raw.timeoutMs, d.timeoutMs, { min: 15000, max: 600000 }),
     preset: typeof raw.preset === 'string' ? raw.preset.trim() : d.preset
   };
@@ -116,7 +119,7 @@ export function shouldSettle({ key = '', st = null, now = Date.now(), cfg = {} }
 }
 
 /** 拼结算提示词：只要严格 JSON，只依据给到的原文，宁可空着也不许编。 */
-export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impressions = [] } = {}) {
+export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impressions = [], selfView = '' } = {}) {
   const known = Array.isArray(impressions)
     ? impressions.filter((x) => x && x.who && String(x.text || '').trim()).slice(0, 12)
     : [];
@@ -129,6 +132,11 @@ export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impre
     ? known.map((x) => `· ${x.who}：${x.text}`).join('\n')
     : '（还没有）';
 
+  // 她的自述（portrait）：结算要知道「以前怎么看这个人」，才判断得出「有没有真的变」。
+  // 传进来的是 formatPortraitForPrompt() 的成品文本，这里不关心 store 的结构。
+  const selfText = String(selfView ?? '').replace(/\r/g, '').trim().slice(0, 2000);
+  const selfBlock = selfText || '（还没有自述）';
+
   return [
     '你是一个只做总结的旁白，不是聊天的人。你在读一段对话原文，把「她的状态变化」和',
     '「她对某个人新认识到的东西」提取成结构化数据。',
@@ -140,20 +148,30 @@ export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impre
     '   要具体（做了什么、在意什么、什么脾气），不要「人很好」「很健谈」这种空话。',
     '4. 「她已经记得的人」里有的那个人，who 必须原样抄那个名字，',
     '   不许改写成 QQ 号、手机号、或者「私聊xxx」这种别的称呼。',
-    '5. 只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余的话。',
+    '5. 自述（portrait）是长期看法，不是这一轮的情绪。只有真的改变了对某个人、',
+    '   或对自己的看法时才写一条；日常寒暄、客套、一次性的玩笑一律不写。',
+    '   facet 只能是 doing / view / bond：doing＝她在做什么、处于什么处境；',
+    '   view＝她对这件事或这个人的看法；bond＝这个人和她是什么关系。',
+    '   没有真正变化就写 "portrait": []。',
+    '6. 只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余的话。',
     '',
     '输出格式：',
-    '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}]}',
+    '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}],"portrait":[{"subject":"说谁","facet":"doing","text":"六十字以内的长期看法"}]}',
     '',
     '字段说明：',
     '· mood.pleasure / arousal / dominance 取值 -1 到 1，0 表示平静；',
     '· mood.label 是她情绪的短标签（不超过十个字，如「有点心虚」「挺高兴」）；',
     '· mood.reason 是一句话原因（不超过四十个字）；',
     '· 没有情绪变化时写 "mood": null；没有新印象时写 "impressions": []。',
+    '· portrait 最多两条；subject 写名字，指她自己时写「我」；text 不超过六十字；',
+    '· 自述写的是「她从此记住的事」，不是「这一轮发生了什么」，别把对话复述一遍。',
     '',
     `对话场景：${isGroup ? '群聊' : '私聊'}（${key}）`,
     `她已经记得的人：`,
     knownBlock,
+    '',
+    `她现在的自述（长期看法，只有真的变了才改）：`,
+    selfBlock,
     '',
     '最近这段原文（「我」是她，其余是对方）：',
     said || '（空）',
@@ -211,7 +229,23 @@ export function parseSettleJSON(text) {
     impressions.push({ who, text });
   }
 
-  return { ok: true, value: { mood, impressions } };
+  // 自述（portrait）：facet 白名单 + 长度上限 + 同人同 facet 去重。
+  const FACETS = ['doing', 'view', 'bond'];
+  const portraits = [];
+  const rawPortrait = Array.isArray(parsed.portrait) ? parsed.portrait : [];
+  for (const item of rawPortrait) {
+    if (!item || typeof item !== 'object') continue;
+    const subject = String(item.subject ?? '').replace(/\s+/g, ' ').trim().slice(0, 20);
+    const facet = String(item.facet ?? '').trim().toLowerCase();
+    const text = String(item.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
+    if (!subject || !text) continue;
+    if (!FACETS.includes(facet)) continue;
+    if (['__proto__', 'constructor', 'prototype'].includes(subject)) continue;
+    if (portraits.some((x) => x.subject === subject && x.facet === facet)) continue;
+    portraits.push({ subject, facet, text });
+  }
+
+  return { ok: true, value: { mood, impressions, portraits } };
 }
 
 /**
@@ -261,14 +295,21 @@ export function resolveImpressionWho({ key = '', impressions = null, who = '' } 
 }
 
 /** 写入计划：把解析结果裁成「最多写几条」，方便上层直接照做。 */
-export function planSettleWrites(parsed, { maxImpressions = SETTLE_DEFAULTS.maxImpressions } = {}) {
+export function planSettleWrites(
+  parsed,
+  { maxImpressions = SETTLE_DEFAULTS.maxImpressions, maxPortraits = SETTLE_DEFAULTS.maxPortraits } = {}
+) {
   const value = parsed && typeof parsed === 'object' ? parsed : {};
   const mood = value.mood && typeof value.mood === 'object' ? value.mood : null;
   const list = Array.isArray(value.impressions) ? value.impressions : [];
   const cap = num(maxImpressions, SETTLE_DEFAULTS.maxImpressions, { min: 0, max: 10 });
+  const selfList = Array.isArray(value.portraits) ? value.portraits : [];
+  const selfCap = num(maxPortraits, SETTLE_DEFAULTS.maxPortraits, { min: 0, max: 6 });
   return {
     mood,
     impressions: list.slice(0, cap),
-    skippedImpressions: Math.max(0, list.length - cap)
+    skippedImpressions: Math.max(0, list.length - cap),
+    portraits: selfList.slice(0, selfCap),
+    skippedPortraits: Math.max(0, selfList.length - selfCap)
   };
 }
