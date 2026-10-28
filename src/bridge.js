@@ -3052,6 +3052,91 @@ async function main() {
     throw new Error('视觉会话重建后仍然失败');
   }
 
+  // MARKER: image-see
+  // 看一张图：输入是「会话里的某条消息」或「一个 URL / 本地文件」，输出是中文描述。
+  // 为什么要有这个：她的 recentMessages 里图片只有「[图片]」四个字，
+  // 聊天记录往前翻全是黑框；她自己画的图更惨 —— 画完只拿到 jobId，从没见过成品。
+  async function describeMediaByRef(key, opts = {}) {
+    const k = String(key ?? '');
+    const st = socialV2.conversations.get(k);
+    const msgs = Array.isArray(st?.recentMessages) ? st.recentMessages : [];
+    let media = null;
+    let msg = null;
+    const url = String(opts.url ?? '').trim();
+    const file = String(opts.file ?? '').trim();
+    const ref = String(opts.messageRef ?? '').trim();
+    if (url || file) {
+      media = { kind: 'image', url: url || undefined, file: file || undefined };
+    } else {
+      // 没有显式给：取最近一条带图的消息；给了 messageRef 就按 messageId 找。
+      for (let i = msgs.length - 1; i >= 0; i -= 1) {
+        const m = msgs[i];
+        if (!m || !Array.isArray(m.media) || !m.media.length) continue;
+        if (ref && String(m.messageId || '') !== ref) continue;
+        msg = m;
+        media = m.media.find((x) => x && (x.kind === 'image' || x.kind === 'sticker' || x.kind === 'mface')) || m.media[0];
+        break;
+      }
+    }
+    if (!media) return { ok: false, why: '翻不到可看的图（这个会话最近没有带图的消息）' };
+    const cached = String(media.desc ?? '').trim();
+    if (cached && !opts.refresh) return { ok: true, text: cached, cached: true };
+    const got = await fetchOneBotImage(media);
+    if (!got?.buffer) return { ok: false, why: '取不到这张图的字节（可能已经过期）' };
+    const mimeType = String(media.mimeType || got.mimeType || 'image/png');
+    const text = await describeImage({
+      data: Buffer.from(got.buffer).toString('base64'),
+      mediaType: mimeType,
+      name: String(media.file || 'qq-image.png')
+    });
+    const clean = String(text ?? '').trim();
+    if (!clean) return { ok: false, why: '视觉模型返回空' };
+    media.desc = clean.slice(0, 400);
+    // 写回原文，让后面所有轮次都能看见（不是只这一次）
+    try {
+      if (msg) {
+        const label = `[图片] ${String(media.desc).slice(0, 80)}`;
+        if (/^\[图片\]$/.test(String(msg.plain ?? ''))) msg.plain = label;
+        if (/^\[图片\]$/.test(String(msg.text ?? ''))) msg.text = label;
+        saveSocialV2State();
+      }
+    } catch { /* 写回失败不影响这次回答 */ }
+    return { ok: true, text: clean };
+  }
+
+  // 描述一张本地文件（她自己画的图就走这里）。
+  async function describeLocalImageFile(filePath) {
+    const buf = await fs.promises.readFile(filePath);
+    const name = path.basename(String(filePath));
+    const mimeType = /\.jpe?g$/i.test(name) ? 'image/jpeg' : /\.webp$/i.test(name) ? 'image/webp' : 'image/png';
+    return describeImage({ data: buf.toString('base64'), mediaType: mimeType, name });
+  }
+
+  // 把她刚画的图回灌进她自己的会话：下一轮她「记得」自己画了什么、长什么样。
+  function noteSelfImage(key, desc, filePath) {
+    const k = String(key ?? '');
+    const st = socialV2.conversations.get(k);
+    if (!st) return false;
+    const text = `[我发了张图] ${String(desc ?? '').slice(0, 200)}`;
+    const item = {
+      sender: '我',
+      text,
+      plain: text,
+      isSelf: true,
+      isOwner: false,
+      media: [{ kind: 'image', file: path.basename(String(filePath ?? '')), desc: String(desc ?? '').slice(0, 400) }],
+      hasMedia: true,
+      messageId: '',
+      time: Date.now()
+    };
+    if (!Array.isArray(st.recentMessages)) st.recentMessages = [];
+    st.recentMessages.push(item);
+    const cap = Math.max(50, Number(cfg.social?.contextWindow ?? 15) * 2);
+    while (st.recentMessages.length > cap) st.recentMessages.shift();
+    try { saveSocialV2State(); } catch { /* 落盘失败不影响 */ }
+    return true;
+  }
+
   async function describeImage(part) {
     const data = String(part?.data ?? '');
     if (!data) throw new Error('图片数据为空');
@@ -5928,6 +6013,10 @@ async function main() {
       generateImageNow: (opts) => generateImageWithRetry(opts),
       // MARKER: selfie-helpers
       generateImageWithRef: (opts) => generateImageWithRef(opts),
+      // MARKER: image-see-helpers
+      describeMediaByRef: (key, opts) => describeMediaByRef(key, opts),
+      describeLocalImageFile: (p) => describeLocalImageFile(p),
+      noteSelfImage: (key, desc, p) => noteSelfImage(key, desc, p),
       selfieCfg: () => selfieCfg(cfg),
       selfieRefPath: () => selfieRefPath(),
       selfieQuotaCheck: () => selfieQuota({ todayCount: selfieCountToday(), cfg: selfieCfg(cfg) }),
@@ -10149,7 +10238,10 @@ async function main() {
     const recent = (Array.isArray(v2state?.recentMessages) && v2state.recentMessages.length)
       ? v2state.recentMessages
       : (social.recentMessages.get(key) ?? []);
-    const cutoff = Date.now() - 120000;
+    // MARKER: image-owner-window —— 原来是硬编码 120 秒。实测她一轮要跑 1~10 分钟，
+    // 「主人 @ 了我」这条事实在两分钟后自动失效，于是她画不出来还查不到原因。
+    // 现在按配置走，默认 10 分钟。
+    const cutoff = Date.now() - (Number(cfg.socialV2?.image?.ownerSpokeMs) || 600000);
     const ownerSpoke = recent.some((m) => m && m.isOwner && Number(m.time ?? 0) >= cutoff);
     const r = String(reason || '');
     let byMention = r === 'atMention' || r === 'nameMention' || r === 'question';
@@ -10157,7 +10249,7 @@ async function main() {
     // 于是紧跟着的真唤醒判不出 byMention。这里兜一层：主人三分钟内在群里说过话，
     // 就当作是被叫了（冒充挡不住 isOwner，冒充者也改不了 QQ 号）。
     if (!byMention) {
-      const limit = Date.now() - 180000;
+      const limit = Date.now() - (Number(cfg.socialV2?.image?.ownerSpokeMs) || 600000);
       byMention = recent.some((m) => m && m.isOwner && Number(m.time ?? 0) >= limit);
     }
     return ownerSpoke && byMention ? 'owner-group' : null;
@@ -10223,7 +10315,8 @@ async function main() {
         // 冒名改昵称过不了 isOwner）。理由：生图要 36~50 秒，她常常是
         // 「先回一句我去画，下一轮才调工具」，那时回合早已收工、宽限也过期了。
         // 私聊不放宽：私聊里主人随时能说话，没有「错过就永远画不了」的问题。
-        if (String(key).startsWith('group:') && imageSceneFor(key, '')) {
+        // put-through: 把回合真实的 reason 传下去，否则 atMention 永远判不出来（原来传的是空串）。
+        if (String(key).startsWith('group:') && imageSceneFor(key, String(ended.reason || ''))) {
           log(`[image] 群聊放行（${key}，回合已结束，但主人 120 秒内 @ 过）`);
           return { ok: true, scene: 'owner-group' };
         }
@@ -10308,7 +10401,11 @@ function recordGeneratedImage(entry) {
     prompt: String(entry?.prompt ?? '').slice(0, 200),
     size: String(entry?.size ?? ''),
     key: String(entry?.key ?? ''),
-    at: Number(entry?.at) > 0 ? Number(entry.at) : Date.now()
+    at: Number(entry?.at) > 0 ? Number(entry.at) : Date.now(),
+    kind: String(entry?.kind ?? 'generate'),
+    scene: String(entry?.scene ?? ''),
+    desc: String(entry?.desc ?? '').slice(0, 400),
+    day: localDayOf(Number(entry?.at) > 0 ? Number(entry.at) : Date.now())
   };
   if (!item.path) return null;
   const items = [item, ...readGeneratedImages().filter((x) => x.path !== item.path)].slice(0, GENERATED_IMAGES_KEEP);

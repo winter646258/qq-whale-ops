@@ -84,6 +84,27 @@ async function image({ req, url, sendJson, readBody }) {
       });
       return;
     }
+    // MARKER: image-see-action
+    // 看图：按最近的带图消息、或指定的 messageRef/url/file 现场识别一张。
+    if (action === 'see') {
+      if (typeof h.describeMediaByRef !== 'function') {
+        sendJson({ ok: false, error: '服务端没有看图能力（版本过旧）' }, 501);
+        return;
+      }
+      try {
+        const got = await h.describeMediaByRef(key, {
+          messageRef: body.messageRef,
+          url: body.url,
+          file: body.file,
+          refresh: body.refresh === true || body.refresh === 'true'
+        });
+        if (!got?.ok) { sendJson({ ok: false, error: got?.why || '看不到这张图' }, 200); return; }
+        sendJson({ ok: true, action, text: got.text, cached: !!got.cached });
+      } catch (error) {
+        sendJson({ ok: false, error: '看图失败：' + (error?.message ?? error) }, 500);
+      }
+      return;
+    }
     let permit = h.imageAllowedNow(key);
     // MARKER: image-report-only
     // 主人 2026-10-25 指令「开启画图模式，无需审批，只需要报备管理员」：
@@ -132,7 +153,7 @@ async function image({ req, url, sendJson, readBody }) {
     // 自拍/合照：提示词不让她写，由身份锁 + 场景拼（src/selfie.js），走带参考图的口子，人还是她。
     const isSelfie = action === 'selfie';
     if (action !== 'generate' && !isSelfie) {
-      sendJson({ ok: false, error: '不认识的 action：' + action + '（可用 generate / selfie / status / recent）' }, 400);
+      sendJson({ ok: false, error: '不认识的 action：' + action + '（可用 generate / selfie / see / status / recent）' }, 400);
       return;
     }
     let refPath = '';
@@ -236,6 +257,30 @@ async function image({ req, url, sendJson, readBody }) {
           }
         } catch (error) {
           log(`[reserved2] 记录生图产物失败（${key}）：${error?.message ?? error}`);
+        }
+        // MARKER: image-feedback
+        // 她自己得看过这张图：不描述一遍，她只会说「画好了」但完全不知道画面。
+        let artDesc = '';
+        try {
+          if (result?.path && typeof h.describeLocalImageFile === 'function') {
+            artDesc = await h.describeLocalImageFile(result.path);
+            log(`[image] 自己的图描述完成（${key}）：${String(artDesc).slice(0, 40)}`);
+          }
+        } catch (error) {
+          log(`[image] 描述自己的图失败（${key}）：${error?.message ?? error}`);
+        }
+        try {
+          if (result?.path && artDesc && typeof h.recordGeneratedImage === 'function') {
+            h.recordGeneratedImage({
+              path: result.path, prompt, size: body.size, key, at: Date.now(),
+              kind: isSelfie ? 'selfie' : 'generate', desc: artDesc
+            });
+          }
+          if (artDesc && typeof h.noteSelfImage === 'function') {
+            h.noteSelfImage(key, artDesc, result?.path);
+          }
+        } catch (error) {
+          log(`[image] 回灌自己的图失败（${key}）：${error?.message ?? error}`);
         }
         // 画完就发：工具只把 url/本地路径当文本回给模型，她自己看不到图，主人也收不到。
         // 不发等于白画一张，所以默认发。发送失败只记日志，生图结果照常报备。
