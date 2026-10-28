@@ -138,7 +138,9 @@ export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impre
     '2. 情绪是「她此刻的感觉」，不是你对她表现的评价；没有明显变化就写 null。',
     '3. 印象只写这一轮里**新出现或需要修正**的认识，一个人最多一条，四十字以内，',
     '   要具体（做了什么、在意什么、什么脾气），不要「人很好」「很健谈」这种空话。',
-    '4. 只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余的话。',
+    '4. 「她已经记得的人」里有的那个人，who 必须原样抄那个名字，',
+    '   不许改写成 QQ 号、手机号、或者「私聊xxx」这种别的称呼。',
+    '5. 只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余的话。',
     '',
     '输出格式：',
     '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}]}',
@@ -210,6 +212,52 @@ export function parseSettleJSON(text) {
   }
 
   return { ok: true, value: { mood, impressions } };
+}
+
+/**
+ * 把模型写的「who」归到已有的键上。
+ *
+ * 为什么需要（2026-10-28 实测）：模型会把 QQ 号当成名字写回来，
+ * 于是同一个人在同一份 memberImpressions 里分身成三条 ——
+ * `管理员`、`私聊 1124721191`、`1124721191`，每次结算各写一条，
+ * 谁的印象都不完整。
+ *
+ * 规则从严到宽，只做「显然同一个人」的归一，不猜人名：
+ *   1. 完全同名 → 原样用
+ *   2. who 里的数字命中某个已有键（或反过来）→ 用那个键
+ *      例："1124721191" → "私聊 1124721191"
+ *   3. who 是某个已有键的一部分（≥2 字）→ 用那个键
+ *      例："管理员" → "管理员 1124721191"
+ *   4. 私聊场景且只有一个已有键 → 归到它（私聊对面只有这一个人）
+ *   5. 其余当成新的人
+ */
+export function resolveImpressionWho({ key = '', impressions = null, who = '' } = {}) {
+  const raw = String(who ?? '').replace(/\s+/g, ' ').trim();
+  if (!raw) return '';
+  if (['__proto__', 'constructor', 'prototype'].includes(raw)) return '';
+  const entries = impressions && typeof impressions === 'object' ? impressions : {};
+  const keys = Object.keys(entries);
+  if (keys.length === 0) return raw;
+  if (Object.prototype.hasOwnProperty.call(entries, raw)) return raw;
+
+  const digits = (raw.match(/\d{5,12}/) || [])[0] || '';
+  if (digits) {
+    const hit = keys.find((k) => k.includes(digits));
+    if (hit) return hit;
+  }
+
+  if (raw.length >= 2) {
+    // 双向包含：模型可能给名字加后缀（"管理员大人"），也可能省掉后缀
+    // （"管理员" 对 "管理员 1124721191"）。取重叠最长的那个，越长越像同一个人。
+    const cands = keys.filter((k) => k.length >= 2 && (k.includes(raw) || raw.includes(k)));
+    if (cands.length) {
+      cands.sort((a, b) => b.length - a.length);
+      return cands[0];
+    }
+  }
+
+  if (String(key).startsWith('private:') && keys.length === 1) return keys[0];
+  return raw;
 }
 
 /** 写入计划：把解析结果裁成「最多写几条」，方便上层直接照做。 */

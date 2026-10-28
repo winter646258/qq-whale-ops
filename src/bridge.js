@@ -95,7 +95,8 @@ import { pacingCfg, skipDecision, urgeDelay } from './pacing.js';
 // 结算层：回合收工之后另起一个安静的小回合，把情绪和印象写回库里。纯逻辑在 settle.js。
 // MARKER: settle-import
 import {
-  buildSettlePrompt, parseSettleJSON, pickSettleMessages, planSettleWrites, settleCfg, shouldSettle
+  buildSettlePrompt,
+  resolveImpressionWho, parseSettleJSON, pickSettleMessages, planSettleWrites, settleCfg, shouldSettle
 } from './settle.js';
 // MARKER: shared-memory
 // 跨会话共享记忆：主人私聊能了解她在群里经历的重要事情，同时私聊专属内容
@@ -3869,7 +3870,9 @@ async function main() {
         }
         let wroteImp = 0;
         for (const item of plan.impressions) {
-          if (applyMemberImpression(st, item.who, item.text)) wroteImp += 1;
+          // 模型会把 QQ 号当名字写回来，先归到已有键，别让同一个人分身成三条。
+          const who = resolveImpressionWho({ key, impressions: st.memberImpressions || {}, who: item.who });
+          if (who && applyMemberImpression(st, who, item.text)) wroteImp += 1;
         }
         settleDone = true;
         st.lastSettleAt = Date.now();
