@@ -3831,7 +3831,22 @@ async function main() {
           log(`[settle] ${key} 提问失败：${why}`);
           return;
         }
-        const text = await handle.promise;
+        let text = '';
+        try {
+          text = await handle.promise;
+        } catch (turnError) {
+          // MARKER: settle-turn-retry
+          // 上游偶发 503（"Service temporarily unavailable"）或慢渠道超时：
+          // 同一份提示词隔 8 秒再问一次，别把整轮结算丢掉。
+          const why = turnError?.message ?? String(turnError);
+          try { handle.cancel?.(); } catch {}
+          if (attempt < 2) {
+            log(`[settle] ${key} 第 ${attempt} 次没问出来（${why}），8 秒后重试`);
+            await new Promise((r) => setTimeout(r, 8000));
+            continue;
+          }
+          throw new Error(`${why}（重试后仍失败）`);
+        }
         const parsed = parseSettleJSON(text);
         if (!parsed.ok) { log(`[settle] ${key} 解析失败：${parsed.error}`); return; }
         const plan = planSettleWrites(parsed.value, { maxImpressions: sc.maxImpressions });
