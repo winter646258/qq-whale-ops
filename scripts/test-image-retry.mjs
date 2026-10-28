@@ -39,7 +39,10 @@ ok('二次失败文案带「已重试一次」', src.includes('（已重试一�
 
 // ---------- 抠出包装层，放进沙箱 ----------
 const start = src.indexOf('// MARKER: image-retry-once');
-const end = src.indexOf('async function generateImageNow({ prompt, size }) {', start);
+// 抠到下一个 MARKER（生图产物登记）为止；没有就退回到 generateImageNow 定义处。
+// 用「下一个 MARKER」而不是固定函数名，免得以后再往这段中间插东西时把别的东西一起抠进来。
+const registryMarker = src.indexOf('// MARKER: image-registry', start);
+const end = registryMarker > start ? registryMarker : src.indexOf('async function generateImageNow({ prompt, size }) {', start);
 if (start < 0 || end < 0) {
   console.error('找不到包装层，测试无法继续');
   process.exit(1);
@@ -56,6 +59,13 @@ function harness(impl) {
     },
     log: (m) => logs.push(String(m)),
     generateImageNow: impl,
+    // 这一段现在还会捎带抠进生图产物登记（image-registry）的函数定义，
+    // 它在模块顶层就要 path.join / STATE_DIR 才能求值，所以沙箱里给上桩。
+    // 只求值、不被调用，桩不需要真的读写文件。
+    path: { join: (...parts) => parts.filter(Boolean).join('/'), basename: (p) => String(p ?? '').split('/').pop() },
+    fs: { readFileSync: () => { throw new Error('sandbox 不读文件'); }, writeFileSync: () => {} },
+    STATE_DIR: '/tmp/sandbox-state',
+    atomicWriteJson: () => {},
   };
   vm.createContext(sandbox);
   vm.runInContext(`${block}\n;__wrap = generateImageWithRetry;__desc = describeImageError;__re = IMAGE_RETRYABLE_RE;`, sandbox);

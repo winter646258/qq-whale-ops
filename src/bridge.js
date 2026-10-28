@@ -5483,6 +5483,8 @@ async function main() {
       persistImageApproval: (action, detail) => persistImageApproval(action, detail),
       commitApprovedImageApproval: (approval) => commitApprovedImageApproval(approval),
       generateImageNow: (opts) => generateImageWithRetry(opts),
+      recordGeneratedImage: (entry) => recordGeneratedImage(entry),
+      recentGeneratedImages: (limit) => recentGeneratedImages(limit),
       onebotSend: (kind, id, message, replyToMessageId, atUserId, images) =>
         onebotSend(kind, id, message, replyToMessageId, atUserId, images),
       throttleMs: () => IMAGE_THROTTLE_MS,
@@ -6861,6 +6863,21 @@ async function main() {
               if (!/^[A-Za-z0-9_-]{4,120}$/.test(tid)) { sendJson({ ok: false, error: 'tid 格式不对（用 action=list 拿到的 tid）' }, 400); return; }
               await qzoneCall('delete_qzone_msg', { tid });
               log(`[qzone] 删除说说 tid=${tid}`);
+              // 删了就要把本地账划掉，否则 qzone-post.json 里留着这条，冷却会一直说「刚发过」。
+              // 2026-10-28 咱自测那条删了两小时，本地账还在，把她卡了整整一小时的冷却。
+              try {
+                const psPath = path.join(STATE_DIR, 'qzone-post.json');
+                const psRaw = fs.readFileSync(psPath, 'utf8');
+                const psData = JSON.parse(psRaw);
+                const before = Array.isArray(psData?.posts) ? psData.posts : [];
+                const kept = before.filter((p) => String(p?.tid ?? '') !== tid);
+                if (kept.length !== before.length) {
+                  fs.writeFileSync(psPath, JSON.stringify({ posts: kept }, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+                  log(`[qzone] 已从本地账里划掉 tid=${tid}（剩 ${kept.length} 条）`);
+                }
+              } catch (error) {
+                log(`[qzone] 划账失败：${error?.message ?? error}`);
+              }
               sendJson({ ok: true, action: 'delete', tid });
               return;
             }
@@ -9632,7 +9649,48 @@ async function main() {
       }
     }
   }
-  async function generateImageNow({ prompt, size }) {
+  // MARKER: image-registry（2026-10-28）
+// 异步生图之后，工具只回 jobId —— 她拿不到路径，也就没法把刚画好的图拿去配说说或再转发
+// （线上实证：18:24 画完一张，18:25 配说说时只能翻出 10-26 的旧图）。
+// 所以每画成一张就在这里记一笔，配合 /api/socialV2/image 的 action:"recent" 还给她。
+const GENERATED_IMAGES_FILE = path.join(STATE_DIR, 'generated-images.json');
+const GENERATED_IMAGES_KEEP = 50;
+
+function readGeneratedImages() {
+  try {
+    const raw = fs.readFileSync(GENERATED_IMAGES_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    return Array.isArray(data?.items) ? data.items.filter((x) => x && typeof x.path === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function recordGeneratedImage(entry) {
+  const item = {
+    path: String(entry?.path ?? ''),
+    file: path.basename(String(entry?.path ?? '')),
+    prompt: String(entry?.prompt ?? '').slice(0, 200),
+    size: String(entry?.size ?? ''),
+    key: String(entry?.key ?? ''),
+    at: Number(entry?.at) > 0 ? Number(entry.at) : Date.now()
+  };
+  if (!item.path) return null;
+  const items = [item, ...readGeneratedImages().filter((x) => x.path !== item.path)].slice(0, GENERATED_IMAGES_KEEP);
+  try {
+    atomicWriteJson(GENERATED_IMAGES_FILE, { items });
+  } catch (error) {
+    log(`[image] 写生图登记失败：${error?.message ?? error}`);
+  }
+  return item;
+}
+
+function recentGeneratedImages(limit = 5) {
+  const n = Math.min(20, Math.max(1, Number(limit) || 5));
+  return readGeneratedImages().slice(0, n);
+}
+
+async function generateImageNow({ prompt, size }) {
     const imageCfg = cfg.socialV2?.image ?? {};
     const baseUrl = String(imageCfg.baseUrl || 'https://ai.windking.shop/v1').replace(/\/+$/, '');
     const model = String(imageCfg.model || 'gpt-image-2');

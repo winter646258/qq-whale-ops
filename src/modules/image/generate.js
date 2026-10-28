@@ -69,6 +69,21 @@ async function image({ req, url, sendJson, readBody }) {
       sendJson({ ok: false, error: 'qq_generate_image 已在配置里关闭' }, 403); return;
     }
 
+    if (action === 'recent') {
+      // 拿回最近画过的图：path 可以直接喂给 qq_qzone 的 images，或者自己再发一次。
+      // 放在额度判断之前 —— 额度用光了也不该妨碍她查自己画过什么。
+      const limit = Math.min(20, Math.max(1, Number(body.limit) || 5));
+      const items = typeof h.recentGeneratedImages === 'function' ? h.recentGeneratedImages(limit) : [];
+      sendJson({
+        ok: true,
+        action,
+        items,
+        note: items.length
+          ? 'path 是长期保留的本地路径，可以直接用作 qq_qzone 的 images，或再发一次。'
+          : '还没有画过图。'
+      });
+      return;
+    }
     let permit = h.imageAllowedNow(key);
     // MARKER: image-report-only
     // 主人 2026-10-25 指令「开启画图模式，无需审批，只需要报备管理员」：
@@ -114,7 +129,7 @@ async function image({ req, url, sendJson, readBody }) {
       return;
     }
     if (action !== 'generate') {
-      sendJson({ ok: false, error: '不认识的 action：' + action + '（可用 generate / status）' }, 400);
+      sendJson({ ok: false, error: '不认识的 action：' + action + '（可用 generate / status / recent）' }, 400);
       return;
     }
     const prompt = String(body.prompt ?? '').trim();
@@ -170,12 +185,21 @@ async function image({ req, url, sendJson, readBody }) {
       jobId,
       etaMs: Math.max(30000, Number(cfg.socialV2?.image?.timeoutMs) || 180000),
       note: '画着呢（通常 40~90 秒，最长 3 分钟）。画完会直接发到聊天里，这一轮不用等，也不要再调 qq_generate_image。'
+        + '想知道画到哪了或用它的路径配说说，稍后调 action:"recent"。'
     });
     // 后台跑：画 → 发 → 报备；失败就发一句话说明原因。
     void (async () => {
       let sent = false;
       try {
         const result = await h.generateImageNow({ prompt, size: body.size });
+        // 记一笔：异步之后工具只回 jobId，她拿不到路径（MARKER: image-registry）。
+        try {
+          if (result?.path && typeof h.recordGeneratedImage === 'function') {
+            h.recordGeneratedImage({ path: result.path, prompt, size: body.size, key, at: Date.now() });
+          }
+        } catch (error) {
+          log(`[reserved2] 记录生图产物失败（${key}）：${error?.message ?? error}`);
+        }
         // 画完就发：工具只把 url/本地路径当文本回给模型，她自己看不到图，主人也收不到。
         // 不发等于白画一张，所以默认发。发送失败只记日志，生图结果照常报备。
         try {

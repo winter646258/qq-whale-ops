@@ -1547,18 +1547,26 @@ server.tool(
     + '谁能画：① 主人私聊、或主人在群里 @ 你/叫你名字时，直接画；② 好友私聊里也能要，但**不会立刻画**——'
     + '服务端会返回 status="pending-approval" 和 approvalId，意思是已经把请求转给主人了，等主人点头才画，'
     + '画好会直接发到对方会话。收到 pending-approval 就如实告诉对方「我去问问」然后结束，别重试、别说「马上画」。'
-    + '③ 其他场景（群里别人喊你、陌生人私聊）服务端会拒绝，别硬试。',
+    + '③ 其他场景（群里别人喊你、陌生人私聊）服务端会拒绝，别硬试。\n'
+    + '**画完之后**：这个工具立刻回执（jobId），图由后台画好直接发到会话里，所以这一轮别等、别重复调。'
+    + '要拿刚画那张的本地路径（比如配说说、或再转发给别人），调 action:"recent" 取 items[0].path。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
     prompt: z.string().describe('画面描述：要什么、什么风格、什么构图'),
-    size: z.string().optional().describe('尺寸，默认 1024x1024')
+    size: z.string().optional().describe('尺寸，默认 1024x1024'),
+    action: z.enum(['generate', 'recent']).optional()
+      .describe('generate=画一张（默认）；recent=不画，只把最近画过的图列出来（含本地路径）'),
+    limit: z.number().optional().describe('action=recent 时列几条，默认 5，最多 20')
   },
-  async ({ key, token, prompt, size }) => {
+  async ({ key, token, prompt, size, action, limit }) => {
     try {
+      const act = action === 'recent' ? 'recent' : 'generate';
       const data = await agentApi('/api/socialV2/image', {
         method: 'POST',
-        body: JSON.stringify({ key, token, action: 'generate', prompt, size }),
+        body: JSON.stringify(act === 'recent'
+          ? { key, token, action: act, limit }
+          : { key, token, action: act, prompt, size }),
         headers: { 'x-agent-token': token },
         // 生图实测 35~50 秒；bridge 侧 AbortController 是 180 秒，这里必须对齐。
         // 用 agentApi 默认的 15000ms 会让工具先 abort，而她其实画完了、图稍后才发。
