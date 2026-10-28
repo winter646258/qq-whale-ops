@@ -138,6 +138,8 @@ import {
   parseTopicJSON,
   localDayOf as topicsDayOf
 } from './topics.js';
+// MARKER: selfie-import
+import { selfieCfg, buildSelfiePrompt, selfieQuota } from './selfie.js';
 // MARKER: shared-memory
 // 跨会话共享记忆：主人私聊能了解她在群里经历的重要事情，同时私聊专属内容
 // 不进群、群专属内容不自动进私聊。纯逻辑在 shared-memory-store.js，带单测。
@@ -5924,6 +5926,12 @@ async function main() {
       persistImageApproval: (action, detail) => persistImageApproval(action, detail),
       commitApprovedImageApproval: (approval) => commitApprovedImageApproval(approval),
       generateImageNow: (opts) => generateImageWithRetry(opts),
+      // MARKER: selfie-helpers
+      generateImageWithRef: (opts) => generateImageWithRef(opts),
+      selfieCfg: () => selfieCfg(cfg),
+      selfieRefPath: () => selfieRefPath(),
+      selfieQuotaCheck: () => selfieQuota({ todayCount: selfieCountToday(), cfg: selfieCfg(cfg) }),
+      buildSelfiePrompt: (opts) => buildSelfiePrompt({ ...(opts || {}), cfg: selfieCfg(cfg) }),
       recordGeneratedImage: (entry) => recordGeneratedImage(entry),
       recentGeneratedImages: (limit) => recentGeneratedImages(limit),
       onebotSend: (kind, id, message, replyToMessageId, atUserId, images) =>
@@ -10386,6 +10394,92 @@ function queueDiaryArt(key, entry, { artPrompt = '' } = {}) {
   })();
   return true;
 }
+
+  // MARKER: selfie-runtime
+  // 自拍/合照：走 /images/edits（multipart 带参考图）。
+  // 2026-10-28 探针：这条中转的 edits 口吃参考图，换场景后人物身份保得住；
+  // 纯文字生图每次都是另一个人，所以自拍必须有参考图。
+  function selfieRefPath() {
+    const img = cfg.socialV2?.image || {};
+    const configured = String(img.refSelf ?? '').trim();
+    if (configured) {
+      const abs = path.isAbsolute(configured) ? configured : path.join(STATE_DIR, configured);
+      try { if (fs.statSync(abs).isFile()) return abs; } catch {}
+    }
+    // 没有指定就退而求其次：最新的日记插画（那张就是她自己的样子），再不行用最新生图。
+    const pick = (dir) => {
+      try {
+        const names = fs.readdirSync(dir).filter((n) => /\.png$/i.test(n)).map((n) => path.join(dir, n));
+        names.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+        return names[0] ?? '';
+      } catch { return ''; }
+    };
+    try {
+      const artRoot = path.join(ROOT, 'diary', 'art');
+      const months = fs.readdirSync(artRoot).sort().reverse();
+      for (const m of months) {
+        const got = pick(path.join(artRoot, m));
+        if (got) return got;
+      }
+    } catch {}
+    return pick(path.join(STATE_DIR, 'images'));
+  }
+  function selfieCountToday() {
+    try {
+      const list = typeof readGeneratedImages === 'function' ? readGeneratedImages() : [];
+      const day = localDayOf(Date.now());
+      return list.filter((x) => x && x.kind === 'selfie' && String(x.day ?? '') === day).length;
+    } catch {
+      return 0;
+    }
+  }
+  async function generateImageWithRef({ prompt, refPath, size }) {
+    const imageCfg = cfg.socialV2?.image ?? {};
+    const baseUrl = String(imageCfg.baseUrl || 'https://ai.windking.shop/v1').replace(/\/+$/, '');
+    const model = String(imageCfg.model || 'gpt-image-2');
+    const apiKey = String(imageCfg.apiKey || '');
+    const budget = Math.max(30000, Number(imageCfg.timeoutMs) || 180000);
+    if (!refPath) throw new Error('自拍缺少参考图');
+    const form = new FormData();
+    form.append('model', model);
+    form.append('prompt', prompt);
+    if (size) form.append('size', size);
+    form.append('image', new Blob([fs.readFileSync(refPath)], { type: 'image/png' }), path.basename(refPath));
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), budget);
+    try {
+      const resp = await fetch(`${baseUrl}/images/edits`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${apiKey}` },
+        body: form,
+        signal: ac.signal,
+      });
+      const raw = await resp.text();
+      if (!resp.ok) throw new Error(`上游 ${resp.status}：${raw.slice(0, 300)}`);
+      let payload = null;
+      try { payload = JSON.parse(raw); } catch { throw new Error(`上游返回的不是 JSON：${raw.slice(0, 120)}`); }
+      const item = (Array.isArray(payload?.data) ? payload.data[0] : null) || {};
+      const dir = path.join(STATE_DIR, 'images');
+      fs.mkdirSync(dir, { recursive: true });
+      const outPath = path.join(dir, `img-${new Date().toISOString().replace(/[:.]/g, '-')}.png`);
+      if (item.b64_json) {
+        fs.writeFileSync(outPath, Buffer.from(String(item.b64_json), 'base64'));
+      } else if (item.url) {
+        const img = await fetch(String(item.url), { signal: ac.signal });
+        if (!img.ok) throw new Error(`图下载失败：上游 ${img.status}`);
+        fs.writeFileSync(outPath, Buffer.from(await img.arrayBuffer()));
+      } else {
+        throw new Error('上游没给图');
+      }
+      log(`[selfie] 出图 ${path.basename(outPath)}（参考图 ${path.basename(refPath)}，${model}）`);
+      return { url: String(item.url || ''), path: outPath, model, size: size || imageCfg.size || '1024x1024' };
+    } catch (error) {
+      if (error?.name === 'AbortError') throw new Error(`上游 ${Math.round(budget / 1000)} 秒没画完`);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
 async function generateImageNow({ prompt, size }) {
     const imageCfg = cfg.socialV2?.image ?? {};

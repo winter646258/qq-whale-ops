@@ -1551,24 +1551,35 @@ server.tool(
     + '画好会直接发到对方会话。收到 pending-approval 就如实告诉对方「我去问问」然后结束，别重试、别说「马上画」。'
     + '③ 其他场景（群里别人喊你、陌生人私聊）服务端会拒绝，别硬试。\n'
     + '**画完之后**：这个工具立刻回执（jobId），图由后台画好直接发到会话里，所以这一轮别等、别重复调。'
-    + '要拿刚画那张的本地路径（比如配说说、或再转发给别人），调 action:"recent" 取 items[0].path。',
+    + '要拿刚画那张的本地路径（比如配说说、或再转发给别人），调 action:"recent" 取 items[0].path。\n'
+    // MARKER: selfie-tool
+    + '**自拍/合照**用 action:"selfie"：这条不用写 prompt，只写 scene（在哪儿、在干什么，一句话）。'
+    + '服务端会拿「她自己那张参考图」重画，人还是她，只换场景；合照加 withPartner:true。'
+    + '不给他画正脸（只出现肩膀/手/背影）——画错一张脸比缺一张合照糟糕。一天最多 3 张。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
     prompt: z.string().describe('画面描述：要什么、什么风格、什么构图'),
     size: z.string().optional().describe('尺寸，默认 1024x1024'),
-    action: z.enum(['generate', 'recent']).optional()
-      .describe('generate=画一张（默认）；recent=不画，只把最近画过的图列出来（含本地路径）'),
-    limit: z.number().optional().describe('action=recent 时列几条，默认 5，最多 20')
+    action: z.enum(['generate', 'recent', 'selfie']).optional()
+      .describe('generate=画一张（默认）；selfie=用她自己的参考图出自拍/合照（写 scene 不用写 prompt）；recent=只列最近画过的图'),
+    limit: z.number().optional().describe('action=recent 时列几条，默认 5，最多 20'),
+    scene: z.string().optional().describe(
+      'action=selfie 时用：她此刻在哪儿、在干什么，一句话。可用预设词：家里/咖啡店/街上/海边/夜里'
+    ),
+    withPartner: z.boolean().optional().describe('action=selfie 时用：true=合照（他在画面里，但不画正脸）'),
+    style: z.enum(['photo', 'sketchbook']).optional().describe('action=selfie 时用：photo=手机生活照（默认）/ sketchbook=铅笔手绘')
   },
-  async ({ key, token, prompt, size, action, limit }) => {
+  async ({ key, token, prompt, size, action, limit, scene, withPartner, style }) => {
     try {
-      const act = action === 'recent' ? 'recent' : 'generate';
+      const act = action === 'recent' ? 'recent' : action === 'selfie' ? 'selfie' : 'generate';
       const data = await agentApi('/api/socialV2/image', {
         method: 'POST',
         body: JSON.stringify(act === 'recent'
           ? { key, token, action: act, limit }
-          : { key, token, action: act, prompt, size }),
+          : act === 'selfie'
+            ? { key, token, action: act, scene, withPartner, style, size }
+            : { key, token, action: act, prompt, size }),
         headers: { 'x-agent-token': token },
         // 生图实测 35~50 秒；bridge 侧 AbortController 是 180 秒，这里必须对齐。
         // 用 agentApi 默认的 15000ms 会让工具先 abort，而她其实画完了、图稍后才发。

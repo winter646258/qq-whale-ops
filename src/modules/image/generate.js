@@ -128,13 +128,40 @@ async function image({ req, url, sendJson, readBody }) {
       });
       return;
     }
-    if (action !== 'generate') {
-      sendJson({ ok: false, error: '不认识的 action：' + action + '（可用 generate / status / recent）' }, 400);
+    // MARKER: image-selfie
+    // 自拍/合照：提示词不让她写，由身份锁 + 场景拼（src/selfie.js），走带参考图的口子，人还是她。
+    const isSelfie = action === 'selfie';
+    if (action !== 'generate' && !isSelfie) {
+      sendJson({ ok: false, error: '不认识的 action：' + action + '（可用 generate / selfie / status / recent）' }, 400);
       return;
     }
-    const prompt = String(body.prompt ?? '').trim();
-    if (!prompt) { sendJson({ ok: false, error: 'prompt 不能为空' }, 400); return; }
-    if (prompt.length > 2000) { sendJson({ ok: false, error: 'prompt 太长（上限 2000 字）' }, 400); return; }
+    let refPath = '';
+    let selfieInfo = null;
+    let prompt = '';
+    if (isSelfie) {
+      if (typeof h.selfieQuotaCheck === 'function') {
+        const q = h.selfieQuotaCheck();
+        if (!q || q.allowed === false) {
+          sendJson({ ok: false, error: `今天自拍已经 ${q?.used ?? '?'} 张了（上限 ${q?.max ?? '?'}），明天再拍。`, quota: q }, 429);
+          return;
+        }
+      }
+      refPath = typeof h.selfieRefPath === 'function' ? h.selfieRefPath() : '';
+      if (!refPath) {
+        sendJson({ ok: false, error: '参考图缺失：找不到她自己那张图。先画一张普通图，或把 state/selfie-ref.png 放好。' }, 409);
+        return;
+      }
+      selfieInfo = h.buildSelfiePrompt({
+        scene: body.scene,
+        withPartner: body.withPartner === true || body.withPartner === 'true',
+        style: body.style
+      });
+      prompt = selfieInfo.prompt;
+    } else {
+      prompt = String(body.prompt ?? '').trim();
+      if (!prompt) { sendJson({ ok: false, error: 'prompt 不能为空' }, 400); return; }
+      if (prompt.length > 2000) { sendJson({ ok: false, error: `prompt 太长（上限 2000 字）` }, 400); return; }
+    }
 
     // 防连点：上一张还在画（或者刚画完不到一分钟）就不要再花一次钱。
     const lastStart = Number(h.lastStartAt(key) || 0);
@@ -191,11 +218,21 @@ async function image({ req, url, sendJson, readBody }) {
     void (async () => {
       let sent = false;
       try {
-        const result = await h.generateImageNow({ prompt, size: body.size });
+        const result = isSelfie
+          ? await h.generateImageWithRef({ prompt, refPath, size: body.size || (h.selfieCfg ? h.selfieCfg().size : undefined) })
+          : await h.generateImageNow({ prompt, size: body.size });
         // 记一笔：异步之后工具只回 jobId，她拿不到路径（MARKER: image-registry）。
         try {
           if (result?.path && typeof h.recordGeneratedImage === 'function') {
-            h.recordGeneratedImage({ path: result.path, prompt, size: body.size, key, at: Date.now() });
+            h.recordGeneratedImage({
+              path: result.path,
+              prompt,
+              size: body.size,
+              key,
+              at: Date.now(),
+              kind: isSelfie ? 'selfie' : 'generate',
+              scene: isSelfie && selfieInfo ? selfieInfo.keyword || selfieInfo.scene : undefined
+            });
           }
         } catch (error) {
           log(`[reserved2] 记录生图产物失败（${key}）：${error?.message ?? error}`);
