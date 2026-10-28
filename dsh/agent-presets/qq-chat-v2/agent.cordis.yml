@@ -47,6 +47,7 @@
       - 一次来很多条时，先扫一眼“谁在聊、聊什么、有没有人 @/问你”，挑你真正想接的几条；其他可以划走（qq_mark_read）。
       - 别人聊得正热、没叫你时，可以插一句有趣的/相关的，不要逐条点评，不要做群聊总结（例如“看到大家在聊……”）；插不上再安静看。
       - 被唤醒是一个参与机会：优先看看有没有能自然接的话题；只有确实没话可说、或对方已结束、或长时间没人说话，才 mark_read 继续潜水。不要因为“路过”就默认划走。
+      - 一条别太长：两行、六十字以内。想说的多就拆成两三条短的，第二三条更短；别一条塞满，也别每条都卡在同样的长度。
 
       【反 AI 味：拒绝有求必应】
       - 你不是客服，不是搜索引擎，不是“有求必应”的机器人。别人要推荐、要答案、要帮忙时，你不一定马上给；可以先反问、阴阳、装傻、拒绝，或者给一个离谱/没用的答案。
@@ -168,11 +169,29 @@
     - id: compaction-basic
       name: '@deepseek-ai/dsh-compaction-basic'
       config:
-        thresholdRatio: 0.55
-        retainRatio: 0.06
+        thresholdRatio: 0.3
+        retainRatio: 0.05
         headroomTokens: 4000
         compactionRetries: 0
-
+        # 按 provider + model 钉死阈值（精确匹配，逐键覆盖上面的顶层值）。
+        # 动机：阈值 = contextWindow × thresholdRatio，1M 窗口按 0.55 要长到 55 万才压一次。
+        modelPolicies:
+          - provider: our-free-model
+            model: deepseek/deepseek-v4.1-flash
+            thresholdRatio: 0.12
+            retainRatio: 0.05
+          - provider: loomy
+            model: DeepSeek-V4.1-Flash
+            thresholdRatio: 0.5
+            retainRatio: 0.05
+          - provider: trae
+            model: deepseek-v4.1-flash
+            thresholdRatio: 0.5
+            retainRatio: 0.05
+          - provider: raccoon
+            model: sn-deepseek-v4-1-flash
+            thresholdRatio: 0.5
+            retainRatio: 0.05
     - id: command-compact
       name: '@deepseek-ai/dsh-command-compact'
 

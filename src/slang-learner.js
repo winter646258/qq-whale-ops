@@ -43,6 +43,21 @@ export function createId() {
  * 超过就按「已确认 → 出现次数 → 最近更新」保留，剩下的按同样优先级丢弃。
  */
 export const SLANG_MAX_ENTRIES = 2000;
+
+// MARKER: slang-soft-cap
+// 硬顶 2000 的时候，库是「一直是满的」：每进一批就挤掉一批，
+// 挤掉的和进来的都可能是噪音（实测 2000 条里 1500 条是无释义的单次碎片，
+// 而首字提示词只吃 confirmed + 有释义的那几十条）。
+// 软上限压到 1200，让「有释义 / 有证据 / 出现过」的词留在库里，
+// 新词也有位置进来。硬顶仍是 2000，防的是配置写疯。
+export const SLANG_SOFT_CAP = 1200;
+
+/** 把配置里的 softCap 夹到 [200, SLANG_MAX_ENTRIES]，没配或写坏就用 1200。 */
+export function resolveSlangCap(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return SLANG_SOFT_CAP;
+  return Math.max(200, Math.min(SLANG_MAX_ENTRIES, Math.floor(n)));
+}
 const SLANG_FIELD_MAX = 300;
 const SLANG_CONTENT_MAX = 50;
 const EVIDENCE_TEXT_MAX = 80;

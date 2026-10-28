@@ -54,7 +54,8 @@ import {
   mergeEvidence,
   promoteSlangEntries,
   SLANG_STATUS,
-  SLANG_MAX_ENTRIES
+  SLANG_MAX_ENTRIES,
+  resolveSlangCap
 } from './slang-learner.js';
 import {
   loadStickerStore,
@@ -89,6 +90,7 @@ import {
   ventUndercurrent, resolveUndercurrent, setBaseline, moodStats, recordMoodSample, settleBaseline,
   MOOD_FILE as MOOD_STORE_FILE
 } from './mood-store.js';
+import { LEARNER_RETRY_NUDGE, learnerOutcome } from './learner-retry.js';
 // 节奏层：什么时候叫醒她、回复后跳几次、主动间隔。纯逻辑在 pacing.js，带单测。
 // MARKER: pacing-import
 import { pacingCfg, skipDecision, urgeDelay } from './pacing.js';
@@ -2648,10 +2650,12 @@ async function main() {
       } catch (promoError) {
         log('黑话自动晋升失败（已忽略，不影响落盘）:', promoError?.message ?? promoError);
       }
-      const result = saveSlang(SLANG_FILE, slangEntries);
+      // MARKER: slang-soft-cap-use —— 软上限（默认 1200，config.slang.softCap 可调）。
+      const cap = resolveSlangCap(cfg.slang?.softCap);
+      const result = saveSlang(SLANG_FILE, slangEntries, { max: cap });
       if (result?.dropped > 0) {
         slangEntries = result.entries;
-        log(`黑话库超过 ${SLANG_MAX_ENTRIES} 条上限，已按「已确认优先」丢弃 ${result.dropped} 条最不活跃的词条`);
+        log(`黑话库超过软上限 ${cap} 条，已按「已确认 > 有释义 > 证据 > 次数」丢掉 ${result.dropped} 条最弱的词条`);
       }
     } catch (error) { log('保存黑话库失败:', error?.message ?? error); }
   }
@@ -13343,16 +13347,45 @@ async function main() {
                   const waiters = learnerWaiters.get(frame.sessionId) ?? [];
                   const waiter = waiters.shift();
                   if (waiters.length === 0) learnerWaiters.delete(frame.sessionId);
-                  if (waiter) {
+                  // MARKER: learner-empty-retry
+                  // 「completed 但一个字都没输出」是这条学习通道最常见的失败形态
+                  // （模型把正文吞了、或上游提前收尾）。旧代码当彻底失败，
+                  // 视觉/黑话/结算三处一起漏。现在原地补一句、重试一次，仍空才算真失败。
+                  const outcome = learnerOutcome({
+                    kind: learnerEnded.reason.kind,
+                    text: learnerEnded.text,
+                    retried: waiter?.emptyRetried === true
+                  });
+                  let retriedNow = false;
+                  if (waiter && outcome.action === 'retry') {
+                    waiter.emptyRetried = true;
+                    retriedNow = true;
+                    learnerCollectors.set(frame.sessionId, createTurnCollector());
+                    const retryList = learnerWaiters.get(frame.sessionId) ?? [];
+                    retryList.unshift(waiter);
+                    learnerWaiters.set(frame.sessionId, retryList);
+                    log(`[learner] 学习会话空回复，补一句重试一次：${frame.sessionId}`);
+                    Promise.resolve()
+                      .then(() => api.sessions.prompt({
+                        sessionId: frame.sessionId,
+                        mode: 'queue',
+                        content: [{ type: 'text', text: LEARNER_RETRY_NUDGE }]
+                      }))
+                      .catch((retryError) => {
+                        const list = learnerWaiters.get(frame.sessionId) ?? [];
+                        const idx = list.findIndex((w) => w === waiter);
+                        if (idx >= 0) list.splice(idx, 1);
+                        if (list.length === 0) learnerWaiters.delete(frame.sessionId);
+                        clearTimeout(waiter.timer);
+                        waiter.reject(new Error(`学习会话重试失败：${retryError?.message ?? retryError}`));
+                      });
+                  } else if (waiter) {
                     clearTimeout(waiter.timer);
-                    if (learnerEnded.reason.kind === 'completed' && learnerEnded.text.trim()) {
-                      waiter.resolve(learnerEnded.text);
-                    } else {
-                      waiter.reject(new Error(`学习会话 turn 未正常完成：${learnerEnded.reason.kind}`));
-                    }
+                    if (outcome.action === 'resolve') waiter.resolve(outcome.text);
+                    else waiter.reject(new Error(`学习会话 turn 未正常完成：${outcome.reason}`));
                   }
-                  // 旧学习会话 turn 结束后从集合移除，避免残留
-                  if (frame.sessionId !== slangLearnerSessionId && frame.sessionId !== slangResearchSessionId && !isVisionSession(frame.sessionId) && !isSettleSession(frame.sessionId)) learnerSessions.delete(frame.sessionId);
+                  // 旧学习会话 turn 结束后从集合移除，避免残留（正在重试的那个除外）
+                  if (!retriedNow && frame.sessionId !== slangLearnerSessionId && frame.sessionId !== slangResearchSessionId && !isVisionSession(frame.sessionId) && !isSettleSession(frame.sessionId)) learnerSessions.delete(frame.sessionId);
                 }
               }
               continue;

@@ -326,6 +326,11 @@ async function updateConfig({ sendJson, readBody }) {
     merged.injectMax = Math.min(200, Math.max(1, Math.round(Number(merged.injectMax) || 1)));
   }
   if (merged.autoResearch !== undefined) merged.autoResearch = merged.autoResearch === true;
+  if (merged.softCap !== undefined) {
+    // 黑话软上限 200~2000（默认 1200）。写坏或 0 一律回到 1200。
+    const n = Number(merged.softCap);
+    merged.softCap = Number.isFinite(n) && n > 0 ? Math.max(200, Math.min(2000, Math.round(n))) : 1200;
+  }
   if (merged.learnerPreset !== undefined) merged.learnerPreset = String(merged.learnerPreset ?? '').trim();
   if (merged.workspaceTitle !== undefined) {
     merged.workspaceTitle = String(merged.workspaceTitle ?? '').trim() || 'QQ 黑话学习';

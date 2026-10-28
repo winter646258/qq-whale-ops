@@ -80,11 +80,29 @@
     - id: compaction-basic
       name: '@deepseek-ai/dsh-compaction-basic'
       config:
-        thresholdRatio: 0.55
-        retainRatio: 0.06
+        thresholdRatio: 0.3
+        retainRatio: 0.05
         headroomTokens: 4000
         compactionRetries: 0
-
+        # 按 provider + model 钉死阈值（精确匹配，逐键覆盖上面的顶层值）。
+        # 动机：阈值 = contextWindow × thresholdRatio，1M 窗口按 0.55 要长到 55 万才压一次。
+        modelPolicies:
+          - provider: our-free-model
+            model: deepseek/deepseek-v4.1-flash
+            thresholdRatio: 0.12
+            retainRatio: 0.05
+          - provider: loomy
+            model: DeepSeek-V4.1-Flash
+            thresholdRatio: 0.5
+            retainRatio: 0.05
+          - provider: trae
+            model: deepseek-v4.1-flash
+            thresholdRatio: 0.5
+            retainRatio: 0.05
+          - provider: raccoon
+            model: sn-deepseek-v4-1-flash
+            thresholdRatio: 0.5
+            retainRatio: 0.05
     - id: command-compact
       name: '@deepseek-ai/dsh-command-compact'
 
