@@ -94,6 +94,7 @@ import { LEARNER_RETRY_NUDGE, learnerOutcome } from './learner-retry.js';
 // 节奏层：什么时候叫醒她、回复后跳几次、主动间隔。纯逻辑在 pacing.js，带单测。
 // MARKER: pacing-import
 import { pacingCfg, skipDecision, urgeDelay } from './pacing.js';
+import { prepareQzoneImages } from './qzone-image.js';
 // 结算层：回合收工之后另起一个安静的小回合，把情绪和印象写回库里。纯逻辑在 settle.js。
 // MARKER: settle-import
 import {
@@ -4332,6 +4333,23 @@ async function main() {
   let dshCheckStarted = false;
   let snowlumaWatchStarted = false; // SnowLuma 上游健康探测只启动一次（见 startSnowlumaWatch）
   let currentMode = 'chat'; // chat | closed-agent | reserved（仿真模式，由 DSH settings / state/mode.json 驱动）
+  // MARKER: mode-boot-hint
+  // 为什么要有这段：真正的模式要等 DSH 回话后 refreshMode() 才读到，而 HTTP 服务在
+  // 那之前就已经 listen 了 —— 中间这几秒里 currentMode 还是上面那个 'chat' 初值，
+  // 于是任何带 x-agent-token 的 /api/socialV2/* 调用都会被总闸挡成
+  // 「该接口仅 reserved2 模式可用」。实测代价：2026-10-28 18:04 她想收藏一张表情，
+  // 恰好撞上 provider 切换触发的重启窗口（模式 18:04:15 才确认），收藏失败并被她理解成
+  // 「收藏这个口子我这边是关着的」。
+  // 先用控制台自己写的 state/mode.json 垫底（那里就是最后一次人工/控制台设定的模式），
+  // DSH 活着以后 refreshMode() 会用 DSH 设置覆盖它 —— 顺序不变，只是初值不再是假的 'chat'。
+  {
+    const bootLocal = readJsonSafe(path.join(STATE_DIR, 'mode.json'), null);
+    const bootMode = bootLocal ? normalizeModeInput(bootLocal.mode) : null;
+    if (bootMode) {
+      currentMode = bootMode;
+      log(`[mode] 启动时按 state/mode.json 预置模式：${bootMode}（等 DSH 就绪后再以 DSH 设置为准）`);
+    }
+  }
   let lastMode = currentMode;
   // closed-agent 模式使用的 DSH agent preset：留空表示「用 DSH 自己声明的默认 preset」。
   // 旧版本这里硬编码 'router-standard'，但 DSH 0.1.5 已移除该 preset，硬编码会导致
@@ -4376,6 +4394,11 @@ async function main() {
       // 规范化后再比较：`simulation` 也走这里（见 MODE_INPUT_ALIASES）。
       const fromDsh = ns?.value ? normalizeModeInput(ns.value.mode) : null;
       if (fromDsh) {
+        // MARKER: mode-change-log
+        // 以前模式切换完全静默：只会在 DSH 首次就绪时打一行「模式: X」，
+        // 之后从 chat 换成 reserved2 还是反过来，日志里一点痕迹都没有，
+        // 排查「为什么工具突然全 403」只能靠猜。这行是给自己留的自证。
+        if (fromDsh !== currentMode) log(`[mode] 桥接模式切换：${currentMode} -> ${fromDsh}（来源：DSH 设置）`);
         currentMode = fromDsh;
         // DSH 设置页也可配置管理员 QQ；未设置该字段时不覆盖 config.json。
         if (ns.value.ownerQQ !== undefined) {
@@ -6690,7 +6713,10 @@ async function main() {
         }
         // 模式隔离：带 agent token 的 v2 接口只允许在 reserved2 模式下使用
         if (req.headers['x-agent-token'] && url.pathname.startsWith('/api/socialV2/') && currentMode !== 'reserved2') {
-          sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403);
+          // MARKER: mode-gate-why
+          // 带上当前模式：以前只说「仅 reserved2 可用」，看不出到底是「真的不是 reserved2」
+          // 还是「刚重启还没读到 DSH 设置」，两种处理方式完全不同。
+          sendJson({ ok: false, error: `该接口仅 reserved2 模式可用（当前模式：${currentMode}）` }, 403);
           return;
         }
         // 管理端专用 v2 接口：带 agent token 的请求一律拒绝，防止 MCP 工具越权访问控制台功能
@@ -6837,6 +6863,16 @@ async function main() {
             if (action !== 'post') { sendJson({ ok: false, error: 'action 只支持 post / list / delete' }, 400); return; }
             const content = String(body.content ?? '').trim();
             const images = Array.isArray(body.images) ? body.images.map((v) => String(v ?? '').trim()).filter(Boolean).slice(0, 9) : [];
+            // MARKER: qzone-image-base64
+            // SnowLuma 在容器里看不到宿主机的 state/images，而它的 send_qzone_msg 支持 base64://，
+            // 所以这里先读成 base64 再递过去（和发 QQ 图片走 base64 是同一个思路）。
+            let uploadImages = [];
+            try {
+              uploadImages = prepareQzoneImages(images, { imageDir: path.join(STATE_DIR, 'images'), stateDir: STATE_DIR });
+            } catch (error) {
+              sendJson({ ok: false, error: String(error?.message ?? error) }, 400);
+              return;
+            }
             if (!content && !images.length) { sendJson({ ok: false, error: 'content 和 images 不能同时为空' }, 400); return; }
             if (content.length > 1000) { sendJson({ ok: false, error: '说说正文最多 1000 字' }, 400); return; }
             const postCfg = cfg.qzone?.post ?? {};
@@ -6857,14 +6893,14 @@ async function main() {
             }
             const data = await qzoneCall('send_qzone_msg', {
               content,
-              ...(images.length ? { images } : {}),
+              ...(uploadImages.length ? { images: uploadImages } : {}),
               ...(Number.isFinite(Number(body.ugcRight)) ? { ugc_right: Number(body.ugcRight) } : {})
             }, 120000);
             const tid = String(data?.tid ?? data?.unikey ?? '').trim();
             posts.push({ tid, at: now, content: content.slice(0, 200), images: images.length });
             try { fs.writeFileSync(postStatePath, JSON.stringify({ posts }, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 }); } catch (error) { log(`[qzone] 写状态失败：${error?.message ?? error}`); }
-            log(`[qzone] 发表说说 成功 tid=${tid || '-'} 字数=${content.length} 图=${images.length}`);
-            sendJson({ ok: true, action: 'post', tid, contentLength: content.length, images: images.length, todayCount: todayCount + 1, maxPerDay, raw: data });
+            log(`[qzone] 发表说说 成功 tid=${tid || '-'} 字数=${content.length} 图=${uploadImages.length}`);
+            sendJson({ ok: true, action: 'post', tid, contentLength: content.length, images: uploadImages.length, todayCount: todayCount + 1, maxPerDay, raw: data });
             return;
           } catch (error) {
             log(`[qzone] ${action} 失败：${error?.message ?? error}`);
