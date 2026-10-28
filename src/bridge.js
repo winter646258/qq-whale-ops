@@ -121,6 +121,8 @@ import {
   buildLifeAsk, lifeCfg, lifeDayFor, lifeLineFor, normalizeLifePlan, setLifeDay, summarizeLifeDay
 } from './life.js';
 import { moodDaysCfg, moodTrendLine, pruneMoodDays, recordMoodDay } from './mood-days.js';
+import { buildThreadsAsk, threadsCfg, threadsLine, summarizeThreads, addThreads, dueThreads, markAsked, pruneThreads, resolveThreads } from './threads.js';
+import { buildWishesAsk, wishesCfg, wishesLine, summarizeWishes, addWishes, completeWishes, pruneWishes } from './wishes.js';
 // MARKER: shared-memory
 // 跨会话共享记忆：主人私聊能了解她在群里经历的重要事情，同时私聊专属内容
 // 不进群、群专属内容不自动进私聊。纯逻辑在 shared-memory-store.js，带单测。
@@ -3793,6 +3795,36 @@ async function main() {
   // 两个状态文件都跟 情绪.json 同等待遇：读坏当空、写盘走 atomicWriteJson。
   const LIFE_FILE = path.join(STATE_DIR, 'life.json');
   const MOOD_DAYS_FILE = path.join(STATE_DIR, 'mood-days.json');
+  // MARKER: world-b-store
+  // 话题与愿望：同样「读坏当空、写盘走 atomicWriteJson」，和 情绪.json 一个待遇。
+  const THREADS_FILE = path.join(STATE_DIR, 'threads.json');
+  const WISHES_FILE = path.join(STATE_DIR, 'wishes.json');
+  function readThreadsStore() {
+    const raw = readJsonSafe(THREADS_FILE, null);
+    return raw && typeof raw === 'object' && Array.isArray(raw.items)
+      ? raw
+      : { version: 1, items: [] };
+  }
+  function saveThreadsStore(store) {
+    try {
+      atomicWriteJson(THREADS_FILE, store);
+    } catch (error) {
+      log(`[threads] 落盘失败：${error?.message ?? error}`);
+    }
+  }
+  function readWishesStore() {
+    const raw = readJsonSafe(WISHES_FILE, null);
+    return raw && typeof raw === 'object' && Array.isArray(raw.items)
+      ? raw
+      : { version: 1, items: [] };
+  }
+  function saveWishesStore(store) {
+    try {
+      atomicWriteJson(WISHES_FILE, store);
+    } catch (error) {
+      log(`[wishes] 落盘失败：${error?.message ?? error}`);
+    }
+  }
   function readLifeStore() {
     const raw = readJsonSafe(LIFE_FILE, null);
     return raw && typeof raw === 'object' && raw.days && typeof raw.days === 'object'
@@ -3976,13 +4008,46 @@ async function main() {
       log(`[life] 生成前检查失败：${error?.message ?? error}`);
     }
 
+    // MARKER: world-b-ask
+    // 话题/愿望只在有东西可记、或有话挂到期时才提要求，平时不加输出 token。
+    let askWorldText = '';
+    try {
+      const tc = threadsCfg(cfg);
+      const wc = wishesCfg(cfg);
+      const threadStore = readThreadsStore();
+      const wishStore = readWishesStore();
+      const openThreads = (threadStore.items || []).filter((x) => x && x.status === 'open' && String(x.key ?? '') === String(key ?? ''));
+      const parts = [];
+      if (tc.enabled) parts.push(buildThreadsAsk({ maxInject: tc.maxInject }));
+      if (wc.enabled) parts.push(buildWishesAsk({ maxItems: wc.maxInject }));
+      if (parts.length) {
+        parts.push('把结果并进同一个 JSON 里，加这几个可选键：');
+        parts.push('- `threads`: 这次新记下的「还挂着的话」；`wishes`: 这次新记下的愿望；`done`: 已经做完的愿望原文；`resolved`: 已经问到答案的话题 id。');
+        if (openThreads.length) {
+          parts.push('');
+          parts.push('已经挂着的（问到答案就把 id 放进 `resolved`）：');
+          parts.push(openThreads.slice(0, 6).map((x) => `- ${x.id}：${x.topic}`).join('\n'));
+        }
+        const wishSummary = summarizeWishes(wishStore, { limit: 6 });
+        if (wishSummary && wishSummary !== '（没有）') {
+          parts.push('');
+          parts.push('愿望清单现在是：');
+          parts.push(wishSummary);
+        }
+        askWorldText = parts.join('\n').slice(0, 1400);
+      }
+    } catch (error) {
+      log(`[world-b] 生成任务段失败：${error?.message ?? error}`);
+    }
+
     const promptText = buildSettlePrompt({
       key,
       isGroup: String(key).startsWith('group:'),
       lines,
       impressions: known,
       selfView: selfViewText,
-      lifeAsk: askLifeText
+      lifeAsk: askLifeText,
+      worldAsk: askWorldText
     });
 
     settleRunning = true;
@@ -4122,6 +4187,48 @@ async function main() {
           } catch (error) {
             log(`[life] 写入失败：${error?.message ?? error}`);
           }
+        }
+        // MARKER: world-b-write
+        // 顺序：先关掉已经问到答案的 → 再并新的 → 最后剪枝。关掉在前，避免同一条被记两次。
+        let wroteThreads = 0;
+        let wroteWishes = 0;
+        try {
+          const tc = threadsCfg(cfg);
+          if (tc.enabled) {
+            let store = readThreadsStore();
+            if (plan.resolvedThreads.length) {
+              const closed = resolveThreads(store, { ids: plan.resolvedThreads, now: Date.now() });
+              store = closed.store;
+            }
+            if (plan.threads.length) {
+              const merged = addThreads(store, { key, who: '', items: plan.threads, now: Date.now(), cfg: tc });
+              store = merged.store;
+              wroteThreads = merged.added;
+            }
+            store = pruneThreads(store, { now: Date.now(), cfg: tc });
+            saveThreadsStore(store);
+          }
+        } catch (error) {
+          log(`[threads] 写入失败：${error?.message ?? error}`);
+        }
+        try {
+          const wc = wishesCfg(cfg);
+          if (wc.enabled) {
+            let store = readWishesStore();
+            if (plan.doneWishes.length) {
+              const done = completeWishes(store, { texts: plan.doneWishes, now: Date.now(), cfg: wc });
+              store = done.store;
+            }
+            if (plan.wishes.length) {
+              const merged = addWishes(store, { items: plan.wishes, now: Date.now(), addedBy: '她', cfg: wc });
+              store = merged.store;
+              wroteWishes = merged.added;
+            }
+            store = pruneWishes(store, { now: Date.now(), cfg: wc });
+            saveWishesStore(store);
+          }
+        } catch (error) {
+          log(`[wishes] 写入失败：${error?.message ?? error}`);
         }
         settleDone = true;
         st.lastSettleAt = Date.now();
@@ -12549,7 +12656,34 @@ async function generateImageNow({ prompt, size }) {
     } catch (error) {
       log(`[心情日历] 注入失败：${error?.message ?? error}`);
     }
-    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    // MARKER: world-b-inject
+    // 还挂着的话 / 一起想做的事：都是**事实**，措辞留活口（想提就提）。
+    // 主动开口（proactiveCheck / schedule）才允许她先问，并把问过的次数记账，防追着问。
+    let threadsText = '';
+    let wishesText = '';
+    try {
+      const tc = threadsCfg(cfg);
+      if (tc.enabled) {
+        const reasonText = String(reason ?? '');
+        const isProactive = reasonText.startsWith('proactive') || reasonText.startsWith('schedule');
+        const line = threadsLine(readThreadsStore(), { key, now: Date.now(), cfg: tc, isProactive });
+        threadsText = line.text || '';
+        if (isProactive && line.dueIds.length) {
+          const asked = markAsked(readThreadsStore(), { ids: line.dueIds, now: Date.now() });
+          saveThreadsStore(asked.store);
+          log(`[threads] ${key} 主动提起 ${asked.asked} 条（${line.dueIds.join(',')}）`);
+        }
+      }
+    } catch (error) {
+      log(`[threads] 注入失败：${error?.message ?? error}`);
+    }
+    try {
+      const wc = wishesCfg(cfg);
+      if (wc.enabled) wishesText = wishesLine(readWishesStore(), { cfg: wc });
+    } catch (error) {
+      log(`[wishes] 注入失败：${error?.message ?? error}`);
+    }
+    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;

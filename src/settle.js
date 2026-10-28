@@ -122,7 +122,7 @@ export function shouldSettle({ key = '', st = null, now = Date.now(), cfg = {} }
 }
 
 /** 拼结算提示词：只要严格 JSON，只依据给到的原文，宁可空着也不许编。 */
-export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impressions = [], selfView = '', lifeAsk = '' } = {}) {
+export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impressions = [], selfView = '', lifeAsk = '', worldAsk = '' } = {}) {
   const known = Array.isArray(impressions)
     ? impressions.filter((x) => x && x.who && String(x.text || '').trim()).slice(0, 12)
     : [];
@@ -141,6 +141,8 @@ export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impre
   const selfBlock = selfText || '（还没有自述）';
   // 世界层：只在「那天还没有安排」时要求她写一段自己的日子，其余时候这段为空。
   const lifeAskText = String(lifeAsk ?? '').replace(/\r/g, '').trim().slice(0, 900);
+  // 世界层 B：话题与愿望的额外任务（规则在 threads.js / wishes.js，带单测）。
+  const worldAskText = String(worldAsk ?? '').replace(/\r/g, '').trim().slice(0, 1400);
 
   return [
     '你是一个只做总结的旁白，不是聊天的人。你在读一段对话原文，把「她的状态变化」和',
@@ -163,6 +165,7 @@ export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impre
     '   最多两条，没有就写 "notes": []。',
     '7. 只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余的话。',
     ...(lifeAskText ? ['', '额外任务：', lifeAskText, ''] : ['']),
+    ...(worldAskText ? ['', '额外任务（接着来）：', worldAskText, ''] : ['']),
     '输出格式：',
     lifeAskText
       ? '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}],"portrait":[{"subject":"说谁","facet":"doing","text":"六十字以内的长期看法"}],"notes":[{"text":"心里还挂着的一件事，四十字以内"}],"life":{"outfit":"穿什么","plans":[{"period":"上午","text":"想做什么"}],"moodHint":"想怎么过"}}'
@@ -277,7 +280,12 @@ export function parseSettleJSON(text) {
 
   // 世界层：life 不在这里洗（洗的规则在 life.js，带单测），只把对象原样带出去。
   const life = parsed.life && typeof parsed.life === 'object' && !Array.isArray(parsed.life) ? parsed.life : null;
-  return { ok: true, value: { mood, impressions, portraits, notes, life } };
+  // 世界层 B：不在这里洗，只把数组原样带出去（洗的规则在 threads.js / wishes.js，各带单测）。
+  const threads = Array.isArray(parsed.threads) ? parsed.threads.slice(0, 10) : [];
+  const wishes = Array.isArray(parsed.wishes) ? parsed.wishes.slice(0, 10) : [];
+  const doneWishes = Array.isArray(parsed.done) ? parsed.done.slice(0, 10) : [];
+  const resolvedThreads = Array.isArray(parsed.resolved) ? parsed.resolved.slice(0, 10) : [];
+  return { ok: true, value: { mood, impressions, portraits, notes, life, threads, wishes, doneWishes, resolvedThreads } };
 }
 
 /**
@@ -348,6 +356,10 @@ export function planSettleWrites(
   return {
     mood,
     life,
+    threads: Array.isArray(value.threads) ? value.threads : [],
+    wishes: Array.isArray(value.wishes) ? value.wishes : [],
+    doneWishes: Array.isArray(value.doneWishes) ? value.doneWishes : [],
+    resolvedThreads: Array.isArray(value.resolvedThreads) ? value.resolvedThreads : [],
     impressions: list.slice(0, cap),
     skippedImpressions: Math.max(0, list.length - cap),
     portraits: selfList.slice(0, selfCap),
