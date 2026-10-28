@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小鲸鱼的日记本</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#161b22; --panel2:#1c232d; --line:#2a3340; --text:#e6edf3; --dim:#8b98a5;
+    --accent:#4f9cf9; --warm:#f2b25c; --good:#58c98a; --bad:#ef6b6b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:15px/1.65 "PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif}
+  header{padding:26px 22px 10px;max-width:1180px;margin:0 auto}
+  h1{margin:0 0 6px;font-size:22px;letter-spacing:.5px}
+  .sub{color:var(--dim);font-size:13px}
+  .sub b{color:var(--warm);font-weight:600}
+  .bar{max-width:1180px;margin:14px auto 0;padding:0 22px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;flex:1}
+  .chip{background:var(--panel);border:1px solid var(--line);color:var(--dim);border-radius:999px;padding:5px 12px;font-size:13px;cursor:pointer;transition:.15s}
+  .chip:hover{border-color:#3d4b5c;color:var(--text)}
+  .chip.on{background:var(--accent);border-color:var(--accent);color:#06101c;font-weight:600}
+  input[type=search]{background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:9px;padding:7px 12px;font-size:13px;min-width:190px;outline:none}
+  input[type=search]:focus{border-color:var(--accent)}
+  main{max-width:1180px;margin:18px auto 60px;padding:0 22px;display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
+  .card .pic{display:block;width:100%;background:#0b0e12;cursor:zoom-in}
+  .card .pic img{display:block;width:100%;height:auto}
+  .card .body{padding:13px 15px 15px}
+  .meta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:7px;font-size:12px;color:var(--dim)}
+  .mood{background:#1f2a38;color:var(--warm);border-radius:999px;padding:2px 9px}
+  .lv{width:6px;height:6px;border-radius:50%;background:#3b4757}
+  .lv.important{background:var(--warm)}
+  .lv.critical{background:var(--bad)}
+  .text{white-space:pre-wrap;word-break:break-word}
+  .noart{color:#5a6675;font-size:12px;margin-top:9px}
+  .empty{grid-column:1/-1;text-align:center;color:var(--dim);padding:60px 0}
+  .gate{max-width:420px;margin:14vh auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:26px}
+  .gate h2{margin:0 0 8px;font-size:17px}
+  .gate p{color:var(--dim);font-size:13px;margin:0 0 14px}
+  .gate input,.gate button{width:100%;padding:9px 12px;border-radius:9px;border:1px solid var(--line);background:#0e1319;color:var(--text);font-size:14px}
+  .gate button{margin-top:10px;background:var(--accent);border-color:var(--accent);color:#06101c;font-weight:600;cursor:pointer}
+  #zoom{position:fixed;inset:0;background:rgba(4,7,10,.92);display:none;align-items:center;justify-content:center;z-index:50;cursor:zoom-out;padding:20px}
+  #zoom.on{display:flex}
+  #zoom img{max-width:min(96vw,1100px);max-height:92vh;border-radius:10px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+</style>
+</head>
+<body>
+<header>
+  <h1>小鲸鱼的日记本</h1>
+  <div class="sub" id="summary">在翻本子…</div>
+</header>
+<div class="bar" id="bar" hidden>
+  <div class="chips" id="chips"></div>
+  <input type="search" id="q" placeholder="搜正文 / 心情">
+</div>
+<main id="list"></main>
+<div id="zoom"><img alt=""></div>
+
+<script>
+(function(){
+  var TOKEN_KEY = 'consoleToken';
+  var token = new URLSearchParams(location.search).get('token') || localStorage.getItem(TOKEN_KEY) || '';
+  var month = '';
+  var all = [];
+
+  function headers(){ return token ? { 'x-console-token': token } : {}; }
+  function esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+  function fmtDay(day, time){
+    if (!day) return time || '';
+    var d = day.slice(5);
+    var hm = (time || '').slice(11, 16);
+    return d + (hm ? ' ' + hm : '');
+  }
+
+  function gate(msg){
+    document.getElementById('bar').hidden = true;
+    document.getElementById('list').innerHTML = '';
+    var box = document.createElement('div');
+    box.className = 'gate';
+    box.innerHTML = '<h2>需要控制台令牌</h2><p>' + esc(msg || '这个页面和控制台共用同一个令牌。粘一次就好，存在本机浏览器里。') + '</p>'
+      + '<input id="tk" type="password" placeholder="state/console-token 里的那串"><button id="go">进去看</button>';
+    document.body.appendChild(box);
+    box.querySelector('#go').onclick = function(){
+      var v = box.querySelector('#tk').value.trim();
+      if (!v) return;
+      token = v; localStorage.setItem(TOKEN_KEY, v);
+      box.remove(); load();
+    };
+  }
+
+  function render(){
+    var q = document.getElementById('q').value.trim();
+    var items = all.filter(function(it){
+      if (!q) return true;
+      return (it.text + ' ' + (it.mood || '')).toLowerCase().indexOf(q.toLowerCase()) >= 0;
+    });
+    var list = document.getElementById('list');
+    if (!items.length){
+      list.innerHTML = '<div class="empty">这一页还是空的。</div>';
+      return;
+    }
+    list.innerHTML = items.map(function(it){
+      var pic = it.art && it.art.exists && it.art.url
+        ? '<a class="pic" data-src="' + esc(it.art.url) + '"><img loading="lazy" src="' + esc(it.art.url) + '" alt=""></a>'
+        : '';
+      var lv = it.level && it.level !== 'normal' ? '<span class="lv ' + esc(it.level) + '" title="' + esc(it.level) + '"></span>' : '<span class="lv"></span>';
+      var mood = it.mood ? '<span class="mood">' + esc(it.mood) + '</span>' : '';
+      var noart = (!it.art || !it.art.exists) ? '<div class="noart">这一条没有配图</div>' : '<div class="noart">配图：' + esc(it.art.style || '手绘') + '</div>';
+      return '<article class="card">' + pic + '<div class="body">'
+        + '<div class="meta">' + lv + '<span>' + esc(fmtDay(it.day, it.time)) + '</span>' + mood + '</div>'
+        + '<div class="text">' + esc(it.text) + '</div>' + noart + '</div></article>';
+    }).join('');
+  }
+
+  function renderChips(months){
+    var box = document.getElementById('chips');
+    var html = '<button class="chip on" data-m="">全部</button>';
+    months.forEach(function(m){
+      html += '<button class="chip" data-m="' + esc(m.month) + '">' + esc(m.month) + '（' + m.count + '）</button>';
+    });
+    box.innerHTML = html;
+    box.querySelectorAll('.chip').forEach(function(btn){
+      btn.onclick = function(){
+        box.querySelectorAll('.chip').forEach(function(b){ b.classList.remove('on'); });
+        btn.classList.add('on');
+        month = btn.getAttribute('data-m') || '';
+        load();
+      };
+    });
+  }
+
+  function load(){
+    document.getElementById('list').innerHTML = '<div class="empty">翻本子…</div>';
+    var url = '/api/socialV2/diary/book?limit=500' + (month ? '&month=' + encodeURIComponent(month) : '');
+    fetch(url, { headers: headers() }).then(function(r){ return r.json(); }).then(function(data){
+      if (!data || data.ok === false){
+        var msg = (data && data.error) || '读不到日记';
+        if (/令牌|token/i.test(msg)) { gate(msg); return; }
+        document.getElementById('list').innerHTML = '<div class="empty">' + esc(msg) + '</div>';
+        return;
+      }
+      all = data.items || [];
+      document.getElementById('bar').hidden = false;
+      var s = data.summary || {};
+      document.getElementById('summary').innerHTML =
+        '共 <b>' + (s.total || 0) + '</b> 条，带配图 <b>' + (s.withArt || 0) + '</b> 张'
+        + (s.firstDay ? '，从 <b>' + esc(s.firstDay) + '</b> 到 <b>' + esc(s.lastDay || s.firstDay) + '</b>' : '');
+      renderChips(data.months || []);
+      // 月份切换后保留当前高亮
+      if (month){
+        document.querySelectorAll('#chips .chip').forEach(function(b){
+          b.classList.toggle('on', (b.getAttribute('data-m') || '') === month);
+        });
+      }
+      render();
+    }).catch(function(err){
+      document.getElementById('list').innerHTML = '<div class="empty">读不到日记：' + esc(err && err.message) + '</div>';
+    });
+  }
+
+  document.getElementById('q').oninput = render;
+  document.getElementById('list').onclick = function(e){
+    var a = e.target.closest('.pic');
+    if (!a) return;
+    e.preventDefault();
+    var zoom = document.getElementById('zoom');
+    zoom.querySelector('img').src = a.getAttribute('data-src');
+    zoom.classList.add('on');
+  };
+  document.getElementById('zoom').onclick = function(){ this.classList.remove('on'); };
+
+  if (!token) { gate(); } else { load(); }
+})();
+</script>
+</body>
+</html>

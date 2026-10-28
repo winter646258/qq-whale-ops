@@ -55,8 +55,8 @@ export const ART_DEFAULTS = {
   size: '1024x1024',
   /** 一天最多几张。0 = 关掉。写日记不该无上限烧图。 */
   maxPerDay: 3,
-  /** private=只在私聊发；always=都发；never=只存档不发 */
-  sendToChat: 'private',
+  /** private=只在私聊发；always=都发；never=只存档不发（默认：日记本才是它的地方，别往聊天里塞） */
+  sendToChat: 'never',
   maxPromptChars: 700,
   character: DIARY_CHARACTER,
 };
@@ -169,5 +169,7 @@ const SAFE = /[^0-9A-Za-z_-]/g;
 export function artFileName(entry, now = Date.now()) {
   const day = String(entry?.day ?? '').trim() || new Date(Number(now)).toISOString().slice(0, 10);
   const id = String(entry?.id ?? '').trim().replace(SAFE, '') || String(Number(now));
-  return `${day.replace(SAFE, '')}-${id}.png`;
+  const d = day.replace(SAFE, '') || 'unknown';
+  // 按月分子目录：一本本子里按月份翻，几千张也不会挤在一个目录里
+  return `${d.slice(0, 7)}/${d}-${id}.png`;
 }

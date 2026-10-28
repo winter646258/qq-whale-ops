@@ -67,8 +67,9 @@ ok(shouldSendArt('always', 'group:906710082') === true, 'always 群里也发');
 ok(shouldSendArt('never', 'private:1124721191') === false, 'never 不发');
 
 // ── 文件名 ──
-eq(artFileName({ day: '2026-10-28', id: 'd1a2b' }), '2026-10-28-d1a2b.png', '文件名=日子+id');
-ok(!artFileName({ day: '2026/10/28 中文', id: 'd/1' }).includes('/'), '文件名不含斜杠');
+eq(artFileName({ day: '2026-10-28', id: 'd1a2b' }), '2026-10/2026-10-28-d1a2b.png', '文件名=按月/日子-id');
+ok(!artFileName({ day: '2026/10/28 中文', id: 'd/1' }).includes('..'), '文件名不越界');
+ok(!artFileName({ day: '', id: '' }).includes('undefined'), '缺字段不写 undefined');
 
 // ── diary-store 落盘读回 ──
 const tmp = path.join(os.tmpdir(), `diary-art-test-${process.pid}.jsonl`);

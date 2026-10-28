@@ -39,6 +39,8 @@ import {
   recentDiary, recallDiary, diaryDays, diaryStats, parseLegacyMarkdown, localStamp,
   normalizeLevel, daysSinceLast, DEFAULT_LEVEL, LEVEL_LABELS, setDiaryArt, countArtInDay} from './diary-store.js';
 import { artCfg, artAllowed, artFileName, buildArtPrompt, shouldSendArt } from './diary-art.js';
+import { artUrlFor, bookItems, bookMonths, bookSummary, resolveArtFile } from './diary-book.js';
+// MARKER: diary-book-import
 // MARKER: diary-art-import
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -6272,7 +6274,8 @@ async function main() {
   function fmtDiaryLine(e) {
     const lv = normalizeLevel(e?.level);
     // 给模型看的行里附上 id：改某条（mode=replace）要用
-    return `[${e.time || '未知时间'}]${fmtLevelTag(lv)}${e.mood ? `（${e.mood}）` : ''} ${e.text}${e.id ? ` 〔${e.id}〕` : ''}`;
+    // 有配图就把这件事告诉她（图本身在日记本里，不在聊天里）
+    return `[${e.time || '未知时间'}]${fmtLevelTag(lv)}${e.mood ? `（${e.mood}）` : ''} ${e.text}${e.art && e.art.file ? ' 〔配图〕' : ''}${e.id ? ` 〔${e.id}〕` : ''}`;
   }
 
   function buildSleepReviewLineFor(key) {
@@ -7432,6 +7435,55 @@ async function main() {
             return;
           }
         }
+
+            // ── 日记本：日记与配图的专门存档处（不进聊天）──
+            // MARKER: diary-book
+            // 页面本身也在控制台这一侧（同一台机器、同一个令牌），不走外网。
+            if (req.method === 'GET' && (url.pathname === '/diary' || url.pathname === '/diary.html')) {
+              res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
+              try {
+                res.end(fs.readFileSync(path.join(ROOT, 'public', 'diary.html'), 'utf8'));
+              } catch {
+                res.end('日记本页面缺失：qq-bridge/public/diary.html');
+              }
+              return;
+            }
+            if (req.method === 'GET' && url.pathname === '/api/socialV2/diary/book') {
+              const DIARY_BOOK_FILE = path.join(ROOT, 'diary', DIARY_JSONL);
+              const DIARY_ART_ROOT = path.join(ROOT, 'diary', 'art');
+              let entries = [];
+              try { entries = readDiary(DIARY_BOOK_FILE); } catch (error) { sendJson({ ok: false, error: '日记读不出来：' + (error?.message ?? error) }, 500); return; }
+              const month = String(url.searchParams.get('month') ?? '').trim();
+              const limit = Number(url.searchParams.get('limit') ?? 200) || 200;
+              const items = bookItems(entries, {
+                month,
+                limit,
+                artExists: (rel) => {
+                  const full = resolveArtFile(DIARY_ART_ROOT, rel);
+                  return Boolean(full && fs.existsSync(full));
+                }
+              });
+              sendJson({ ok: true, month, summary: bookSummary(entries), months: bookMonths(entries), items });
+              return;
+            }
+            if (req.method === 'GET' && url.pathname.startsWith('/api/socialV2/diary/art/')) {
+              const DIARY_ART_ROOT = path.join(ROOT, 'diary', 'art');
+              let rel = '';
+              try { rel = decodeURIComponent(url.pathname.slice('/api/socialV2/diary/art/'.length)); }
+              catch { sendJson({ ok: false, error: '图片名解码失败' }, 400); return; }
+              const full = resolveArtFile(DIARY_ART_ROOT, rel);
+              if (!full) { sendJson({ ok: false, error: '配图路径不合法' }, 400); return; }
+              let buf;
+              try { buf = fs.readFileSync(full); } catch { sendJson({ ok: false, error: '配图不存在' }, 404); return; }
+              res.writeHead(200, {
+                'content-type': 'image/png',
+                'content-length': String(buf.length),
+                'cache-control': 'private, max-age=86400',
+                'X-Content-Type-Options': 'nosniff'
+              });
+              res.end(buf);
+              return;
+            }
 
         if ((req.method === 'GET' || req.method === 'POST') && (url.pathname === '/api/socialV2/diary' || url.pathname === '/api/socialV2/album')) {
           const isDiary = url.pathname.endsWith('/diary');
