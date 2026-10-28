@@ -122,7 +122,7 @@ export function shouldSettle({ key = '', st = null, now = Date.now(), cfg = {} }
 }
 
 /** 拼结算提示词：只要严格 JSON，只依据给到的原文，宁可空着也不许编。 */
-export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impressions = [], selfView = '' } = {}) {
+export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impressions = [], selfView = '', lifeAsk = '' } = {}) {
   const known = Array.isArray(impressions)
     ? impressions.filter((x) => x && x.who && String(x.text || '').trim()).slice(0, 12)
     : [];
@@ -139,6 +139,8 @@ export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impre
   // 传进来的是 formatPortraitForPrompt() 的成品文本，这里不关心 store 的结构。
   const selfText = String(selfView ?? '').replace(/\r/g, '').trim().slice(0, 2000);
   const selfBlock = selfText || '（还没有自述）';
+  // 世界层：只在「那天还没有安排」时要求她写一段自己的日子，其余时候这段为空。
+  const lifeAskText = String(lifeAsk ?? '').replace(/\r/g, '').trim().slice(0, 900);
 
   return [
     '你是一个只做总结的旁白，不是聊天的人。你在读一段对话原文，把「她的状态变化」和',
@@ -160,9 +162,11 @@ export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impre
     '   只有过几天还会突然想起来的事才写；已经说清楚、已经过去的不要写。',
     '   最多两条，没有就写 "notes": []。',
     '7. 只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余的话。',
-    '',
+    ...(lifeAskText ? ['', '额外任务：', lifeAskText, ''] : ['']),
     '输出格式：',
-    '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}],"portrait":[{"subject":"说谁","facet":"doing","text":"六十字以内的长期看法"}],"notes":[{"text":"心里还挂着的一件事，四十字以内"}]}',
+    lifeAskText
+      ? '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}],"portrait":[{"subject":"说谁","facet":"doing","text":"六十字以内的长期看法"}],"notes":[{"text":"心里还挂着的一件事，四十字以内"}],"life":{"outfit":"穿什么","plans":[{"period":"上午","text":"想做什么"}],"moodHint":"想怎么过"}}'
+      : '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}],"portrait":[{"subject":"说谁","facet":"doing","text":"六十字以内的长期看法"}],"notes":[{"text":"心里还挂着的一件事，四十字以内"}]}',
     '',
     '字段说明：',
     '· mood.pleasure / arousal / dominance 取值 -1 到 1，0 表示平静；',
@@ -172,6 +176,12 @@ export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impre
     '· portrait 最多两条；subject 写名字，指她自己时写「我」；text 不超过六十字；',
     '· 自述写的是「她从此记住的事」，不是「这一轮发生了什么」，别把对话复述一遍。',
     '· notes 写「还挂在心上的」，不是「刚发生的事」；别写情绪形容词（那个 mood 里有了）。',
+    ...(lifeAskText
+      ? [
+          '· life 是她自己的日子：plans 每条给一个时段 + 一件小事；outfit 是穿着；moodHint 是这天想怎么过。',
+          '· life 不许写成任务清单、不许写对别人的安排、不许重复前一天的安排。'
+        ]
+      : []),
     '',
     `对话场景：${isGroup ? '群聊' : '私聊'}（${key}）`,
     `她已经记得的人：`,
@@ -265,7 +275,9 @@ export function parseSettleJSON(text) {
     notes.push({ text });
   }
 
-  return { ok: true, value: { mood, impressions, portraits, notes } };
+  // 世界层：life 不在这里洗（洗的规则在 life.js，带单测），只把对象原样带出去。
+  const life = parsed.life && typeof parsed.life === 'object' && !Array.isArray(parsed.life) ? parsed.life : null;
+  return { ok: true, value: { mood, impressions, portraits, notes, life } };
 }
 
 /**
@@ -331,8 +343,11 @@ export function planSettleWrites(
   const selfCap = num(maxPortraits, SETTLE_DEFAULTS.maxPortraits, { min: 0, max: 6 });
   const noteList = Array.isArray(value.notes) ? value.notes : [];
   const noteCap = num(maxNotes, SETTLE_DEFAULTS.maxNotes, { min: 0, max: 4 });
+  // 世界层：life 只在被要求时出现，原样透传给 bridge 去洗（洗的规则在 life.js，带单测）。
+  const life = value.life && typeof value.life === 'object' && !Array.isArray(value.life) ? value.life : null;
   return {
     mood,
+    life,
     impressions: list.slice(0, cap),
     skippedImpressions: Math.max(0, list.length - cap),
     portraits: selfList.slice(0, selfCap),

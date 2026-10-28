@@ -114,6 +114,13 @@ import {
   buildSettlePrompt,
   resolveImpressionWho, parseSettleJSON, pickSettleMessages, planSettleWrites, settleCfg, shouldSettle
 } from './settle.js';
+// MARKER: world-life-import
+// 世界层 §3.1/§3.3：她自己的日子（life.json）与心情编年史（mood-days.json）。
+// 纯逻辑在 life.js / mood-days.js，各自带单测；bridge 只负责存盘、注入、结算接线。
+import {
+  buildLifeAsk, lifeCfg, lifeDayFor, lifeLineFor, normalizeLifePlan, setLifeDay, summarizeLifeDay
+} from './life.js';
+import { moodDaysCfg, moodTrendLine, pruneMoodDays, recordMoodDay } from './mood-days.js';
 // MARKER: shared-memory
 // 跨会话共享记忆：主人私聊能了解她在群里经历的重要事情，同时私聊专属内容
 // 不进群、群专属内容不自动进私聊。纯逻辑在 shared-memory-store.js，带单测。
@@ -3782,6 +3789,37 @@ async function main() {
   // 为什么不在聊天里做：2026-10-25 铁律 —— 情绪/关系写入放结算，绝不新增聊天中的工具
   // 调用（一次工具调用重发约 24 万 token）。可这条铁律一直没被实现，于是情绪库停在
   // 10-24、印象重写 0 个、`qq_mood` 调用 0 次。这里是把它真做出来。
+  // MARKER: world-life-store
+  // 两个状态文件都跟 情绪.json 同等待遇：读坏当空、写盘走 atomicWriteJson。
+  const LIFE_FILE = path.join(STATE_DIR, 'life.json');
+  const MOOD_DAYS_FILE = path.join(STATE_DIR, 'mood-days.json');
+  function readLifeStore() {
+    const raw = readJsonSafe(LIFE_FILE, null);
+    return raw && typeof raw === 'object' && raw.days && typeof raw.days === 'object'
+      ? raw
+      : { version: 1, updatedAt: 0, days: {} };
+  }
+  function saveLifeStore(store) {
+    try {
+      atomicWriteJson(LIFE_FILE, store);
+    } catch (error) {
+      log(`[life] 落盘失败：${error?.message ?? error}`);
+    }
+  }
+  function readMoodDaysStore() {
+    const raw = readJsonSafe(MOOD_DAYS_FILE, null);
+    return raw && typeof raw === 'object' && raw.days && typeof raw.days === 'object'
+      ? raw
+      : { version: 1, updatedAt: 0, days: {} };
+  }
+  function saveMoodDaysStore(store) {
+    try {
+      atomicWriteJson(MOOD_DAYS_FILE, store);
+    } catch (error) {
+      log(`[心情日历] 落盘失败：${error?.message ?? error}`);
+    }
+  }
+
   const SETTLE_SESSION_FILE = path.join(STATE_DIR, 'settle-session.json');
   const settleSessions = new Set();
   const settleTimers = new Map();
@@ -3907,12 +3945,44 @@ async function main() {
     } catch (error) {
       log(`[settle] 自述读取失败：${error?.message ?? error}`);
     }
+    // MARKER: world-life-ask
+    // 只在「那天还没有安排」时才多问这一段：settle 一天跑很多次，不能每次都写。
+    const lc = lifeCfg(cfg);
+    let askLifeText = '';
+    let lifeTargetDay = '';
+    try {
+      if (lc.enabled) {
+        const want = lifeDayFor(Date.now(), { switchHour: lc.switchHour });
+        lifeTargetDay = want.day;
+        const lifeStore = readLifeStore();
+        if (!lifeStore.days[want.day]) {
+          const known = Object.keys(lifeStore.days).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
+          const lastDay = known[known.length - 1] || '';
+          const prevSummary = lastDay ? summarizeLifeDay(lifeStore, lastDay) : '';
+          let moodLabel = '';
+          try {
+            moodLabel = String(moodStore()?.label || '');
+          } catch {}
+          askLifeText = buildLifeAsk({
+            dayLabel: want.isTomorrow ? '明天' : '今天',
+            previous: prevSummary,
+            moodLabel,
+            maxPlans: lc.maxPlans,
+            planChars: lc.planChars
+          });
+        }
+      }
+    } catch (error) {
+      log(`[life] 生成前检查失败：${error?.message ?? error}`);
+    }
+
     const promptText = buildSettlePrompt({
       key,
       isGroup: String(key).startsWith('group:'),
       lines,
       impressions: known,
-      selfView: selfViewText
+      selfView: selfViewText,
+      lifeAsk: askLifeText
     });
 
     settleRunning = true;
@@ -4003,6 +4073,22 @@ async function main() {
             log(`[settle] 情绪落盘失败：${error?.message ?? error}`);
           }
         }
+        // MARKER: world-mood-days
+        // 心情编年史：一天一格，同一天重复结算就覆盖。趋势由代码算，不让模型发挥。
+        try {
+          const mc = moodDaysCfg(cfg);
+          if (mc.enabled) {
+            const rec = recordMoodDay(readMoodDaysStore(), {
+              now: Date.now(),
+              label: String(moodState.label || ''),
+              pad: moodState.pad,
+              samples: Array.isArray(moodState.samples) ? moodState.samples.length : 0
+            });
+            saveMoodDaysStore(pruneMoodDays(rec, { now: Date.now(), keepDays: mc.keepDays }));
+          }
+        } catch (error) {
+          log(`[心情日历] 记录失败：${error?.message ?? error}`);
+        }
         let wroteImp = 0;
         for (const item of plan.impressions) {
           // 模型会把 QQ 号当名字写回来，先归到已有键，别让同一个人分身成三条。
@@ -4023,6 +4109,20 @@ async function main() {
             log(`[settle] 自述写入失败（${item.subject}/${item.facet}）：${error?.message ?? error}`);
           }
         }
+        // MARKER: world-life-write
+        // 只有这次确实要了这段、且模型给了内容才写；一天只写一次（缺才问）。
+        let wroteLife = false;
+        if (askLifeText && lifeTargetDay && plan.life) {
+          try {
+            const normalized = normalizeLifePlan(plan.life, lc);
+            if (normalized) {
+              saveLifeStore(setLifeDay(readLifeStore(), lifeTargetDay, normalized, { keepDays: lc.keepDays }));
+              wroteLife = true;
+            }
+          } catch (error) {
+            log(`[life] 写入失败：${error?.message ?? error}`);
+          }
+        }
         settleDone = true;
         st.lastSettleAt = Date.now();
         if (wroteMood || wroteImp || wroteSelf) saveSocialV2State();
@@ -4031,13 +4131,14 @@ async function main() {
         const selfNote = wroteSelf ? `，自述 ${wroteSelf} 条` : '';
         const skipSelfNote = plan.skippedPortraits ? `（${plan.skippedPortraits} 条自述超限没写）` : '';
         const noteNote = wroteNotes ? `，手札 ${wroteNotes} 条` : '';
+        const lifeNote = wroteLife ? `，日程 ${lifeTargetDay} 记下` : '';
         const driftNote = baseDrift
           ? `，底色 ${Object.entries(baseDrift.delta)
               .filter(([, v]) => v)
               .map(([k, v]) => `${k}${v > 0 ? '+' : ''}${v}`)
               .join(' ')}`
           : '';
-        log(`[settle] ${key} 结算完成：情绪${moodNote}，印象 ${wroteImp} 条${skipNote}${selfNote}${skipSelfNote}${noteNote}${driftNote}`);
+        log(`[settle] ${key} 结算完成：情绪${moodNote}，印象 ${wroteImp} 条${skipNote}${selfNote}${skipSelfNote}${noteNote}${driftNote}${lifeNote}`);
         return;
       }
     } catch (error) {
@@ -12432,7 +12533,23 @@ async function generateImageNow({ prompt, size }) {
     }
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    // MARKER: world-life-inject
+    // 注入的是事实，不是指令：只摆她上次自己写下的日子与这几天的心情走向，
+    // 爆不爆由她决定（这条既是一致性要求，也是对成本的控制）。
+    let lifeLineText = '';
+    let moodTrendText = '';
+    try {
+      if (lifeCfg(cfg).enabled) lifeLineText = lifeLineFor(readLifeStore(), Date.now());
+    } catch (error) {
+      log(`[life] 注入失败：${error?.message ?? error}`);
+    }
+    try {
+      const mc = moodDaysCfg(cfg);
+      if (mc.enabled) moodTrendText = moodTrendLine(readMoodDaysStore(), { now: Date.now(), shiftGap: mc.shiftGap });
+    } catch (error) {
+      log(`[心情日历] 注入失败：${error?.message ?? error}`);
+    }
+    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
