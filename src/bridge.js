@@ -3730,6 +3730,22 @@ async function main() {
     const saved = readJsonSafe(SETTLE_SESSION_FILE, null);
     const dir = path.join(STATE_DIR, 'settle-agent');
     fs.mkdirSync(dir, { recursive: true });
+    // MARKER: settle-session-reuse
+    // 重启之后 settleSessionId 在内存里是空的，但会话本身还活着。
+    // 不接回就每重启一次新建一个会话（白烧一次 create + 一次冷启动）。
+    const savedSession = saved && typeof saved === 'object' ? String(saved.__sessionId ?? '') : '';
+    if (savedSession) {
+      try {
+        api.events.follow(savedSession);
+        settleSessions.add(savedSession);
+        learnerSessions.add(savedSession);
+        settleSessionId = savedSession;
+        log(`[settle] 复用上次的结算会话：${savedSession}`);
+        return savedSession;
+      } catch (error) {
+        log(`[settle] 上次的结算会话接不回来（${error?.message ?? error}），重建一个`);
+      }
+    }
     let workspaceId = saved && typeof saved === 'object' ? String(saved.__workspaceId ?? '') : '';
     if (!workspaceId) {
       const ws = unwrap(await api.workspace.create({ path: dir }), 'settle workspace.create');
@@ -3744,6 +3760,7 @@ async function main() {
     // 有 key 的会话帧会被当成 QQ 会话去发消息，结算会话绝不能走那条路。
     learnerSessions.add(sessionId);
     settleSessionId = sessionId;
+    try { atomicWriteJson(SETTLE_SESSION_FILE, { __workspaceId: workspaceId, __sessionId: sessionId, __updatedAt: Date.now() }); } catch {}
     log(`[settle] 结算会话已创建：${sessionId}（preset ${preset}）`);
     return sessionId;
   }
@@ -9689,6 +9706,8 @@ async function main() {
             lastImpressionRefreshAt: Number(val.lastImpressionRefreshAt) > 0 ? Number(val.lastImpressionRefreshAt) : 0,
             // 「记印象」驱动的冷却计时；缺省 0 表示从未念过（允许首次提醒）。
             lastImpressionNudgeAt: Number(val.lastImpressionNudgeAt) > 0 ? Number(val.lastImpressionNudgeAt) : 0,
+            // 结算冷却的锚点。只写内存不落盘 ⇒ 每次重启冷却清零、每个会话都白结一次。
+            lastSettleAt: Number(val.lastSettleAt) > 0 ? Number(val.lastSettleAt) : 0,
             // 繁忙暂存队列：重启后仍要补发（过期项由巡检清掉）
             pendingWakeReasons: Array.isArray(val.pendingWakeReasons)
               ? val.pendingWakeReasons
@@ -9787,6 +9806,7 @@ async function main() {
           // 这是交接文档待办 #7「印象只增不减」的根因（此前只在 load 里读到过）。
           lastImpressionRefreshAt: Number(st.lastImpressionRefreshAt) || 0,
           lastImpressionNudgeAt: Number(st.lastImpressionNudgeAt) || 0,
+          lastSettleAt: Number(st.lastSettleAt) || 0,
           // MARKER: item56
           // 繁忙暂存队列与主动档期也必须落盘：桥接一天要重启好几次，
           // 只存内存等于「每次重启都把还没补发的 @ 和已经等过的主动档期清空」。
@@ -9872,10 +9892,17 @@ async function main() {
       }
     }
     const impressions = st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {};
-    const names = Object.keys(impressions);
+    // MARKER: impression-inject-recent
+    // 按「最近重写过」取 10 人。以前取 Object.keys 的尾部（插入顺序），
+    // 人一多，早记下的人永远轮不到，等于慢慢失忆。
+    const names = Object.keys(impressions)
+      .map((n) => ({ n, t: Number(impressions[n]?.refreshedAt) || Number(impressions[n]?.lastSeenAt) || 0 }))
+      .sort((a, b) => b.t - a.t)
+      .slice(0, 10)
+      .map((x) => x.n);
     if (names.length) {
       lines.push('【对群友的印象】');
-      for (const name of names.slice(-10)) {
+      for (const name of names) {
         const im = impressions[name] || {};
         const traits = Array.isArray(im.traits) ? im.traits : [];
         lines.push(`- ${name}：${traits.length ? traits.join('、') : '暂无记录'}（互动 ${Number(im.interactionCount) || 0} 次）`);

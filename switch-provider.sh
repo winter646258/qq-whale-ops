@@ -71,9 +71,12 @@ SLOW_STRIKES="${SLOW_STRIKES:-2}"            # 连续这么多次检查都慢 ->
 FAIL_PATTERN="unauthorized|quota|insufficient|balance|rate.?limit|额度不足|余额不足|发送失败|限流|解禁|所有账号|可用账号|AI 反馈.*error|agent 处理出错|Illegal API invocation|unapproved channel"
 
 # 候选链：从优到劣。加渠道就往这三个数组尾部追加，判定逻辑会自动跟上。
-CHAIN_PROVIDERS=(loomy trae raccoon our-free-model)
-CHAIN_MODELS=(DeepSeek-V4.1-Flash deepseek-v4.1-flash sn-deepseek-v4-1-flash deepseek/deepseek-v4.1-flash)
-CHAIN_EFFORTS=(low light on light)
+# 2026-10-28：把 our-free-model 提到链首。
+# 原链首是 loomy，而本部署的日常渠道是 our-free-model ⇒ role 结构性地永远 fallback，
+# 黑话研究与结算都被它连累。改序后 chain[0] 就是日常渠道，role 才会是 main。
+CHAIN_PROVIDERS=(our-free-model loomy trae raccoon)
+CHAIN_MODELS=(deepseek/deepseek-v4.1-flash DeepSeek-V4.1-Flash deepseek-v4.1-flash sn-deepseek-v4-1-flash)
+CHAIN_EFFORTS=(light low light on)
 
 # A_/B_ 是链首与次级的别名 —— 脚本里还有一批地方按这两个名字取「主渠道」，
 # 保留它们可以让 record_history 的 role 判定、--status 输出等无需改动。
@@ -273,7 +276,7 @@ if len(hist) > HISTORY_MAX:
     del hist[:len(hist) - HISTORY_MAX]
 d['lastSwitchAt'] = now
 d['role'] = 'main' if to == main_provider else 'fallback'
-json.dump(d, open(p, 'w'), ensure_ascii=False, indent=2)
+json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 PY
 }
 
@@ -404,7 +407,7 @@ try: d = json.load(open(p))
 except Exception: d = {}
 d['slowStrikes'] = 0
 d['ledgerSnap'] = {}
-json.dump(d, open(p, 'w', ensure_ascii=False), indent=2)
+json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 PY
 }
 
@@ -430,7 +433,7 @@ p = sys.argv[1]
 try: d = json.load(open(p))
 except Exception: d = {}
 d['lastProbeAt'] = int(time.time() * 1000)
-json.dump(d, open(p, 'w'), ensure_ascii=False, indent=2)
+json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 PY
     return 0
   fi
@@ -526,7 +529,7 @@ try: d = json.load(open(p))
 except Exception: d = {}
 d['lastProbeAt'] = 0
 d['lastSwitchAt'] = 0
-json.dump(d, open(p, 'w'), ensure_ascii=False, indent=2)
+json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 print('已重置探测与切换冷却')
 PY
     exit 0 ;;
