@@ -37,8 +37,9 @@ import {
   MAX_BYTES as DIARY_MAX_BYTES,
   readDiary, writeDiary, appendDiaryEntry, updateDiaryEntry, removeDiaryEntry,
   recentDiary, recallDiary, diaryDays, diaryStats, parseLegacyMarkdown, localStamp,
-  normalizeLevel, daysSinceLast, DEFAULT_LEVEL, LEVEL_LABELS
-} from './diary-store.js';
+  normalizeLevel, daysSinceLast, DEFAULT_LEVEL, LEVEL_LABELS, setDiaryArt, countArtInDay} from './diary-store.js';
+import { artCfg, artAllowed, artFileName, buildArtPrompt, shouldSendArt } from './diary-art.js';
+// MARKER: diary-art-import
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import {
@@ -7594,6 +7595,8 @@ async function main() {
               const bytes = writeDiary(DIARY_FILE, entries);
               if (bytes > DIARY_MAX_BYTES) { sendJson({ ok: false, error: '日记文件已达上限' }, 400); return; }
               log(`[日记] ${key} 写了一条（共 ${entries.length} 条）`);
+              // MARKER: diary-art-trigger
+              try { queueDiaryArt(key, entry, { artPrompt: body.artPrompt }); } catch (error) { log(`[日记配图] 排队失败：${error?.message ?? error}`); }
               sendJson({
                 ok: true, key, mode: 'append',
                 level: normalizeLevel(entry.level),
@@ -9688,6 +9691,76 @@ function recordGeneratedImage(entry) {
 function recentGeneratedImages(limit = 5) {
   const n = Math.min(20, Math.max(1, Number(limit) || 5));
   return readGeneratedImages().slice(0, n);
+}
+
+// MARKER: diary-art
+// 日记配图：写完一条就顺手画一张手绘插画，画完写回 jsonl 并发到聊天里。
+// 异步、绝不阻塞写日记那条响应：画一张要 30~90 秒，等她回话就太慢了。
+const DIARY_ART_FILE = path.join(ROOT, 'diary', DIARY_JSONL);
+const DIARY_ART_DIR = path.join(ROOT, 'diary', 'art');
+const diaryArtInflight = new Map();
+
+function diaryTargetFromKey(key) {
+  const s = String(key ?? '');
+  const at = s.indexOf(':');
+  if (at <= 0) return null;
+  const kind = s.slice(0, at);
+  const id = Number(s.slice(at + 1));
+  if (!Number.isFinite(id) || id <= 0) return null;
+  return { kind, id };
+}
+
+function queueDiaryArt(key, entry, { artPrompt = '' } = {}) {
+  const c = artCfg(cfg);
+  if (!c.enabled) return false;
+  if (!entry || !entry.id) return false;
+  if (diaryArtInflight.has(entry.id)) return false;
+  let used = 0;
+  try { used = countArtInDay(readDiary(DIARY_ART_FILE), entry.day || ''); } catch {}
+  if (!artAllowed({ entriesToday: used, cfg })) {
+    log(`[日记配图] 今天已经 ${used} 张（上限 ${c.maxPerDay}），这次不画`);
+    return false;
+  }
+  const prompt = buildArtPrompt({
+    artPrompt: String(artPrompt ?? '').replace(/\s+/g, ' ').trim().slice(0, 200),
+    text: entry.text,
+    mood: entry.mood,
+    style: c.style,
+    character: c.character,
+    maxChars: c.maxPromptChars
+  });
+  diaryArtInflight.set(entry.id, Date.now());
+  log(`[日记配图] 开始画 ${entry.id}（提示词 ${prompt.length} 字）`);
+  void (async () => {
+    try {
+      const result = await generateImageNow({ prompt, size: c.size });
+      fs.mkdirSync(DIARY_ART_DIR, { recursive: true });
+      const dest = path.join(DIARY_ART_DIR, artFileName(entry));
+      fs.copyFileSync(result.path, dest);
+      const art = {
+        file: path.relative(path.join(ROOT, 'diary'), dest),
+        prompt,
+        style: c.style,
+        source: 'diary',
+        at: Date.now()
+      };
+      const fresh = readDiary(DIARY_ART_FILE);
+      if (setDiaryArt(fresh, { id: entry.id, art })) {
+        writeDiary(DIARY_ART_FILE, fresh);
+        log(`[日记配图] 完成 ${entry.id} -> ${art.file}`);
+      }
+      const target = diaryTargetFromKey(key);
+      if (target && shouldSendArt(c.sendToChat, key)) {
+        await onebotSend(target.kind, target.id, '', null, null, [dest]);
+        log(`[日记配图] 已发到 ${key}`);
+      }
+    } catch (error) {
+      log(`[日记配图] 画失败 ${entry.id}：${error?.message ?? error}`);
+    } finally {
+      diaryArtInflight.delete(entry.id);
+    }
+  })();
+  return true;
 }
 
 async function generateImageNow({ prompt, size }) {

@@ -40,6 +40,9 @@ function makeSandbox() {
   const sandbox = {
     path: { join: (...parts) => parts.filter(Boolean).join('/'), basename: (p) => String(p ?? '').split('/').pop() },
     STATE_DIR: '/state',
+    // 抠出来的那段现在还会读到 ROOT（日记配图运行时也在里面），真实 bridge 里它当然存在
+    ROOT: '/root',
+    DIARY_JSONL: '日记.jsonl',
     fs: {
       readFileSync: (p) => {
         if (!disk.has(p)) throw new Error('ENOENT');

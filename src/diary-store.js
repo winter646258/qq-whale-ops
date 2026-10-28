@@ -131,7 +131,8 @@ function parseLine(line) {
     mood: cleanMood(obj.mood),
     level: normalizeLevel(obj.level),
     text,
-    editedAt: Number(obj.editedAt) > 0 ? Number(obj.editedAt) : 0
+    editedAt: Number(obj.editedAt) > 0 ? Number(obj.editedAt) : 0,
+    art: cleanArt(obj.art)
   };
 }
 
@@ -172,7 +173,8 @@ export function writeDiary(file, entries) {
       // 只写非默认档：normal 是缺省，不落盘就不占字节，也顺手让旧文件读起来一样
       ...(normalizeLevel(e.level) !== DEFAULT_LEVEL ? { level: normalizeLevel(e.level) } : {}),
       text: e.text,
-      ...(e.editedAt ? { editedAt: e.editedAt } : {})
+      ...(e.editedAt ? { editedAt: e.editedAt } : {}),
+      ...(e.art && e.art.file ? { art: e.art } : {})
     }));
   const payload = lines.join('\n') + (lines.length ? '\n' : '');
   try {
@@ -183,6 +185,50 @@ export function writeDiary(file, entries) {
     throw error;
   }
   return Buffer.byteLength(payload, 'utf8');
+}
+
+/**
+ * 配图元信息：只留 file/prompt/style/source/at，别让奇怪的东西混进日记文件。
+ */
+function cleanArt(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const file = String(raw.file ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, 200);
+  if (!file) return null;
+  const style = String(raw.style ?? '').trim().slice(0, 20);
+  const source = String(raw.source ?? '').trim().slice(0, 20);
+  return {
+    file,
+    prompt: String(raw.prompt ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, MAX_TEXT_CHARS * 2),
+    ...(style ? { style } : {}),
+    ...(source ? { source } : {}),
+    at: Number(raw.at) > 0 ? Number(raw.at) : 0
+  };
+}
+
+/** 给某条日记挂上配图（按 id；没给 id 就挂最后一条）。返回那条 entry，找不到返回 null。 */
+export function setDiaryArt(entries, { id = '', art = null } = {}) {
+  const list = Array.isArray(entries) ? entries : [];
+  const want = String(id ?? '').trim();
+  let hit = want ? list.find((e) => e && String(e.id) === want) : null;
+  if (!hit) hit = [...list].reverse().find((e) => e && e.text) ?? null;
+  if (!hit) return null;
+  const clean = cleanArt(art);
+  if (clean) hit.art = clean;
+  else delete hit.art;
+  return hit;
+}
+
+/** 某一天已经配了几张图（day 为空就数全部）。 */
+export function countArtInDay(entries, day) {
+  const want = String(day ?? '').trim();
+  const list = Array.isArray(entries) ? entries : [];
+  let n = 0;
+  for (const e of list) {
+    if (!e || !e.art || !e.art.file) continue;
+    if (want && String(e.day || '') !== want) continue;
+    n += 1;
+  }
+  return n;
 }
 
 function newId(taken) {
