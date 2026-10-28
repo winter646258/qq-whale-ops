@@ -92,6 +92,11 @@ import {
 // 节奏层：什么时候叫醒她、回复后跳几次、主动间隔。纯逻辑在 pacing.js，带单测。
 // MARKER: pacing-import
 import { pacingCfg, skipDecision, urgeDelay } from './pacing.js';
+// 结算层：回合收工之后另起一个安静的小回合，把情绪和印象写回库里。纯逻辑在 settle.js。
+// MARKER: settle-import
+import {
+  buildSettlePrompt, parseSettleJSON, pickSettleMessages, planSettleWrites, settleCfg, shouldSettle
+} from './settle.js';
 // MARKER: shared-memory
 // 跨会话共享记忆：主人私聊能了解她在群里经历的重要事情，同时私聊专属内容
 // 不进群、群专属内容不自动进私聊。纯逻辑在 shared-memory-store.js，带单测。
@@ -2763,7 +2768,26 @@ async function main() {
   function slangResearchChannelIsFallback() {
     try {
       const st = readJsonSafe(path.join(STATE_DIR, 'provider-switch.json'), null);
-      return String(st?.role ?? '') === 'fallback';
+      const role = String(st?.role ?? '');
+      if (role !== 'fallback') return false;
+      // MARKER: fallback-guard-by-latency
+      // role 的语义只是「当前不在候选链链首」，不是「正在用临时慢渠道」。
+      // 本部署的日常渠道本身就配在链尾（config.json 的 dsh.provider），
+      // 于是 role 恒为 fallback，却根本不是慢渠道 —— 按位置判断会把
+      // 黑话研究和结算永久关掉（2026-10-28 实测：14:49 结算被这条挡下）。
+      // 改成按实测首字延迟判断：只有真的慢到「一次 turn 注定超时」才让路。
+      const slowMs = Number(st?.lastSlowAvgMs) || 0;
+      const strikes = Number(st?.slowStrikes) || 0;
+      const checkedAt = Number(st?.lastSlowCheckAt) || 0;
+      const limit = Math.max(1000, Number(cfg.socialV2?.settle?.slowGuardMs) || 12000);
+      // 慢信号必须新鲜（slowGuardFreshMs，默认 30 分钟）才算数。
+      // 原因：切换脚本走到候选链末尾时只写 chain-exhausted、不再刷新慢信号，
+      // 旧的 20515ms 会一直挂着 —— 按旧数字拦，后台任务等于永久关闭。
+      // 宁可放过去试一次（结算自带 timeoutMs 兜底），也不要静默罢工。
+      const freshMs = Math.max(60000, Number(cfg.socialV2?.settle?.slowGuardFreshMs) || 1800000);
+      const fresh = checkedAt > 0 && Date.now() - checkedAt < freshMs;
+      if (fresh && strikes >= 1 && slowMs >= limit) return true;
+      return false;
     } catch {
       return false;
     }
@@ -3648,6 +3672,223 @@ async function main() {
   // （turn 15 在群里配合玩梗，52 分钟 129 次工具调用），所以不能再靠提示词自律。
   const turnBudgetLedger = new Map(); // sessionId -> { startedAt, steps, sends, cancelled, reason }
   const TURN_BUDGET_GRACE_FILE = path.join(STATE_DIR, 'wake-config-grace.json');
+  // MARKER: settle-member-impression
+  // 「她对某个人的新印象」。从 qq_memory_update 的分支里抽出来 ——
+  // 工具通道和结算通道共用同一份口径（每条 40 字、每人最多 10 条、按人记时间），
+  // 免得"加"和"改"两条路宽度不同。
+  function applyMemberImpression(st, target, text) {
+    const who = String(target || '').trim();
+    if (!st || !who) return false;
+    if (['__proto__', 'constructor', 'prototype'].includes(who)) return false;
+    const value = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    if (!value) return false;
+    if (!st.memberImpressions || typeof st.memberImpressions !== 'object') st.memberImpressions = {};
+    const old = st.memberImpressions[who] || {};
+    const traits = Array.isArray(old.traits) ? old.traits.slice(0, 10) : [];
+    if (!traits.includes(value)) traits.push(value);
+    st.memberImpressions[who] = {
+      traits,
+      interactionCount: (Number(old.interactionCount) || 0) + 1,
+      lastSeenAt: Date.now(),
+      // MARKER: impression-per-member —— 按成员记时间，别让「改了一个人」把整会话的计时重置掉。
+      refreshedAt: Date.now()
+    };
+    const entries = Object.entries(st.memberImpressions);
+    if (entries.length > 50) {
+      entries.sort((a, b) => (Number(a[1]?.lastSeenAt) || 0) - (Number(b[1]?.lastSeenAt) || 0));
+      for (let i = 0; i < entries.length - 50; i += 1) delete st.memberImpressions[entries[i][0]];
+    }
+    return true;
+  }
+
+  // MARKER: settle-runtime
+  // 结算通道：回合收工 → 隔几十秒 → 一个独立小会话读最近几轮原文 → 写情绪/印象。
+  //
+  // 为什么不在聊天里做：2026-10-25 铁律 —— 情绪/关系写入放结算，绝不新增聊天中的工具
+  // 调用（一次工具调用重发约 24 万 token）。可这条铁律一直没被实现，于是情绪库停在
+  // 10-24、印象重写 0 个、`qq_mood` 调用 0 次。这里是把它真做出来。
+  const SETTLE_SESSION_FILE = path.join(STATE_DIR, 'settle-session.json');
+  const settleSessions = new Set();
+  const settleTimers = new Map();
+  let settleSessionId = null;
+  let settleRunning = false;
+
+  function isSettleSession(sessionId) {
+    return settleSessions.has(sessionId);
+  }
+
+  async function ensureSettleSession() {
+    if (settleSessionId && settleSessions.has(settleSessionId)) {
+      learnerSessions.add(settleSessionId);
+      api.events.follow(settleSessionId);
+      return settleSessionId;
+    }
+    const sc = settleCfg(cfg);
+    const preset = resolvePresetName(sc.preset || cfg.slang?.learnerPreset || cfg.agentPreset, { strict: true });
+    if (!preset) throw new Error('结算会话缺少已验证的安全 preset，拒绝创建');
+    const saved = readJsonSafe(SETTLE_SESSION_FILE, null);
+    const dir = path.join(STATE_DIR, 'settle-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    let workspaceId = saved && typeof saved === 'object' ? String(saved.__workspaceId ?? '') : '';
+    if (!workspaceId) {
+      const ws = unwrap(await api.workspace.create({ path: dir }), 'settle workspace.create');
+      workspaceId = ws.workspace.workspaceId;
+      try { atomicWriteJson(SETTLE_SESSION_FILE, { __workspaceId: workspaceId, __updatedAt: Date.now() }); } catch {}
+    }
+    const value = unwrap(await api.sessions.create({ workspaceId, agentPreset: preset }), 'settle session.create');
+    const sessionId = value.sessionId;
+    api.events.follow(sessionId);
+    settleSessions.add(sessionId);
+    // 塞进 learnerSessions 是为了让事件循环用「学习会话」那套收集器收她的回答：
+    // 有 key 的会话帧会被当成 QQ 会话去发消息，结算会话绝不能走那条路。
+    learnerSessions.add(sessionId);
+    settleSessionId = sessionId;
+    log(`[settle] 结算会话已创建：${sessionId}（preset ${preset}）`);
+    return sessionId;
+  }
+
+  function dropSettleSession(sessionId) {
+    settleSessions.delete(sessionId);
+    learnerSessions.delete(sessionId);
+    if (settleSessionId === sessionId) settleSessionId = null;
+  }
+
+  /** 等一次结算 turn。返回 {promise, cancel}。 */
+  function waitSettleTurn(sessionId, timeoutMs) {
+    let timer = null;
+    const drop = () => {
+      const arr = learnerWaiters.get(sessionId) ?? [];
+      const idx = arr.findIndex((w) => w.timer === timer);
+      if (idx >= 0) arr.splice(idx, 1);
+      if (arr.length === 0) learnerWaiters.delete(sessionId);
+      if (timer) clearTimeout(timer);
+    };
+    const promise = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        drop();
+        reject(new Error(`结算超时（${timeoutMs}ms）`));
+      }, timeoutMs);
+      const arr = learnerWaiters.get(sessionId) ?? [];
+      arr.push({ resolve, reject, timer });
+      learnerWaiters.set(sessionId, arr);
+    });
+    return { promise, cancel: drop };
+  }
+
+  async function runSettle(key) {
+    const sc = settleCfg(cfg);
+    if (!sc.enabled) return;
+    if (settleRunning) { log('[settle] 上一次结算还没收工，跳过'); return; }
+    const st = getSocialV2State(key);
+    if (isConversationBusyV2(key, st)) { log(`[settle] ${key} 正在回合中，等它收工再说`); return; }
+    const gate = shouldSettle({ key, st, now: Date.now(), cfg });
+    if (!gate.ok) {
+      if (gate.reason !== 'cooldown' && gate.reason !== 'too-few') log(`[settle] ${key} 不结算（${gate.reason}）`);
+      return;
+    }
+    // MARKER: settle-slow-gate
+    // 渠道太慢就别排这一趟（结算本身有 timeoutMs 兜底，这里只挡「注定超时」的情况）。
+    // 阈值看首字延迟：60 秒首字 + 生成必然撑爆 120 秒的 timeoutMs。
+    // 不用 slangResearchChannelIsFallback()：那个按「是否在候选链链首」判断，
+    // 本部署的日常渠道就配在链尾，按位置判断会把结算永久关掉。
+    const _ps = readJsonSafe(path.join(STATE_DIR, 'provider-switch.json'), null) || {};
+    const _slowMs = Number(_ps.lastSlowAvgMs) || 0;
+    const _strikes = Number(_ps.slowStrikes) || 0;
+    const _checkedAt = Number(_ps.lastSlowCheckAt) || 0;
+    const _slowLimit = Math.max(0, Number(sc.slowGuardMs) || 0);
+    const _slowFresh = _checkedAt > 0 && Date.now() - _checkedAt < 1800000;
+    if (_slowLimit > 0 && _slowFresh && _strikes >= 1 && _slowMs >= _slowLimit) {
+      log(`[settle] ${key} 渠道太慢（首字 ${_slowMs}ms ≥ ${_slowLimit}ms，role=${_ps.role}），跳过结算`);
+      return;
+    }
+
+    const lines = pickSettleMessages(st.recentMessages, { maxMessages: sc.maxMessages, maxChars: sc.maxChars });
+    if (lines.length < 2) return;
+    const known = Object.entries(st.memberImpressions || {})
+      .map(([who, v]) => ({ who, text: String((Array.isArray(v?.traits) ? v.traits.slice(-1)[0] : '') ?? '') }))
+      .filter((x) => x.text);
+    const promptText = buildSettlePrompt({ key, isGroup: String(key).startsWith('group:'), lines, impressions: known });
+
+    settleRunning = true;
+    let settleDone = false;
+    try {
+      let sessionId = await ensureSettleSession();
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const handle = waitSettleTurn(sessionId, sc.timeoutMs);
+        const accepted = await api.sessions.prompt({
+          sessionId,
+          mode: 'queue',
+          content: [{ type: 'text', text: promptText }]
+        });
+        if (!accepted?.result?.ok) {
+          handle.cancel();
+          const why = `${accepted?.result?.error?.code}: ${accepted?.result?.error?.message}`;
+          if (attempt === 1 && /not[- ]?found|unavailable|不存在/i.test(why)) {
+            dropSettleSession(sessionId);
+            sessionId = await ensureSettleSession();
+            continue;
+          }
+          log(`[settle] ${key} 提问失败：${why}`);
+          return;
+        }
+        const text = await handle.promise;
+        const parsed = parseSettleJSON(text);
+        if (!parsed.ok) { log(`[settle] ${key} 解析失败：${parsed.error}`); return; }
+        const plan = planSettleWrites(parsed.value, { maxImpressions: sc.maxImpressions });
+
+        let wroteMood = false;
+        if (plan.mood) {
+          try {
+            const next = setMood(moodStore(), {
+              label: plan.mood.label,
+              reason: plan.mood.reason,
+              pleasure: plan.mood.pleasure,
+              arousal: plan.mood.arousal,
+              dominance: plan.mood.dominance
+            });
+            saveMoodSafe(next, '情绪');
+            wroteMood = true;
+          } catch (error) {
+            log(`[settle] 情绪写入失败：${error?.message ?? error}`);
+          }
+        }
+        let wroteImp = 0;
+        for (const item of plan.impressions) {
+          if (applyMemberImpression(st, item.who, item.text)) wroteImp += 1;
+        }
+        settleDone = true;
+        st.lastSettleAt = Date.now();
+        if (wroteMood || wroteImp) saveSocialV2State();
+        const moodNote = wroteMood ? `「${plan.mood.label}」` : '无变化';
+        const skipNote = plan.skippedImpressions ? `（${plan.skippedImpressions} 条超限没写）` : '';
+        log(`[settle] ${key} 结算完成：情绪${moodNote}，印象 ${wroteImp} 条${skipNote}`);
+        return;
+      }
+    } catch (error) {
+      log(`[settle] ${key} 出错：${error?.message ?? error}`);
+    } finally {
+      settleRunning = false;
+      // 没成也要记一笔：否则慢渠道/JSON 不合规时，每个回合收工都会再白试一次。
+      if (!settleDone) {
+        st.lastSettleAt = Date.now();
+        saveSocialV2State();
+        log(`[settle] ${key} 这轮没成，冷却 ${Math.round((Number(sc.cooldownMs) || 0) / 60000)} 分钟后再试`);
+      }
+    }
+  }
+
+  function scheduleSettle(key) {
+    const sc = settleCfg(cfg);
+    if (!sc.enabled) return;
+    if (settleTimers.has(key)) return;
+    const timer = setTimeout(() => {
+      settleTimers.delete(key);
+      runSettle(key).catch((error) => log(`[settle] ${key} 未捕获：${error?.message ?? error}`));
+    }, sc.delayMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    settleTimers.set(key, timer);
+  }
+
   function turnBudgetCfg(key) {
     const b = cfg.socialV2?.turnBudget ?? {};
     const pick = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : d);
@@ -9672,30 +9913,7 @@ async function main() {
       }
       if (st.pendingThoughts.length > 20) st.pendingThoughts.splice(0, st.pendingThoughts.length - 20);
     } else if (cat === 'memberImpression') {
-      const target = String(extra.target || '').trim();
-      if (!target || ['__proto__', 'constructor', 'prototype'].includes(target)) return;
-      if (!st.memberImpressions || typeof st.memberImpressions !== 'object') st.memberImpressions = {};
-      const old = st.memberImpressions[target] || {};
-      // MARKER: ghosttool
-      // 与 memory-update 保持同一个长度口径（40 字），免得"加"和"改"两条路宽度不同。
-      const traits = Array.isArray(old.traits) ? old.traits.slice(0, 10) : [];
-      const shortText = text.slice(0, 40);
-      if (shortText && !traits.includes(shortText)) traits.push(shortText);
-      st.memberImpressions[target] = {
-        traits,
-        interactionCount: (Number(old.interactionCount) || 0) + 1,
-        lastSeenAt: Date.now(),
-        // MARKER: impression-per-member —— 主动追加标签本身就是在更新印象，
-        // 按成员记时间，别让「改了一个人」把整会话的计时重置掉。
-        refreshedAt: Date.now()
-      };
-      const impressionEntries = Object.entries(st.memberImpressions);
-      if (impressionEntries.length > 50) {
-        impressionEntries.sort((a, b) => (Number(a[1]?.lastSeenAt) || 0) - (Number(b[1]?.lastSeenAt) || 0));
-        for (let i = 0; i < impressionEntries.length - 50; i++) {
-          delete st.memberImpressions[impressionEntries[i][0]];
-        }
-      }
+      applyMemberImpression(st, String(extra.target || ''), text);
     }
     saveSocialV2State();
   }
@@ -13022,7 +13240,7 @@ async function main() {
                     }
                   }
                   // 旧学习会话 turn 结束后从集合移除，避免残留
-                  if (frame.sessionId !== slangLearnerSessionId && frame.sessionId !== slangResearchSessionId && !isVisionSession(frame.sessionId)) learnerSessions.delete(frame.sessionId);
+                  if (frame.sessionId !== slangLearnerSessionId && frame.sessionId !== slangResearchSessionId && !isVisionSession(frame.sessionId) && !isSettleSession(frame.sessionId)) learnerSessions.delete(frame.sessionId);
                 }
               }
               continue;
@@ -13134,6 +13352,13 @@ async function main() {
                   }
                   turnBudgetLedger.delete(frame.sessionId);
                 }
+              }
+              // MARKER: settle-trigger —— 回合收工后过一会儿结算这一轮：
+              // 她的情绪走向、对谁多了什么印象。放在回合之外做，所以不占她聊天中的工具调用。
+              try {
+                scheduleSettle(key);
+              } catch (error) {
+                log(`[settle] 排队失败：${error?.message ?? error}`);
               }
               collectors.delete(frame.sessionId);
               const sendToolSucceeded = sendToolSucceededSessions.has(frame.sessionId);
