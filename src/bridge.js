@@ -89,6 +89,9 @@ import {
   ventUndercurrent, resolveUndercurrent, setBaseline, moodStats,
   MOOD_FILE as MOOD_STORE_FILE
 } from './mood-store.js';
+// 节奏层：什么时候叫醒她、回复后跳几次、主动间隔。纯逻辑在 pacing.js，带单测。
+// MARKER: pacing-import
+import { pacingCfg, skipDecision, urgeDelay } from './pacing.js';
 // MARKER: shared-memory
 // 跨会话共享记忆：主人私聊能了解她在群里经历的重要事情，同时私聊专属内容
 // 不进群、群专属内容不自动进私聊。纯逻辑在 shared-memory-store.js，带单测。
@@ -11069,6 +11072,40 @@ async function main() {
     return null;
   }
 
+  // MARKER: mood-fade
+  // 「此刻的情绪」也要会淡：两道闸从 config 读，默认 0.12 / 24 小时。
+  function moodFadeCfg() {
+    const m = cfg.socialV2?.mood ?? {};
+    const num = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+    return {
+      labelMinIntensity: num(m.labelMinIntensity, 0.12),
+      labelMaxMs: Math.max(60000, num(m.labelMaxHours, 24) * 60 * 60 * 1000)
+    };
+  }
+
+  // MARKER: skip-jitter
+  // 「刚说完话就先歇几次」的抖动闸。每条消息过一遍：
+  //   1) 计数（本条算一次触发）
+  //   2) 她说过新的话就重掷 target
+  //   3) 只有软触发（anyMessage / keyword / speaker / probability）会被跳
+  // 明确在叫她的（private / atMention / nameMention / question / poke）永远放行 ——
+  // 这是 wake-priority-exempt 的教训：额度被低优先级吃光后，叫名字被丢了 8 次。
+  function applySkipJitterV2(key, st, reason) {
+    const pc = pacingCfg(cfg);
+    if (!pc.enabled || pc.skip?.enabled === false) return reason;
+    const now = Date.now();
+    const d = skipDecision({ st, reason, now, hour: new Date(now).getHours(), cfg: pc, random: Math.random });
+    st.skipSeen = d.seen;
+    st.skipTarget = d.target;
+    st.skipRolledAt = d.rolledAt;
+    if (d.rolled) log(`[skip-jitter] ${key} 回复后先跳 ${d.target} 次软触发（${d.level}）`);
+    if (!d.skip) return reason;
+    if (d.seen === 1 || d.seen === d.target) {
+      log(`[skip-jitter] ${key} 跳过第 ${d.seen}/${d.target} 次（${reason}）`);
+    }
+    return null;
+  }
+
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
     if (kind === 'private') return 'private';
     // MARKER: mute-aware-skip —— 禁言期间这个群发不出任何东西，唤醒只会白烧 token。
@@ -11634,7 +11671,7 @@ async function main() {
     let moodLine = '';
     if (cfg.socialV2?.mood?.enabled !== false) {
       try {
-        const text = describeMood(moodStore(), Date.now());
+        const text = describeMood(moodStore(), Date.now(), moodFadeCfg());
         moodLine = text ? text + '\n\n' : '';
       } catch (error) {
         log(`[reserved2] 情绪注入跳过 ${key}：${error?.message ?? error}`);
@@ -12258,6 +12295,22 @@ async function main() {
       delay = Math.min(storedNextAt - nowMs, max * 2);
     } else {
       delay = Math.floor(min + Math.random() * (max - min));
+      // MARKER: urge-pacing —— 固定 [min,max] 随机换成乘法模型：
+      //   间隔 = 基础间隔 / (对话密度因子 × 生活节奏因子)
+      // 热闹时更勤、深夜/久无人语时更懒。夹在 [minDelayMs, base×4] 之间，
+      // 前面那道 proactiveHardCapV2 仍然在最外层把关，这里只决定「多久看一次」。
+      const baseDelay = delay;
+      const urge = urgeDelay({
+        baseMs: baseDelay,
+        recentMessages: st.recentMessages,
+        lastIncomingAt: st.lastIncomingAt,
+        now: nowMs,
+        cfg: pacingCfg(cfg)
+      });
+      delay = urge.delay;
+      if (baseDelay > 0 && Math.abs(urge.delay - baseDelay) / baseDelay > 0.2) {
+        log(`[urge] ${key} 主动间隔 ${Math.round(urge.delay / 60000)}min（密度 ${urge.density} × ${urge.rhythm} ${urge.multiplier}，基准 ${Math.round(baseDelay / 60000)}min）`);
+      }
     }
     st.proactiveNextAt = nowMs + delay;
     if (!opts.skipSave) saveSocialV2State();
@@ -12590,8 +12643,11 @@ async function main() {
         scheduleWakeV2(key, 'bootstrap');
       } else {
         const reason = evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
-        if (reason) {
-          scheduleWakeV2(key, reason);
+        // MARKER: skip-jitter —— 每条消息都要过闸（既计数也判定），
+        // 所以不能只在 reason 有值时才调。
+        const gated = applySkipJitterV2(key, st, reason);
+        if (gated) {
+          scheduleWakeV2(key, gated);
         }
       }
       appendActivity(`${key} [reserved2] 消息已入未读：${textContent.slice(0, 80)}`);

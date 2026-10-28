@@ -44,11 +44,16 @@
             config:
               - id: compaction-basic
                 name: '@deepseek-ai/dsh-compaction-basic'
+                config:
+                  thresholdRatio: 0.55
+                  retainRatio: 0.06
+                  headroomTokens: 4000
+                  compactionRetries: 0
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               - id: tool-result-pruner
                 name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
                 config:
-                  thresholdChars: 50000
-                  headChars: 45000
-                  tailChars: 2000
+                  thresholdChars: 12000
+                  headChars: 10000
+                  tailChars: 1500

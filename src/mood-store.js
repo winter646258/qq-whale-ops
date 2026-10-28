@@ -67,6 +67,14 @@ export const AFFINITY_MIN = 1;
 export const AFFINITY_MAX = 10;
 export const MAX_BYTES = 256 * 1024;
 
+// MARKER: mood-fade —— 「此刻」也要会淡。
+// 旧实现只衰减 PAD 三维，label/reason 原样留在注入里，于是她能连着几天读到
+// 「【此刻】有点意外 · …（4 天前开始）」。PAD 早就归位了，标签还在。
+// 这两个数是 describeMood 的两道闸：偏离小于阈值就当她情绪过去了；
+// 挂得太久（哪怕 PAD 还没完全归位）也不再把旧标签当「此刻」念。
+export const DEFAULT_LABEL_MIN_INTENSITY = 0.12;
+export const DEFAULT_LABEL_MAX_MS = 24 * 60 * 60 * 1000;
+
 // ── 基础工具 ────────────────────────────────────────────────────────────
 
 function clamp(value, min, max) {
@@ -439,16 +447,46 @@ export function formatDuration(ms) {
  * 当前生效的情绪：衰减后的值 + 已经持续多久 + 暗流/好感度。
  * 这是给 bridge 用的唯一入口 —— 它不写盘，纯读。
  */
-export function effectiveMood(state, now = Date.now()) {
+/**
+ * 当前情绪离底色有多远：三维里偏得最远的那一维。0 = 已经归位。
+ *
+ * 这是「情绪还在不在」的唯一判据 —— 不用时间戳猜，用衰减后的真实偏离量。
+ * 所以「写了一句很强的话，然后隔了一夜」和「昨天写过、今天又提了一句」
+ * 得到的是同一个答案：PAD 归位了就是过去了。
+ */
+export function moodIntensity(state, now = Date.now()) {
+  const s = normalizeState(state, now);
+  const pad = decayMood(s, now);
+  let max = 0;
+  for (const key of PAD_KEYS) {
+    const gap = Math.abs(Number(pad[key]) - Number(s.baseline[key]));
+    if (Number.isFinite(gap) && gap > max) max = gap;
+  }
+  return round3(max);
+}
+
+export function effectiveMood(state, now = Date.now(), opts = {}) {
   const s = normalizeState(state, now);
   const pad = decayMood(s, now);
   const since = s.since || s.updatedAt || now;
+  const durationMs = Math.max(0, now - since);
+  const intensity = moodIntensity(s, now);
+  const minIntensity = Number.isFinite(Number(opts.labelMinIntensity))
+    ? Number(opts.labelMinIntensity)
+    : DEFAULT_LABEL_MIN_INTENSITY;
+  const maxMs = Number.isFinite(Number(opts.labelMaxMs)) && Number(opts.labelMaxMs) > 0
+    ? Number(opts.labelMaxMs)
+    : DEFAULT_LABEL_MAX_MS;
+  // MARKER: mood-fade —— 两个闸：情绪已经归位，或者这个标签挂得太久。
+  const faded = intensity < minIntensity || durationMs > maxMs;
   return {
     pad,
     label: s.label,
     reason: s.reason,
     since,
-    durationMs: Math.max(0, now - since),
+    durationMs,
+    intensity,
+    faded,
     undercurrent: s.undercurrent.map((item) => ({ ...item })),
     undercurrentLoad: undercurrentLoad(s)
   };
@@ -473,11 +511,13 @@ export function describeBaseline(state) {
  *
  * 空的东西整行不出现 —— 不写「无」「暂无」，那只是噪声。
  */
-export function describeMood(state, now = Date.now()) {
-  const eff = effectiveMood(state, now);
+export function describeMood(state, now = Date.now(), opts = {}) {
+  const eff = effectiveMood(state, now, opts);
   const lines = [];
 
-  if (eff.label) {
+  // MARKER: mood-fade —— 「此刻」只写还在的。情绪凉透了整行不出现，
+  // 而不是留一句「（4 天前开始）」让她照着念。
+  if (eff.label && !eff.faded) {
     const why = eff.reason ? ` · ${eff.reason}` : '';
     lines.push(`【此刻】${eff.label}${why}（${formatDuration(eff.durationMs)}）`);
   }
@@ -504,6 +544,8 @@ export function moodStats(state, now = Date.now()) {
     version: s.version,
     label: eff.label || '(未设置)',
     pad: eff.pad,
+    intensity: eff.intensity,
+    faded: eff.faded,
     baseline: s.baseline,
     durationMs: eff.durationMs,
     undercurrentCount: s.undercurrent.length,
