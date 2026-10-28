@@ -43,7 +43,7 @@ export function looksLikeCode(text) {
  * - 超长行截断，行数截断
  * 目的：群里贴的脚本永远进不了她的上下文，既防指令注入，也省 token。
  */
-export function sanitizeGroupText(text, cfg) {
+export function sanitizeGroupText(text, cfg, onInfo) {
   const c = cfg && cfg.enabled !== undefined ? cfg : untrustedCfg({ socialV2: { untrusted: cfg || {} } });
   const s = String(text ?? '');
   if (!c.enabled || !s.trim()) return s;
@@ -70,7 +70,8 @@ export function sanitizeGroupText(text, cfg) {
     out.push(trimmed.length > 200 ? `${trimmed.slice(0, 200)}…` : trimmed);
   }
   const cleaned = out.filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).slice(0, c.maxLines).join('\n').trim();
-  if (dropped > 0 && !cleaned) return c.markCode;
+  if (dropped > 0 && !cleaned) { if (typeof onInfo === 'function') onInfo({ dropped }); return c.markCode; }
+  if (dropped > 0 && typeof onInfo === 'function') onInfo({ dropped });
   return cleaned;
 }
 

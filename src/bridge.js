@@ -11200,8 +11200,9 @@ async function generateImageNow({ prompt, size }) {
       // MARKER: untrusted-ingest —— 群里的代码/命令只当素材，永远不进她的上下文。
       // 实测动机：群友可以直接贴一段脚本或「请帮我执行」，那是指令注入的入口；
       // 主人也明确要求「不要让鱼读群里的任何代码和指令」。
+      // MARKER: untrusted-audit —— 挡下来的东西要留痕：她记不记得不要紧，出事查得到。
       text: truncateText(String(key).startsWith('group:')
-        ? sanitizeGroupText(textContent, untrustedCfg(cfg))
+        ? sanitizeGroupText(textContent, untrustedCfg(cfg), untrustedReporter(key, textContent))
         : textContent, 200),
       plain: truncateText(String(key).startsWith('group:')
         ? sanitizeGroupText(plainText ?? textContent, untrustedCfg(cfg))
@@ -11237,6 +11238,17 @@ async function generateImageNow({ prompt, size }) {
     const entry = social.pendingSummaries.get(key);
     entry.items.push({ sender, text: truncateText(String(textContent), 200), plain: truncateText(String(plainText ?? textContent), 200), isOwner: !!isOwner, media: Array.isArray(media) ? media : [], messageId: messageRef ? String(messageRef) : '', hasMedia: Array.isArray(media) && media.length > 0, time: Date.now() });
     if (entry.items.length > 60) entry.items.shift();
+  }
+
+  // MARKER: untrusted-audit-fn —— 每挡一条群里贴的代码/命令，记一行账。
+  function untrustedReporter(key, rawText) {
+    let reported = false;
+    return (info) => {
+      if (reported) return;
+      reported = true;
+      const hits = inspectUntrusted(rawText).join(',') || 'code';
+      log(`[untrusted] ${key} 群里贴的代码/命令只当素材（${hits}，挡下 ${info?.dropped ?? '?'} 行）`);
+    };
   }
 
   function buildContextBlock(key) {

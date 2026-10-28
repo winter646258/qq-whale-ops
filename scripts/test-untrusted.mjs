@@ -97,7 +97,8 @@ const bridgeSrc = fs.readFileSync(path.join(here, '../src/bridge.js'), 'utf8');
 ok('bridge 引了 untrusted 模块', () => assert.ok(bridgeSrc.includes("from './untrusted.js'")));
 ok('入库处对群消息做了 sanitize', () => {
   assert.ok(bridgeSrc.includes('MARKER: untrusted-ingest'));
-  assert.ok(/sanitizeGroupText\(textContent, untrustedCfg\(cfg\)\)/.test(bridgeSrc));
+  // 入库处现在带审计回调：少了它等于挡了不记账，所以两个都查。
+  assert.ok(/sanitizeGroupText\(textContent, untrustedCfg\(cfg\), untrustedReporter\(key, textContent\)\)/.test(bridgeSrc));
   assert.ok(/sanitizeGroupText\(plainText \?\? textContent, untrustedCfg\(cfg\)\)/.test(bridgeSrc));
 });
 ok('群聊提示词粘了 GROUP_RULES', () => {
