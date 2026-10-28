@@ -5478,7 +5478,7 @@ async function main() {
       rejectImageApproval: (st, id) => rejectImageApproval(st, id),
       persistImageApproval: (action, detail) => persistImageApproval(action, detail),
       commitApprovedImageApproval: (approval) => commitApprovedImageApproval(approval),
-      generateImageNow: (opts) => generateImageNow(opts),
+      generateImageNow: (opts) => generateImageWithRetry(opts),
       onebotSend: (kind, id, message, replyToMessageId, atUserId, images) =>
         onebotSend(kind, id, message, replyToMessageId, atUserId, images),
       throttleMs: () => IMAGE_THROTTLE_MS,
@@ -5959,7 +5959,7 @@ async function main() {
     const ownerKey = imageApprovalOwnerKey();
     try {
       log(`[imgapprove] 主人已通过 ${approval.id}，开始出图（${approval.key}）：${String(approval.prompt).slice(0, 50)}`);
-      const result = await generateImageNow({ prompt: approval.prompt, size: approval.size || undefined });
+      const result = await generateImageWithRetry({ prompt: approval.prompt, size: approval.size || undefined });
       let sent = false;
       try {
         if (result?.path) {
@@ -9598,6 +9598,36 @@ async function main() {
    * 真去画。同步落一份本地副本 —— 上游给的 url 是别人站点的，过期就没了，
    * 她要回看或者转发都得有自己的原件。
    */
+  // MARKER: image-retry-once
+  // 为什么要有这一层：上游（凌风AI 中转）偶尔在 30~40 秒把连接掐掉，undici 在读 body 时
+  // 抛出来的错误 message 就只有一个词 `terminated` —— 2026-10-28 18:19 那次正好卡在 38 秒，
+  // 她只能对主人说「画失败了：terminated」。生图没有副作用（每次都是新画一张），
+  // 对这种纯网络层断连重试一次，比让她去解释「terminated 是什么」划算得多。
+  // 反过来：4xx/5xx、超时、上游返回非 JSON、上游没给图片 —— 一律不重试，重试只会再错一次还多烧钱。
+  const IMAGE_RETRYABLE_RE = /terminated|ECONNRESET|socket hang up|other side closed|UND_ERR|fetch failed|EPIPE|ETIMEDOUT/i;
+  function describeImageError(error) {
+    const name = error?.name || 'Error';
+    const msg = String(error?.message || error);
+    const code = error?.cause?.code || error?.code || '';
+    return code ? `${msg}（${name}/${code}）` : `${msg}（${name}）`;
+  }
+  async function generateImageWithRetry(args) {
+    try {
+      return await generateImageNow(args);
+    } catch (error) {
+      const first = describeImageError(error);
+      if (!IMAGE_RETRYABLE_RE.test(first)) throw new Error(first);
+      log(`[image] 上游连接被掐断，3 秒后重试一次：${first}`);
+      await new Promise((resolve) => { const t = setTimeout(resolve, 3000); t.unref?.(); });
+      try {
+        const result = await generateImageNow(args);
+        log('[image] 重试成功');
+        return result;
+      } catch (error2) {
+        throw new Error(`${describeImageError(error2)}（已重试一次）`);
+      }
+    }
+  }
   async function generateImageNow({ prompt, size }) {
     const imageCfg = cfg.socialV2?.image ?? {};
     const baseUrl = String(imageCfg.baseUrl || 'https://ai.windking.shop/v1').replace(/\/+$/, '');
