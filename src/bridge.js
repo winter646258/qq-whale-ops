@@ -1669,6 +1669,13 @@ async function main() {
       push: (entry) => {
         slangEntries.push(entry);
       },
+      // MARKER: slang-set-entries —— 模块里 batch-delete / clear / batch-confirm /
+      // batch-reject 都靠它整体换数组（见 src/modules/slang/index.js:91/94/114/128）。
+      // 上面第 2 类句柄的注释本来就承诺了"只交 getter/setter"，但这个 setter 一直没交，
+      // 于是这四个控制台接口线上全是 HTTP 500「h.setEntries is not a function」。
+      setEntries: (next) => {
+        slangEntries = Array.isArray(next) ? next : [];
+      },
       save: () => saveSlangStore(),
       createEntry: (input) => createSlangEntry(input),
       SLANG_STATUS,
@@ -3186,7 +3193,10 @@ async function main() {
       const win = slangWindows.get(key) ?? [];
       slangWindows.set(key, win.slice(messages.length));
       saveSlangStore();
-      log(`黑话提取：${key} 新增 ${added} 条，更新 ${updated} 条`);
+      const skippedBot = Number(slangSkippedBot.get(key)) || 0;
+      slangSkippedBot.delete(key);
+      log(`黑话提取：${key} 新增 ${added} 条，更新 ${updated} 条`
+        + (skippedBot > 0 ? `（窗口里挡掉 ${skippedBot} 条机器人消息）` : ''));
       noteSlangLearnerHealthy();  // MARKER: item7-slang
       if (researchCandidates.length && cfg.slang?.autoResearch !== false) {
         queueSlangTask(() => runSlangResearch(researchCandidates));
@@ -3391,10 +3401,38 @@ async function main() {
     queueSlangTask(() => runSlangExtraction(key));
   }
 
+  // MARKER: slang-human-only —— 黑话只从「真人」的群消息里学。
+  //
+  // 为什么：库被「落盘」「兜底默认回复」「一条账一条命」「驳回申请！本猫猫这里
+  // 没有这种数值面板喵」这类碎片填满过 2000 条上限。查下来它们不是群友的黑话，
+  // 是**别的机器人**（含同类 agent bot，群里就有一个「饭饭鲸-Agent」）在群里
+  // 大段叙述自己的运行/开发过程，被提取器当成"陌生词"照单全收。
+  // 判断依据用现成的 isKnownBot()（网关的群机器人表，下面是它的缓存），
+  // 加上 sender 自带机器人标记的兜底；拿不准时**放行**真人，宁可少学一条，
+  // 不要因为她把别的 bot 的话当成群文化。
+  //
+  // 顺带挡住私聊：私聊里聊的是技术和日常，不是群黑话，key 前缀不是 group: 就进不来。
+  function slangFeedAllowed(key, event) {
+    const k = String(key ?? '');
+    if (!k.startsWith('group:')) return false;
+    const uid = event?.user_id ?? event?.userId;
+    if (uid == null || String(uid) === '') return false;
+    const sender = event?.sender ?? {};
+    if (sender.is_robot === true || sender.robot === true || sender.is_bot === true) return false;
+    return !isKnownBot(k.slice('group:'.length), uid);
+  }
+
+  const slangSkippedBot = new Map(); // key -> 本轮窗口里被挡掉的机器人消息数（只用于日志）
+
   // 黑话学习素材入口：群聊普通消息进入滚动窗口（命令/角色控制语不学；
   // 只学当前消息自己的文字，不学引用原文）。一代/二代共用。
-  function feedSlangWindow(key, sender, plainContent) {
+  function feedSlangWindow(key, sender, plainContent, event) {
     if (cfg.slang?.enabled === false) return;
+    if (!slangFeedAllowed(key, event)) {
+      // 只统计，不打每条日志（群里机器人说话很频繁，逐条打会把日志刷满）
+      if (key) slangSkippedBot.set(key, (Number(slangSkippedBot.get(key)) || 0) + 1);
+      return;
+    }
     if (!key || !plainContent || typeof plainContent !== 'string') return;
     const text = plainContent.trim();
     if (!text || text.startsWith('/')) return;
@@ -10732,6 +10770,21 @@ async function main() {
     st.preSleepWaitAccumMs = 0;
     st.recentMessages.push(msg);
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    // MARKER: sticker-sightings-v2 —— 观测层在这里也必须挂一份。
+    // 踩过的坑：群里天天有图（vision 一条条在识别），可 state/sticker-sightings.json
+    //           停在「items: []」二十多个小时不动、启动日志永远「已记录 0 张图」。
+    // 原因是观测层只挂在 v1 的 appendRecentMessage 里，而线上跑的是 reserved2 ——
+    // 那个分支要再往下十几行才到 appendRecentMessage，早就在中间 return 了。
+    // 只记图片 MD5，不碰表情库、不发消息、不改提示词；出任何错都静默吞掉。
+    try {
+      if (safeMedia.length) {
+        const prev = st.recentMessages.length >= 2 ? st.recentMessages[st.recentMessages.length - 2] : null;
+        const nowPlain = String(textContent ?? '').trim();
+        // 纯图消息的正文恒为「[图片]」，拿它当上下文没信息量，改用上一条的文字
+        const ctxText = /^\[图片\]$/.test(nowPlain) ? String(prev?.plain || prev?.text || '') : nowPlain;
+        recordSightings(key, safeMedia, { sender, text: /^\[图片\]$/.test(ctxText) ? '': ctxText, messageId: msg.messageId || '' });
+      }
+    } catch { /* 观测层永不抛 */ }
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
     // MARKER: fix2bugs
@@ -12525,7 +12578,7 @@ async function main() {
       const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
       appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
       // 二代同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
-      if (kind === 'group') feedSlangWindow(key, sender, plainContent);
+      if (kind === 'group') feedSlangWindow(key, sender, plainContent, event);
       if (socialV2.paused) {
         appendActivity(`${key} [reserved2] AI 已暂停，消息仅入库不唤醒：${textContent.slice(0, 80)}`);
         return;
@@ -12547,7 +12600,7 @@ async function main() {
 
     // 黑话学习素材：只从群聊普通消息进入滚动窗口（命令/角色控制语不学；只学当前消息自己的文字，不学引用原文）
     if (kind === 'group') {
-      feedSlangWindow(key, event.sender?.card || event.sender?.nickname || String(event.user_id), plainContent);
+      feedSlangWindow(key, event.sender?.card || event.sender?.nickname || String(event.user_id), plainContent, event);
     }
 
     // 角色扮演提示注入（仅注入给 agent，不影响群友之间的正常对话语义）

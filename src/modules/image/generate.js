@@ -11,10 +11,25 @@
 //     approve 会真的出图并发出去，所以这里是**纯操作者通道**，智能体一律 403。
 //     智能体进程同时持有 x-console-token，控制台令牌闸门挡不住它，必须单独拒。
 //
-// 生图很贵（一约 $0.01）且慢（36~50 秒），所以有两道保护：
+// 生图很贵（一约 $0.01）且慢（36~180 秒），所以有三道保护：
 //   ① IMAGE_THROTTLE_MS 内同一会话不重复画（429 + retryAfterMs）；
 //   ② 画完直接发群/发私聊 —— 工具只把 url 当文本回给模型，她自己看不到图，
 //      不发等于白画。发送失败只记日志，生图结果照常返回。
+//   ③ 本地异步（2026-10-28）：请求立刻回执、后台画、画完自己发。回合不再被
+//      40~180 秒的等待卡住；同 key 在飞时用 imageJobs 兜住并发（限流窗口只有 60 秒，
+//      挡不住一张画 90 秒的第二发）。
+
+// MARKER: image-async-job（2026-10-28）
+// 生图改成本地异步。中转排队 36~180 秒，同步等会把整个回合卡住；中间层
+// （CF/nginx 60~100 秒）先超时的话，这一回合连图带回合一起白烧（线上见过 504）。
+// 现在：① 请求一到就回执，回合继续跑，她能接着聊；② 后台画，画完由后台自己
+// 发到群/私聊（发送逻辑与同步版一致）；③ 失败也由后台说一句，别让她以为图在路上。
+// 不依赖中转支持异步/回调接口，也不需要给服务器开公网入口。
+const imageJobs = new Map(); // key -> { id, startedAt, prompt }
+
+function imageJobId() {
+  return `img-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+}
 
 function isAgentCall(req) {
   return req.headers['x-agent-call'] !== undefined
@@ -120,32 +135,92 @@ async function image({ req, url, sendJson, readBody }) {
       }, 429);
       return;
     }
+    // MARKER: image-async-guard
+    // 同一个会话已经有在飞的任务就直接挡掉，只靠 IMAGE_THROTTLE_MS 不够：
+    // 一张图可能画 90 秒，而限流窗口只有 60 秒，60 秒后再来一发就会并发两张。
+    const inflight = imageJobs.get(key);
+    if (inflight) {
+      const ranSec = Math.max(1, Math.round((Date.now() - inflight.startedAt) / 1000));
+      log(`[reserved2] 生图重复调用被拒（${key}，${inflight.id} 已画 ${ranSec} 秒）`);
+      sendJson({
+        ok: true,
+        key,
+        action,
+        scene: permit.scene,
+        async: true,
+        jobId: inflight.id,
+        running: true,
+        elapsedMs: Date.now() - inflight.startedAt,
+        note: `上一张还在画（已 ${ranSec} 秒），这一张没有重新提交。画完会自动发到聊天里，别再调 qq_generate_image。`
+      });
+      return;
+    }
     h.markStart(key);
     const genStartedAt = Date.now();
-    log(`[reserved2] 生图请求（${permit.scene}，${key}）：${prompt.slice(0, 60)}`);
-    const result = await h.generateImageNow({ prompt, size: body.size });
-    // 画完就发：工具只把 url/本地路径当文本回给模型，她自己看不到图，主人也收不到。
-    // 不发等于白画一张，所以默认发。发送失败只记日志，生图结果照常返回。
-    let sent = false;
-    try {
-      if (result?.path) {
-        const [sendKind, sendId] = String(key).split(':');
-        if ((sendKind === 'group' || sendKind === 'private') && Number(sendId) > 0) {
-          await h.onebotSend(sendKind, Number(sendId), '', null, null, [result.path]);
-          sent = true;
-          log(`[reserved2] 生图已发送（${key}）：${path.basename(result.path)}`);
+    const jobId = imageJobId();
+    imageJobs.set(key, { id: jobId, startedAt: genStartedAt, prompt });
+    log(`[reserved2] 生图入队（${permit.scene}，${key}，${jobId}）：${prompt.slice(0, 60)}`);
+    // 立刻回执，回合不再等图。这里必须 ok:true —— 回 ok:false 她会以为失败，转头再画一张。
+    sendJson({
+      ok: true,
+      key,
+      action,
+      scene: permit.scene,
+      async: true,
+      jobId,
+      etaMs: Math.max(30000, Number(cfg.socialV2?.image?.timeoutMs) || 180000),
+      note: '画着呢（通常 40~90 秒，最长 3 分钟）。画完会直接发到聊天里，这一轮不用等，也不要再调 qq_generate_image。'
+    });
+    // 后台跑：画 → 发 → 报备；失败就发一句话说明原因。
+    void (async () => {
+      let sent = false;
+      try {
+        const result = await h.generateImageNow({ prompt, size: body.size });
+        // 画完就发：工具只把 url/本地路径当文本回给模型，她自己看不到图，主人也收不到。
+        // 不发等于白画一张，所以默认发。发送失败只记日志，生图结果照常报备。
+        try {
+          if (result?.path) {
+            const [sendKind, sendId] = String(key).split(':');
+            if ((sendKind === 'group' || sendKind === 'private') && Number(sendId) > 0) {
+              await h.onebotSend(sendKind, Number(sendId), '', null, null, [result.path]);
+              sent = true;
+              log(`[reserved2] 生图已发送（${key}）：${path.basename(result.path)}`);
+            }
+          }
+        } catch (error) {
+          log(`[reserved2] 生图后发送失败（${key}）：${error?.message ?? error}`);
         }
+        if (reportOnly && typeof h.reportImageUsage === 'function') {
+          void h.reportImageUsage({
+            key, scene: permit.scene, prompt, size: body.size,
+            ok: true, sent, elapsedMs: Date.now() - genStartedAt
+          });
+        }
+        const costSec = Math.round((Date.now() - genStartedAt) / 1000);
+        log(`[reserved2] 生图完成（${key}，${jobId}，${costSec} 秒${sent ? '，已发' : '，未发'}）`);
+      } catch (error) {
+        const why = String(error?.message ?? error);
+        const costSec = Math.round((Date.now() - genStartedAt) / 1000);
+        log(`[reserved2] 生图失败（${key}，${jobId}，${costSec} 秒）：${why}`);
+        if (reportOnly && typeof h.reportImageUsage === 'function') {
+          void h.reportImageUsage({
+            key, scene: permit.scene, prompt, size: body.size, ok: false, error: why
+          });
+        }
+        // 失败了得说一声，否则她那边只拿到「画着呢」，会以为图马上就到。
+        try {
+          const [sendKind, sendId] = String(key).split(':');
+          if ((sendKind === 'group' || sendKind === 'private') && Number(sendId) > 0) {
+            await h.onebotSend(sendKind, Number(sendId), `画失败了：${why.slice(0, 80)}`, null, null, []);
+          }
+        } catch (notifyError) {
+          log(`[reserved2] 生图失败通知发不出去（${key}）：${notifyError?.message ?? notifyError}`);
+        }
+      } finally {
+        imageJobs.delete(key);
       }
-    } catch (error) {
-      log(`[reserved2] 生图后发送失败（${key}）：${error?.message ?? error}`);
-    }
-    if (reportOnly && typeof h.reportImageUsage === 'function') {
-      void h.reportImageUsage({
-        key, scene: permit.scene, prompt, size: body.size,
-        ok: true, sent, elapsedMs: Date.now() - genStartedAt
-      });
-    }
-    sendJson({ ok: true, key, action, scene: permit.scene, sent, ...result });
+    })();
+    return;
   } catch (error) {
     if (reportOnly && typeof h.reportImageUsage === 'function') {
       void h.reportImageUsage({

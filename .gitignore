@@ -90,3 +90,6 @@ src/*.bak.*
 src/*.pre-*
 backup-systemd-*
 *.pre
+
+# 内部交接文档（含服务器信息，不进公开仓库）
+/docs/交接文档-*.md
