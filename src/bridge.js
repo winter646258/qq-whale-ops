@@ -91,6 +91,10 @@ import {
   MOOD_FILE as MOOD_STORE_FILE
 } from './mood-store.js';
 import { LEARNER_RETRY_NUDGE, learnerOutcome } from './learner-retry.js';
+// 生图流式读取 + 分段探测：非流式时上游画完之前连接上一个字节都没有，中间层 35~40 秒就把
+// 空闲连接掐掉（2026-10-28 18:19 那次 38 秒的 terminated）。纯逻辑在 image-stream.js，带单测。
+// MARKER: image-stream-import
+import { readImageStream } from './image-stream.js';
 // 节奏层：什么时候叫醒她、回复后跳几次、主动间隔。纯逻辑在 pacing.js，带单测。
 // MARKER: pacing-import
 import { pacingCfg, skipDecision, urgeDelay } from './pacing.js';
@@ -9604,7 +9608,7 @@ async function main() {
   // 她只能对主人说「画失败了：terminated」。生图没有副作用（每次都是新画一张），
   // 对这种纯网络层断连重试一次，比让她去解释「terminated 是什么」划算得多。
   // 反过来：4xx/5xx、超时、上游返回非 JSON、上游没给图片 —— 一律不重试，重试只会再错一次还多烧钱。
-  const IMAGE_RETRYABLE_RE = /terminated|ECONNRESET|socket hang up|other side closed|UND_ERR|fetch failed|EPIPE|ETIMEDOUT/i;
+  const IMAGE_RETRYABLE_RE = /terminated|ECONNRESET|socket hang up|other side closed|UND_ERR|fetch failed|EPIPE|ETIMEDOUT|STALLED|ImageStreamStall/i;
   function describeImageError(error) {
     const name = error?.name || 'Error';
     const msg = String(error?.message || error);
@@ -9635,6 +9639,9 @@ async function main() {
     const wantSize = String(size || imageCfg.size || '1024x1024');
     const apiKey = String(imageCfg.apiKey || '');
     if (!apiKey) throw new Error('没有配置生图 apiKey（cfg.socialV2.image.apiKey）');
+    // MARKER: image-stream
+    // 默认走流式；配 false 就回到「一次吐完」的老路（万一哪天中转把 SSE 改坏了）。
+    const streamOn = imageCfg.stream !== false;
     const ctrl = new AbortController();
     const budget = Math.max(30000, Number(imageCfg.timeoutMs) || 180000);
     const timer = setTimeout(() => ctrl.abort(), budget);
@@ -9644,7 +9651,7 @@ async function main() {
       resp = await fetch(`${baseUrl}/images/generations`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, prompt, n: 1, size: wantSize }),
+        body: JSON.stringify(streamOn ? { model, prompt, n: 1, size: wantSize, stream: true } : { model, prompt, n: 1, size: wantSize }),
         signal: ctrl.signal
       });
     } catch (error) {
@@ -9653,16 +9660,32 @@ async function main() {
     } finally {
       clearTimeout(timer);
     }
-    const raw = await resp.text();
-    if (!resp.ok) throw new Error(`上游 ${resp.status}：${raw.slice(0, 300)}`);
-    let payload;
-    try {
-      payload = JSON.parse(raw);
-    } catch {
-      throw new Error('上游返回的不是 JSON');
+    if (!resp.ok) {
+      const raw = await resp.text().catch(() => '');
+      throw new Error(`上游 ${resp.status}：${raw.slice(0, 300)}`);
     }
-    const item = Array.isArray(payload?.data) ? payload.data[0] : null;
-    if (!item) throw new Error('上游没有返回图片');
+    let item = null;
+    if (streamOn) {
+      const stream = await readImageStream(resp.body, {
+        stallLogMs: Number(imageCfg.stallLogMs) > 0 ? Number(imageCfg.stallLogMs) : 15000,
+        stallAbortMs: Number(imageCfg.stallAbortMs) > 0 ? Number(imageCfg.stallAbortMs) : 0,
+        abort: () => ctrl.abort(),
+        onStall: (ms) => log(`[image] 上游 ${Math.round(ms / 1000)} 秒没吐字节，还在等…`),
+        onProgress: (text, ms) => log(`[image] 上游进度（${Math.round(ms / 1000)} 秒）：${String(text || '').slice(0, 40)}`)
+      });
+      item = { b64_json: stream.b64, url: stream.url, revised_prompt: '' };
+      log(`[image] 流式读取完成：${stream.chunks} 块 / ${Math.round(stream.bytes / 1024)}KB / ${Math.round(stream.elapsedMs / 1000)} 秒`);
+    } else {
+      const raw = await resp.text();
+      let payload;
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        throw new Error('上游返回的不是 JSON');
+      }
+      item = Array.isArray(payload?.data) ? payload.data[0] : null;
+    }
+    if (!item || (!item.b64_json && !item.url)) throw new Error('上游没有返回图片');
     let savedPath = '';
     try {
       const dir = path.join(STATE_DIR, 'images');
