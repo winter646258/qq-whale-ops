@@ -86,7 +86,7 @@ import {
 // 情绪：此刻的心情、长期底色、压着没说的事。纯逻辑在 mood-store.js，带单测。
 import {
   readMood, writeMood, createDefaultMood, describeMood, setMood,
-  ventUndercurrent, resolveUndercurrent, setBaseline, moodStats,
+  ventUndercurrent, resolveUndercurrent, setBaseline, moodStats, recordMoodSample, settleBaseline,
   MOOD_FILE as MOOD_STORE_FILE
 } from './mood-store.js';
 // 节奏层：什么时候叫醒她、回复后跳几次、主动间隔。纯逻辑在 pacing.js，带单测。
@@ -3884,19 +3884,49 @@ async function main() {
         const plan = planSettleWrites(parsed.value, { maxImpressions: sc.maxImpressions });
 
         let wroteMood = false;
+        let moodState = moodStore();
         if (plan.mood) {
           try {
-            const next = setMood(moodStore(), {
+            moodState = setMood(moodState, {
               label: plan.mood.label,
               reason: plan.mood.reason,
               pleasure: plan.mood.pleasure,
               arousal: plan.mood.arousal,
               dominance: plan.mood.dominance
             });
-            saveMoodSafe(next, '情绪');
             wroteMood = true;
           } catch (error) {
             log(`[settle] 情绪写入失败：${error?.message ?? error}`);
+          }
+        }
+
+        // MARKER: notes-and-baseline
+        // 手札（压着的事）和底色日结算都挂在这儿：结算本来就在写情绪，
+        // 别为一个采样点再多开一次会话。三件事共用一次落盘。
+        let wroteNotes = 0;
+        for (const item of plan.notes) {
+          try {
+            moodState = ventUndercurrent(moodState, { text: item.text });
+            wroteNotes += 1;
+          } catch (error) {
+            log(`[settle] 手札写入失败：${error?.message ?? error}`);
+          }
+        }
+        let baseDrift = null;
+        try {
+          const nowTick = Date.now();
+          moodState = recordMoodSample(moodState, { now: nowTick });
+          const drift = settleBaseline(moodState, { now: nowTick });
+          moodState = drift.state;
+          if (drift.moved) baseDrift = drift;
+        } catch (error) {
+          log(`[settle] 底色结算失败：${error?.message ?? error}`);
+        }
+        if (wroteMood || wroteNotes || baseDrift) {
+          try {
+            saveMoodSafe(moodState, '情绪');
+          } catch (error) {
+            log(`[settle] 情绪落盘失败：${error?.message ?? error}`);
           }
         }
         let wroteImp = 0;
@@ -3926,7 +3956,14 @@ async function main() {
         const skipNote = plan.skippedImpressions ? `（${plan.skippedImpressions} 条超限没写）` : '';
         const selfNote = wroteSelf ? `，自述 ${wroteSelf} 条` : '';
         const skipSelfNote = plan.skippedPortraits ? `（${plan.skippedPortraits} 条自述超限没写）` : '';
-        log(`[settle] ${key} 结算完成：情绪${moodNote}，印象 ${wroteImp} 条${skipNote}${selfNote}${skipSelfNote}`);
+        const noteNote = wroteNotes ? `，手札 ${wroteNotes} 条` : '';
+        const driftNote = baseDrift
+          ? `，底色 ${Object.entries(baseDrift.delta)
+              .filter(([, v]) => v)
+              .map(([k, v]) => `${k}${v > 0 ? '+' : ''}${v}`)
+              .join(' ')}`
+          : '';
+        log(`[settle] ${key} 结算完成：情绪${moodNote}，印象 ${wroteImp} 条${skipNote}${selfNote}${skipSelfNote}${noteNote}${driftNote}`);
         return;
       }
     } catch (error) {

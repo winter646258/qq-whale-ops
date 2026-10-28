@@ -59,6 +59,17 @@ export const DEFAULT_BASELINE = Object.freeze({ pleasure: 0.1, arousal: 0.0, dom
 export const UNDERCURRENT_ALERT = 1.5;
 export const MAX_UNDERCURRENT = 20;
 
+// MARKER: notes-ttl —— 手札活 3 天。一件挂着三个月的事不是心情，是病历。
+export const UNDERCURRENT_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+
+// 采样点：底色日结算的输入。96 个约够一天半（结算间隔通常 30 分钟起）。
+export const MAX_SAMPLES = 96;
+export const SAMPLE_WINDOW_MS = 26 * 60 * 60 * 1000;
+// 一天里「此刻」的均值与底色差不到这个数，就当今天没发生什么，别动底色。
+export const BASELINE_DRIFT_MIN_GAP = 0.12;
+// 两次底色结算至少隔这么久（宁少勿多：性格改得比日子快，就不像性格了）。
+export const BASELINE_DRIFT_MIN_GAP_MS = 20 * 60 * 60 * 1000;
+
 export const MAX_LABEL_CHARS = 20;
 export const MAX_REASON_CHARS = 120;
 export const MAX_VENT_CHARS = 200;
@@ -225,8 +236,24 @@ export function normalizeState(raw, now = Date.now()) {
 
   const undercurrent = (Array.isArray(o.undercurrent) ? o.undercurrent : [])
     .map((item) => normalizeVent(item, now))
-    .filter(Boolean)
+    .filter((item) => item && now - item.at < UNDERCURRENT_TTL_MS)
     .slice(-MAX_UNDERCURRENT);
+
+  // 采样点只给「底色日结算」用（见 settleBaseline 的注释）。脏点直接丢，宁缺不错。
+  const samples = (Array.isArray(o.samples) ? o.samples : [])
+    .map((item) => {
+      const t = Number(item?.t);
+      if (!Number.isFinite(t) || t <= 0 || now - t > SAMPLE_WINDOW_MS) return null;
+      const pad = {};
+      for (const key of PAD_KEYS) {
+        const n = toPadNumber(item?.pad?.[key]);
+        if (n === null) return null;
+        pad[key] = round3(clampPad(n));
+      }
+      return { t, pad };
+    })
+    .filter(Boolean)
+    .slice(-MAX_SAMPLES);
 
   // MARKER: affinity-migrate-norm
   // 好感度不在这里了 —— 它按会话各存一份，落在 state/affinity.json，
@@ -246,7 +273,8 @@ export function normalizeState(raw, now = Date.now()) {
     since: Number.isFinite(sinceAt) && sinceAt > 0 ? sinceAt : (Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : now),
     updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : now,
     baselineUpdatedAt: Number.isFinite(baseAt) && baseAt > 0 ? baseAt : now,
-    undercurrent
+    undercurrent,
+    samples
   };
 }
 
@@ -391,18 +419,89 @@ export function undercurrentLoad(state) {
 /**
  * 底色（baseline）—— 长期是个什么样的人。
  *
- * 这里**故意不做自动漂移**，理由有两层，都是踩过的：
+ * 2026-10-28 之前这里写的是「故意不做自动漂移」，给了两条理由：
+ *   1. 漂移要「她最近的长期情绪」当输入，可模块只存得住「最后一次写入的心情」，
+ *      拿瞬时值当长期平均 = 让一个下午的心情改写性格；
+ *   2. 先衰减再取也不行 —— 隔 24 小时早就代谢归位，目标值约等于底色，推不动。
  *
- *   1. 自动漂移要一个「她最近的长期情绪」当输入，但这个模块只存得住「最后一次
- *      写入的心情」。拿一次瞬时值当长期平均，等于让一个下午的心情改写性格。
- *   2. 那就先按时间衰减再取？不行 —— 隔 24 小时情绪早就代谢归位了，目标值约等于
- *      底色本身，一辈子也推不动。
+ * 两条都对，但它们骂的是「拿一次瞬时值当输入」。所以这次换输入，不换结论：
+ *   · 每次结算记一个采样点（recordMoodSample，最多 96 个、只留 26 小时）
+ *   · 一天结算一次底色，输入是这一天所有采样点的均值（settleBaseline）
+ * 于是「一个下午」不再是输入，一整天才算一次；单日最多挪 BASELINE_STEP_LIMIT（0.05），
+ * 均值与底色差不到 0.12 的日子一律不动。性格还是会随日子慢慢走，但不会被一场架改写。
  *
- * 所以改成和好感度同一个逻辑：系统不猜她变成了什么样，她自己觉得「我最近好像
- * 容易烦」再调。限速仍保留（一次最多 0.05），防的是手滑，不是防她。
- *
- * 常量 BASELINE_STEP_LIMIT 在文件顶部，这里不重复声明。
+ * 手动调（setBaseline）照旧保留：她自己觉得「我最近好像容易烦」就能一次调到位。
+ * 系统不猜她变成了什么样，只负责把日子记下来。
  */
+
+/** 记一个采样点：把衰减后的「此刻」存进 samples，给底色日结算当输入。 */
+export function recordMoodSample(state, { now = Date.now() } = {}) {
+  const s = normalizeState(state, now);
+  const pad = effectiveMoodPad(s, now);
+  const kept = s.samples
+    .concat([{ t: now, pad }])
+    .filter((item) => now - item.t <= SAMPLE_WINDOW_MS)
+    .slice(-MAX_SAMPLES);
+  return { ...s, samples: kept };
+}
+
+/** 衰减后的此刻（只要三个浮点，不掺 label）：底色只关心数值。 */
+function effectiveMoodPad(state, now) {
+  const s = normalizeState(state, now);
+  const pad = {};
+  for (const key of PAD_KEYS) {
+    const halfLife = halfLifeFor(s.pad[key] - s.baseline[key]);
+    pad[key] = round3(clampPad(decayValue(s.pad[key], s.baseline[key], now - s.since, halfLife)));
+  }
+  return pad;
+}
+
+/**
+ * 底色日结算：一天最多动一次，输入是这一天采样点的均值。
+ * 返回 { state, moved, delta, avg, count, reason }。
+ */
+export function settleBaseline(state, { now = Date.now() } = {}) {
+  const s = normalizeState(state, now);
+  const since = now - (Number(s.baselineUpdatedAt) || 0);
+  if (since < BASELINE_DRIFT_MIN_GAP_MS) {
+    return { state: s, moved: false, delta: null, avg: null, count: s.samples.length, reason: 'too-soon' };
+  }
+  const window = s.samples.filter((item) => now - item.t <= SAMPLE_WINDOW_MS);
+  if (window.length < 4) {
+    return { state: s, moved: false, delta: null, avg: null, count: window.length, reason: 'too-few-samples' };
+  }
+  const avg = {};
+  for (const key of PAD_KEYS) {
+    avg[key] = round3(window.reduce((sum, item) => sum + item.pad[key], 0) / window.length);
+  }
+  const baseline = { ...s.baseline };
+  const delta = {};
+  let moved = false;
+  for (const key of PAD_KEYS) {
+    const gap = avg[key] - s.baseline[key];
+    if (Math.abs(gap) < BASELINE_DRIFT_MIN_GAP) {
+      delta[key] = 0;
+      continue;
+    }
+    // 挪「差额的一半」，但不超过单步上限 —— 慢慢走，不跳。
+    const step = Math.max(-BASELINE_STEP_LIMIT, Math.min(BASELINE_STEP_LIMIT, gap * 0.5));
+    const next = round3(clampPad(s.baseline[key] + step));
+    delta[key] = round3(next - s.baseline[key]);
+    baseline[key] = next;
+    if (delta[key] !== 0) moved = true;
+  }
+  if (!moved) {
+    return { state: s, moved: false, delta, avg, count: window.length, reason: 'no-gap' };
+  }
+  return {
+    state: { ...s, baseline, baselineUpdatedAt: now, samples: window },
+    moved: true,
+    delta,
+    avg,
+    count: window.length,
+    reason: 'ok'
+  };
+}
 
 export function setBaseline(state, { pleasure, arousal, dominance, now = Date.now() } = {}) {
   const s = normalizeState(state, now);
@@ -527,10 +626,19 @@ export function describeMood(state, now = Date.now(), opts = {}) {
 
   // 只要压着东西就提一句（她该知道自己心里有未结的事），
   // 压得沉的时候换个说法，但**都不展开内容** —— 要不要翻出来由她自己决定。
+  // MARKER: notes-show
+  // 以前这里只报条数（「2 件事没说」），理由是「要不要翻出来由她自己决定」。
+  // 但结算开始往这里写手札之后，只报条数等于写了没人读 —— 和 portrait 那格同一个病。
+  // 改成把最近两条摊开（每条 40 字封顶，不写权重、不写时间），更多的仍然只报条数。
   const count = eff.undercurrent.length;
   if (count > 0) {
     const heavy = eff.undercurrentLoad >= UNDERCURRENT_ALERT;
-    lines.push(heavy ? `【压着】${count} 件事压得有点沉` : `【压着】${count} 件事没说`);
+    const recent = eff.undercurrent
+      .slice(-2)
+      .map((item) => String(item.text || '').slice(0, 40))
+      .filter(Boolean);
+    const head = heavy ? `【压着】${count} 件事压得有点沉` : `【压着】${count} 件事没说`;
+    lines.push(recent.length ? `${head}：${recent.join('；')}${count > recent.length ? '…' : ''}` : head);
   }
 
   return lines.join('\n');

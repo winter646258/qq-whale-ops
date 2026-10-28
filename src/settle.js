@@ -30,6 +30,8 @@ export const SETTLE_DEFAULTS = Object.freeze({
   maxImpressions: 3,
   // 一次最多写几条自述（portrait）。自述是「长期看法」，宁少不滥。
   maxPortraits: 2,
+  // 一次最多写几条手札（心里挂着的事）。写多了就成流水账了。
+  maxNotes: 2,
   timeoutMs: 120000,
   preset: ''
 });
@@ -56,6 +58,7 @@ export function settleCfg(cfg = {}) {
     maxChars: num(raw.maxChars, d.maxChars, { min: 500, max: 40000 }),
     maxImpressions: num(raw.maxImpressions, d.maxImpressions, { min: 0, max: 10 }),
     maxPortraits: num(raw.maxPortraits, d.maxPortraits, { min: 0, max: 6 }),
+    maxNotes: num(raw.maxNotes, d.maxNotes, { min: 0, max: 4 }),
     timeoutMs: num(raw.timeoutMs, d.timeoutMs, { min: 15000, max: 600000 }),
     preset: typeof raw.preset === 'string' ? raw.preset.trim() : d.preset
   };
@@ -153,10 +156,13 @@ export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impre
     '   facet 只能是 doing / view / bond：doing＝她在做什么、处于什么处境；',
     '   view＝她对这件事或这个人的看法；bond＝这个人和她是什么关系。',
     '   没有真正变化就写 "portrait": []。',
-    '6. 只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余的话。',
+    '6. 手札（notes）是「这几天心里还挂着的事」，一句话，四十字以内。',
+    '   只有过几天还会突然想起来的事才写；已经说清楚、已经过去的不要写。',
+    '   最多两条，没有就写 "notes": []。',
+    '7. 只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余的话。',
     '',
     '输出格式：',
-    '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}],"portrait":[{"subject":"说谁","facet":"doing","text":"六十字以内的长期看法"}]}',
+    '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}],"portrait":[{"subject":"说谁","facet":"doing","text":"六十字以内的长期看法"}],"notes":[{"text":"心里还挂着的一件事，四十字以内"}]}',
     '',
     '字段说明：',
     '· mood.pleasure / arousal / dominance 取值 -1 到 1，0 表示平静；',
@@ -165,6 +171,7 @@ export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impre
     '· 没有情绪变化时写 "mood": null；没有新印象时写 "impressions": []。',
     '· portrait 最多两条；subject 写名字，指她自己时写「我」；text 不超过六十字；',
     '· 自述写的是「她从此记住的事」，不是「这一轮发生了什么」，别把对话复述一遍。',
+    '· notes 写「还挂在心上的」，不是「刚发生的事」；别写情绪形容词（那个 mood 里有了）。',
     '',
     `对话场景：${isGroup ? '群聊' : '私聊'}（${key}）`,
     `她已经记得的人：`,
@@ -245,7 +252,20 @@ export function parseSettleJSON(text) {
     portraits.push({ subject, facet, text });
   }
 
-  return { ok: true, value: { mood, impressions, portraits } };
+  // 手札（notes）：只留 text，四十字封顶，同批去重。
+  const notes = [];
+  const rawNotes = Array.isArray(parsed.notes) ? parsed.notes : [];
+  for (const item of rawNotes) {
+    const text = String((item && typeof item === 'object' ? item.text : item) ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 40);
+    if (!text) continue;
+    if (notes.some((x) => x.text === text)) continue;
+    notes.push({ text });
+  }
+
+  return { ok: true, value: { mood, impressions, portraits, notes } };
 }
 
 /**
@@ -297,7 +317,11 @@ export function resolveImpressionWho({ key = '', impressions = null, who = '' } 
 /** 写入计划：把解析结果裁成「最多写几条」，方便上层直接照做。 */
 export function planSettleWrites(
   parsed,
-  { maxImpressions = SETTLE_DEFAULTS.maxImpressions, maxPortraits = SETTLE_DEFAULTS.maxPortraits } = {}
+  {
+    maxImpressions = SETTLE_DEFAULTS.maxImpressions,
+    maxPortraits = SETTLE_DEFAULTS.maxPortraits,
+    maxNotes = SETTLE_DEFAULTS.maxNotes
+  } = {}
 ) {
   const value = parsed && typeof parsed === 'object' ? parsed : {};
   const mood = value.mood && typeof value.mood === 'object' ? value.mood : null;
@@ -305,11 +329,15 @@ export function planSettleWrites(
   const cap = num(maxImpressions, SETTLE_DEFAULTS.maxImpressions, { min: 0, max: 10 });
   const selfList = Array.isArray(value.portraits) ? value.portraits : [];
   const selfCap = num(maxPortraits, SETTLE_DEFAULTS.maxPortraits, { min: 0, max: 6 });
+  const noteList = Array.isArray(value.notes) ? value.notes : [];
+  const noteCap = num(maxNotes, SETTLE_DEFAULTS.maxNotes, { min: 0, max: 4 });
   return {
     mood,
     impressions: list.slice(0, cap),
     skippedImpressions: Math.max(0, list.length - cap),
     portraits: selfList.slice(0, selfCap),
-    skippedPortraits: Math.max(0, selfList.length - selfCap)
+    skippedPortraits: Math.max(0, selfList.length - selfCap),
+    notes: noteList.slice(0, noteCap),
+    skippedNotes: Math.max(0, noteList.length - noteCap)
   };
 }
