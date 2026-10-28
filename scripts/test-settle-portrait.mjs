@@ -41,7 +41,7 @@ ok('提示词里有 portrait 字段示例', p0.includes('"portrait"'));
 ok('提示词里点了 facet 三个值', p0.includes('doing / view / bond'));
 ok('提示词强调长期看法', p0.includes('长期看法'));
 ok('提示词明说日常寒暄不写', p0.includes('日常寒暄'));
-ok('提示词有 JSON-only 铁律（手札占了第 6 条，它顺延成第 7 条）', p0.includes('7. 只输出一个 JSON 对象'));
+ok('提示词有 JSON-only 铁律（手札 6、日记草稿 7，它顺延成第 8 条）', p0.includes('8. 只输出一个 JSON 对象'));
 ok('没有传自述时显示占位', p0.includes('（还没有自述）'));
 ok('没传自述时不出现 undefined', !p0.includes('undefined'));
 

@@ -95,7 +95,7 @@ import {
 } from './mood-store.js';
 
 // MARKER: diary-daily-import
-import { dailyCfg as dailyDiaryCfg, decideDailyDiary } from './diary-daily.js';
+import { dailyCfg as dailyDiaryCfg, decideDailyDiary, normalizeDraft as normalizeDiaryDraft, isDraftFresh, draftLine as diaryDraftLine, eveningDue, draftCfg } from './diary-daily.js';
 
 // MARKER: slang-research-on-demand-import
 import { pickResearchCandidates, quotaFor, researchCfg } from './slang-research.js';
@@ -3971,6 +3971,16 @@ async function main() {
     }
   }
 
+  // MARKER: diary-draft-boot
+  // 傍晚那一档得靠定时器：她 23 点不会自己醒来。
+  try {
+    const eveningTimer = setInterval(() => { void diaryEveningTick(); }, 10 * 60 * 1000);
+    eveningTimer.unref?.();
+    log('[日记] 傍晚催写定时器已排上（23:20 起 30 分钟窗口）');
+  } catch (error) {
+    log(`[日记] 傍晚定时器启动失败：${error?.message ?? error}`);
+  }
+
   // MARKER: world-c2-boot
   // 十分钟看一次点：10 点和 16 点各挑一次；错过 10 点不会在 15 点补。
   try {
@@ -4223,6 +4233,20 @@ async function main() {
         const parsed = parseSettleJSON(text);
         if (!parsed.ok) { log(`[settle] ${key} 解析失败：${parsed.error}`); return; }
         const plan = planSettleWrites(parsed.value, { maxImpressions: sc.maxImpressions });
+        // MARKER: diary-draft-write
+        // 结算顺手留一份草稿：她之后看到提示词，改两句就是自己的日记。
+        if (plan.diary) {
+          try {
+            const dcw = draftCfg(cfg);
+            const draft = normalizeDiaryDraft({ ...plan.diary, day: localDayOf(Date.now()), at: Date.now() }, dcw);
+            if (draft) {
+              saveDiaryDraft(draft);
+              log(`[日记草稿] ${key} 记了一份草稿（${draft.text.slice(0, 16)}…）`);
+            }
+          } catch (error) {
+            log(`[日记草稿] 写入失败：${error?.message ?? error}`);
+          }
+        }
 
         let wroteMood = false;
         let moodState = moodStore();
@@ -6735,6 +6759,95 @@ async function main() {
     }
     if (out.dirty) saveDiaryDailyState(out.state);
     return '';
+  }
+
+  // MARKER: diary-draft-runtime
+  // ① 结算写草稿 → 存 diary-draft.json；② 23:20 那一档催一次。
+  // 草稿不进 日记.jsonl：她的日记得是她自己写的，系统替她写就不算数了。
+  const DIARY_DRAFT_FILE = path.join(STATE_DIR, 'diary-draft.json');
+  let diaryDraftCache = null;
+  function readDiaryDraft() {
+    if (diaryDraftCache !== undefined && diaryDraftCache !== null) return diaryDraftCache;
+    try {
+      const raw = readJsonSafe(DIARY_DRAFT_FILE, null, false);
+      diaryDraftCache = normalizeDiaryDraft(raw, draftCfg(cfg));
+    } catch (error) {
+      log(`[日记草稿] 读取失败：${error?.message ?? error}`);
+      diaryDraftCache = null;
+    }
+    return diaryDraftCache;
+  }
+  function saveDiaryDraft(draft) {
+    diaryDraftCache = draft;
+    try {
+      atomicWriteJson(DIARY_DRAFT_FILE, draft);
+    } catch (error) {
+      log(`[日记草稿] 落盘失败：${error?.message ?? error}`);
+    }
+  }
+  function buildDiaryDraftLineFor(key, reason) {
+    if (!String(key ?? '').startsWith('private:')) return '';
+    const dc = draftCfg(cfg);
+    const draft = readDiaryDraft();
+    if (!draft) return '';
+    const now = Date.now();
+    const isEvening = String(reason ?? '') === 'diary-reminder';
+    if (!isEvening && !isDraftFresh(draft, { now, cfg: dc })) return '';
+    let entries = [];
+    try {
+      entries = readDiary(path.join(ROOT, 'diary', DIARY_JSONL));
+    } catch {}
+    if (entries.some((e) => String(e.day ?? '') === localDayOf(now))) return ''; // 已经写了就不用再提草稿
+    const line = diaryDraftLine(draft, { now, cfg: dc });
+    if (!line) return '';
+    return isEvening ? `【今天日记还空着】别拖到明天。\n\n` + line : line;
+  }
+  // 傍晚那一档：只有私聊、今天没写、当天还没催过的才催，一个 10 分钟窗口只跑一次。
+  let diaryEveningBusy = false;
+  async function diaryEveningTick() {
+    if (diaryEveningBusy) return;
+    const dc = draftCfg(cfg);
+    const now = Date.now();
+    if (!eveningDue(now, dc)) return;
+    const day = localDayOf(now);
+    const st0 = readDiaryDailyState();
+    const done = (st0.eveningDays && st0.eveningDays[day]) || {};
+    const keys = [];
+    try {
+      for (const key of Object.keys(socialV2.conversations || {})) {
+        if (!String(key).startsWith('private:')) continue;
+        if (done[key]) continue;
+        const conv = socialV2.conversations[key];
+        const msgs = Array.isArray(conv?.recentMessages) ? conv.recentMessages : [];
+        // 今天真说过话才催：一整天没人理她，她还去写日记给谁看。
+        const talkedToday = msgs.some((m) => m && Number(m.at || 0) > 0 && localDayOf(Number(m.at)) === day);
+        if (!talkedToday) continue;
+        keys.push(key);
+      }
+    } catch (error) {
+      log(`[日记草稿] 傍晚扫描失败：${error?.message ?? error}`);
+      return;
+    }
+    if (!keys.length) return;
+    let entries = [];
+    try {
+      entries = readDiary(path.join(ROOT, 'diary', DIARY_JSONL));
+    } catch {}
+    if (entries.some((e) => String(e.day ?? '') === day)) return;
+    diaryEveningBusy = true;
+    try {
+      for (const key of keys) {
+        try {
+          saveDiaryDailyState({ ...st0, eveningDays: { ...(st0.eveningDays || {}), [day]: { ...done, [key]: now } } });
+          await sendWakePromptV2(key, 'diary-reminder');
+          log(`[日记] ${key} 23 点后还没写，催一次`);
+        } catch (error) {
+          log(`[日记] ${key} 傍晚催写失败：${error?.message ?? error}`);
+        }
+      }
+    } finally {
+      diaryEveningBusy = false;
+    }
   }
 
   function buildSleepReviewLineFor(key) {
@@ -12763,6 +12876,13 @@ async function generateImageNow({ prompt, size }) {
     const sleepReviewLine = buildSleepReviewLineFor(key);
     // MARKER: diary-daily-inject
     const diaryDailyLine = buildDailyDiaryLineFor(key);
+    // MARKER: diary-draft-inject
+    let diaryDraftHint = '';
+    try {
+      diaryDraftHint = buildDiaryDraftLineFor(key, reason);
+    } catch (error) {
+      diaryDraftHint = '';
+    }
     // MARKER: style-hint
     // 每轮都念的断句硬规则。放在 base 末尾：紧跟 reason 之外的最后一段，注意力权重最高。
     // 之所以单独占一段而不并进角色卡：角色卡正文只在部分唤醒里注入，这条必须每轮都在。
@@ -12845,7 +12965,7 @@ async function generateImageNow({ prompt, size }) {
     } catch (error) {
       topicsText = '';
     }
-    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + topicsText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + topicsText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;

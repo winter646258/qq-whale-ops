@@ -30,7 +30,7 @@ ok('格式里有 notes', p.includes('"notes"'));
 ok('有第 6 条铁律（手札）', p.includes('6. 手札（notes）'));
 ok('手札要求「还挂着」', p.includes('心里还挂着'));
 ok('明说别写情绪形容词', p.includes('情绪形容词'));
-ok('JSON-only 顺延成第 7 条', p.includes('7. 只输出一个 JSON 对象'));
+ok('JSON-only 顺延成第 8 条（手札 6、日记草稿 7）', p.includes('8. 只输出一个 JSON 对象'));
 ok('没有第 6 条残留旧文本', !p.includes('6. 只输出一个 JSON 对象'));
 
 // ---- 解析 ----

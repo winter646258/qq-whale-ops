@@ -163,13 +163,16 @@ export function buildSettlePrompt({ key = '', isGroup = false, lines = [], impre
     '6. 手札（notes）是「这几天心里还挂着的事」，一句话，四十字以内。',
     '   只有过几天还会突然想起来的事才写；已经说清楚、已经过去的不要写。',
     '   最多两条，没有就写 "notes": []。',
-    '7. 只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余的话。',
+    // MARKER: settle-diary-draft
+    '7. 日记草稿（diary）：今天若有值得记下来的一件小事，用你自己的口气写两句话（一百字以内，写具体的事和当时的想法，不要总结），',
+    '   并给一个心情词；没有就写 "diary": null。这只是草稿，不是正式日记。',
+    '8. 只输出一个 JSON 对象，不要解释、不要 markdown 代码块、不要多余的话。',
     ...(lifeAskText ? ['', '额外任务：', lifeAskText, ''] : ['']),
     ...(worldAskText ? ['', '额外任务（接着来）：', worldAskText, ''] : ['']),
     '输出格式：',
     lifeAskText
-      ? '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}],"portrait":[{"subject":"说谁","facet":"doing","text":"六十字以内的长期看法"}],"notes":[{"text":"心里还挂着的一件事，四十字以内"}],"life":{"outfit":"穿什么","plans":[{"period":"上午","text":"想做什么"}],"moodHint":"想怎么过"}}'
-      : '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}],"portrait":[{"subject":"说谁","facet":"doing","text":"六十字以内的长期看法"}],"notes":[{"text":"心里还挂着的一件事，四十字以内"}]}',
+      ? '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}],"portrait":[{"subject":"说谁","facet":"doing","text":"六十字以内的长期看法"}],"notes":[{"text":"心里还挂着的一件事，四十字以内"}],"diary":{"text":"…","mood":"…"},"life":{"outfit":"穿什么","plans":[{"period":"上午","text":"想做什么"}],"moodHint":"想怎么过"}}'
+      : '{"mood":{"pleasure":0,"arousal":0,"dominance":0,"label":"","reason":""},"impressions":[{"who":"昵称","text":"四十字以内的新印象"}],"portrait":[{"subject":"说谁","facet":"doing","text":"六十字以内的长期看法"}],"notes":[{"text":"心里还挂着的一件事，四十字以内"}],"diary":{"text":"…","mood":"…"}}',
     '',
     '字段说明：',
     '· mood.pleasure / arousal / dominance 取值 -1 到 1，0 表示平静；',
@@ -287,7 +290,14 @@ export function parseSettleJSON(text) {
   const resolvedThreads = Array.isArray(parsed.resolved) ? parsed.resolved.slice(0, 10) : [];
   // 纪念日也不在这里洗（规则在 dates.js，带单测）。
   const dates = Array.isArray(parsed.dates) ? parsed.dates.slice(0, 10) : [];
-  return { ok: true, value: { mood, impressions, portraits, notes, life, threads, wishes, doneWishes, resolvedThreads, dates } };
+  // 日记草稿：只认对象 + 有正文；截长，别让它把提示词和文件撑大。
+  let diary = null;
+  if (parsed.diary && typeof parsed.diary === 'object' && !Array.isArray(parsed.diary)) {
+    const text = String(parsed.diary.text ?? '').replace(/\s+/g, ' ').trim();
+    const mood = String(parsed.diary.mood ?? '').replace(/\s+/g, ' ').trim().slice(0, 20);
+    if (text) diary = { text: text.slice(0, 200), mood };
+  }
+  return { ok: true, value: { mood, impressions, portraits, notes, life, threads, wishes, doneWishes, resolvedThreads, dates, diary } };
 }
 
 /**
@@ -351,6 +361,9 @@ export function planSettleWrites(
   const cap = num(maxImpressions, SETTLE_DEFAULTS.maxImpressions, { min: 0, max: 10 });
   const selfList = Array.isArray(value.portraits) ? value.portraits : [];
   const selfCap = num(maxPortraits, SETTLE_DEFAULTS.maxPortraits, { min: 0, max: 6 });
+  const diary = value.diary && typeof value.diary === 'object' && !Array.isArray(value.diary) && value.diary.text
+    ? { text: String(value.diary.text).slice(0, 200), mood: String(value.diary.mood ?? '').slice(0, 20) }
+    : null;
   const noteList = Array.isArray(value.notes) ? value.notes : [];
   const noteCap = num(maxNotes, SETTLE_DEFAULTS.maxNotes, { min: 0, max: 4 });
   // 世界层：life 只在被要求时出现，原样透传给 bridge 去洗（洗的规则在 life.js，带单测）。
@@ -368,6 +381,7 @@ export function planSettleWrites(
     portraits: selfList.slice(0, selfCap),
     skippedPortraits: Math.max(0, selfList.length - selfCap),
     notes: noteList.slice(0, noteCap),
+    diary,
     skippedNotes: Math.max(0, noteList.length - noteCap)
   };
 }

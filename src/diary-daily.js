@@ -134,3 +134,70 @@ export function dailyDiaryLine({ hour = 12, count = 1, cfg = DIARY_DAILY_DEFAULT
   }
   return `【今天还没写日记】${again}先把今天写下来（qq_diary，一两句具体的：谁说了什么、你当时怎么想的），写完再聊别的。别写成总结，也别在聊天里汇报「我写了日记」。\n\n`;
 }
+
+// MARKER: diary-draft
+// 日记草稿：结算顺手写一句，等她点头再落进真正的日记本。
+// 为什么不直接写进 日记.jsonl：她的日记是她自己的东西，
+// 系统替她写进去，那份「她自己写的」就不成立了。草稿放着，她改两句再发。
+export const DIARY_DRAFT_DEFAULTS = {
+  keepHours: 20,
+  textChars: 200,
+  moodChars: 20,
+  eveningHour: 23,
+  eveningMinute: 20,
+  eveningWindowMin: 30,
+};
+
+export function draftCfg(cfg) {
+  const raw = cfg && cfg.socialV2 && typeof cfg.socialV2 === 'object' ? cfg.socialV2.diaryDaily : null;
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const pick = (v, d, lo, hi) => {
+    if (v === null || v === undefined || v === '') return d;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return d;
+    return Math.min(hi, Math.max(lo, Math.floor(n)));
+  };
+  return {
+    keepHours: pick(src.draftKeepHours, DIARY_DRAFT_DEFAULTS.keepHours, 1, 72),
+    textChars: pick(src.draftTextChars, DIARY_DRAFT_DEFAULTS.textChars, 20, 400),
+    moodChars: pick(src.draftMoodChars, DIARY_DRAFT_DEFAULTS.moodChars, 2, 40),
+    eveningHour: pick(src.eveningHour, DIARY_DRAFT_DEFAULTS.eveningHour, 0, 23),
+    eveningMinute: pick(src.eveningMinute, DIARY_DRAFT_DEFAULTS.eveningMinute, 0, 59),
+    eveningWindowMin: pick(src.eveningWindowMin, DIARY_DRAFT_DEFAULTS.eveningWindowMin, 10, 120),
+  };
+}
+
+export function normalizeDraft(raw, cfg = null) {
+  const c = { ...DIARY_DRAFT_DEFAULTS, ...(cfg && typeof cfg === 'object' ? cfg : {}) };
+  if (!raw || typeof raw !== 'object') return null;
+  const text = String(raw.text ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  return {
+    day: String(raw.day ?? '').slice(0, 10),
+    text: text.length > c.textChars ? text.slice(0, Math.max(1, c.textChars - 1)) + '…' : text,
+    mood: String(raw.mood ?? '').replace(/\s+/g, ' ').trim().slice(0, c.moodChars),
+    at: Number(raw.at) > 0 ? Number(raw.at) : Date.now(),
+  };
+}
+
+export function isDraftFresh(draft, { now = Date.now(), cfg = null } = {}) {
+  if (!draft || !draft.text) return false;
+  const c = { ...DIARY_DRAFT_DEFAULTS, ...(cfg && typeof cfg === 'object' ? cfg : {}) };
+  if (now - Number(draft.at || 0) > c.keepHours * 3600000) return false;
+  return !draft.day || draft.day === localDayOf(now);
+}
+
+export function draftLine(draft, { now = Date.now(), cfg = null } = {}) {
+  if (!isDraftFresh(draft, { now, cfg })) return '';
+  const mood = draft.mood ? `（${draft.mood}）` : '';
+  return `【今天的日记草稿${mood}】${draft.text}\n（这是我替你记的草稿，不用照抄——改成你自己的口气，写完调 qq_diary 落进日记本；不想写就直说。）\n\n`;
+}
+
+// 傍晚那一档：只在这个窗口里算「该催了」，错过就不补（半夜催人写日记没道理）。
+export function eveningDue(now = Date.now(), cfg = null) {
+  const c = { ...DIARY_DRAFT_DEFAULTS, ...(cfg && typeof cfg === 'object' ? cfg : {}) };
+  const d = new Date(now);
+  const mins = d.getHours() * 60 + d.getMinutes();
+  const start = c.eveningHour * 60 + c.eveningMinute;
+  return mins >= start && mins < start + c.eveningWindowMin;
+}
