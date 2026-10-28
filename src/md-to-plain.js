@@ -71,8 +71,40 @@ export function splitForQQ(text, max = 4000) {
  * 判据与同文件的 splitForQQ、以及 src/forward.js 的预览截断保持一致。
  * `max` 非有限数时返回空串 —— 与 `slice(0, NaN)` 的既有行为一致，不做静默放宽。
  */
-export function truncateText(value, max) {
+/**
+ * 把孤立的 UTF-16 代理码元换成 U+FFFD。
+ *
+ * 为什么需要：上游 API 会直接拒绝含孤立代理的请求
+ * （`request contains an unpaired Unicode surrogate; repair text encoding and retry`）。
+ * 我们到处用 slice 截文本，切在 emoji 中间就会留下半个代理 —— 一个 emoji 变成
+ * 两个码元，截在中间那一下就埋了一颗雷。这里统一修，比逐个 slice 打补丁可靠。
+ */
+export function repairSurrogates(value) {
   const s = String(value ?? '');
+  let out = '';
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const n = s.charCodeAt(i + 1);
+      if (n >= 0xdc00 && n <= 0xdfff) {
+        out += s[i] + s[i + 1];
+        i += 1;
+      } else {
+        out += '\uFFFD';
+      }
+      continue;
+    }
+    if (c >= 0xdc00 && c <= 0xdfff) {
+      out += '\uFFFD';
+      continue;
+    }
+    out += s[i];
+  }
+  return out;
+}
+
+export function truncateText(value, max) {
+  const s = repairSurrogates(value);
   const limit = Number.isFinite(Number(max)) ? Math.max(0, Math.floor(Number(max))) : 0;
   if (limit === 0) return '';
   if (s.length <= limit) return s;
@@ -94,7 +126,7 @@ export function truncateText(value, max) {
  * 结果开头会多出一个孤立低代理，同样是坏字符。判据镜像处理。
  */
 export function truncateTextTail(value, max) {
-  const s = String(value ?? '');
+  const s = repairSurrogates(value);
   const limit = Number.isFinite(Number(max)) ? Math.max(0, Math.floor(Number(max))) : 0;
   if (limit === 0) return '';
   if (s.length <= limit) return s;

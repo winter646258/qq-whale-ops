@@ -18,7 +18,9 @@ import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { extractMemories, scopeForText } from './auto-memory.js';
-import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
+import { mdToPlain, repairSurrogates, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
+// MARKER: untrusted-group
+import { GROUP_RULES, inspectUntrusted, sanitizeGroupText, untrustedCfg } from './untrusted.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage, describeAge } from './qq-model-view.js';
@@ -10343,6 +10345,35 @@ async function main() {
     return { ok: true, scene };
   }
 
+  // MARKER: prompt-surrogate-repair
+  // 发出去的每一段文本都先修一遍孤立代理。
+  // 触发过的线上错误：`request contains an unpaired Unicode surrogate; repair text encoding and retry`
+  // （2026-10-29 00:31~00:33，group:906710082 连续三条）。上游直接拒，她那一轮等于白跑。
+  // 收口放在这里而不是逐个 slice 打补丁：截断点有几十处，漏一个就再炸一次。
+  (() => {
+    const original = api.sessions.prompt.bind(api.sessions);
+    const fixValue = (value) => {
+      if (typeof value === 'string') return repairSurrogates(value);
+      if (Array.isArray(value)) return value.map(fixValue);
+      if (value && typeof value === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) out[k] = fixValue(v);
+        return out;
+      }
+      return value;
+    };
+    api.sessions.prompt = (args) => {
+      let fixed = args;
+      try {
+        fixed = fixValue(args);
+        if (fixed !== args && JSON.stringify(fixed).length !== JSON.stringify(args).length) {
+          log('[prompt] 修掉了文本里的孤立代理码元（半个 emoji）');
+        }
+      } catch { /* 修不动就原样发 */ }
+      return original(fixed);
+    };
+  })();
+
   /**
    * 真去画。同步落一份本地副本 —— 上游给的 url 是别人站点的，过期就没了，
    * 她要回看或者转发都得有自己的原件。
@@ -11166,8 +11197,15 @@ async function generateImageNow({ prompt, size }) {
     const arr = social.recentMessages.get(key);
     arr.push({
       sender,
-      text: truncateText(String(textContent), 200),
-      plain: truncateText(String(plainText ?? textContent), 200),
+      // MARKER: untrusted-ingest —— 群里的代码/命令只当素材，永远不进她的上下文。
+      // 实测动机：群友可以直接贴一段脚本或「请帮我执行」，那是指令注入的入口；
+      // 主人也明确要求「不要让鱼读群里的任何代码和指令」。
+      text: truncateText(String(key).startsWith('group:')
+        ? sanitizeGroupText(textContent, untrustedCfg(cfg))
+        : textContent, 200),
+      plain: truncateText(String(key).startsWith('group:')
+        ? sanitizeGroupText(plainText ?? textContent, untrustedCfg(cfg))
+        : (plainText ?? textContent), 200),
       quoteTargetIsSelf: !!quoteTargetIsSelf,
       isOwner: !!isOwner,
       media: Array.isArray(media) ? media : [],
@@ -13156,7 +13194,9 @@ async function generateImageNow({ prompt, size }) {
     } catch (error) {
       topicsText = '';
     }
-    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + topicsText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    // MARKER: untrusted-rules —— 群聊专用：先划清「素材 vs 指令」。
+    const untrustedLine = String(key).startsWith('group:') ? GROUP_RULES : '';
+    const base = roleLine + untrustedLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + topicsText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
