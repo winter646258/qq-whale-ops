@@ -122,6 +122,8 @@ import {
 import {
   buildLifeAsk, lifeCfg, lifeDayFor, lifeLineFor, normalizeLifePlan, setLifeDay, summarizeLifeDay
 } from './life.js';
+// MARKER: session-rotate-import
+import { ROTATE_DEFAULTS, kindOfKey, localDayOf as rotateDayOf, pruneRotateDays, rotateCfg, rotateLine, shouldRotate } from './session-rotate.js';
 import { moodDaysCfg, moodTrendLine, pruneMoodDays, recordMoodDay } from './mood-days.js';
 import { buildThreadsAsk, threadsCfg, threadsLine, summarizeThreads, addThreads, dueThreads, markAsked, pruneThreads, resolveThreads } from './threads.js';
 import { buildWishesAsk, wishesCfg, wishesLine, summarizeWishes, addWishes, completeWishes, pruneWishes } from './wishes.js';
@@ -4066,6 +4068,16 @@ async function main() {
     const eveningTimer = setInterval(() => { void diaryEveningTick(); }, 10 * 60 * 1000);
     eveningTimer.unref?.();
     log('[日记] 傍晚催写定时器已排上（23:20 起 30 分钟窗口）');
+    // MARKER: session-rotate-boot —— 每天换新会话：会话越长每轮越贵，换新最省。
+    try {
+      const rotateC = rotateCfg(cfg);
+      if (rotateC.enabled) {
+        const rotateTimer = setInterval(() => { void sessionRotateTick(); }, 10 * 60 * 1000);
+        rotateTimer.unref?.();
+        log(`[会话换新] 定时器已排上（每天 ${String(rotateC.hour).padStart(2, '0')}:${String(rotateC.minute).padStart(2, '0')} 起 ${rotateC.windowMinutes} 分钟窗口，只换闲置会话）`);
+        setTimeout(() => { void sessionRotateTick(); }, 3 * 60 * 1000).unref?.();
+      }
+    } catch (error) { log('[会话换新] 定时器启动失败：', error?.message ?? error); }
   } catch (error) {
     log(`[日记] 傍晚定时器启动失败：${error?.message ?? error}`);
   }
@@ -5093,6 +5105,88 @@ async function main() {
     wakeConfigMissCount.delete(key);
     wakeConfigUpdatedKeys.delete(key);
     markReadCalledKeys.delete(key);
+  }
+
+  // MARKER: session-rotate-runtime —— 每天换新会话。
+  // 只清「映射 + 会话级缓存」，社交状态（recentMessages/memberImpressions/life/threads/wishes/dates/diary）全部保留：
+  // 她的连续性靠 state，不靠 DSH 的会话历史 —— 这也是敢每天换的前提。
+  const SESSION_ROTATE_FILE = path.join(STATE_DIR, 'session-rotate.json');
+  function readRotateState() {
+    const raw = readJsonSafe(SESSION_ROTATE_FILE, { days: {} });
+    const days = raw && typeof raw.days === 'object' && raw.days ? raw.days : {};
+    return { days };
+  }
+  function saveRotateState(next) {
+    try { atomicWriteJson(SESSION_ROTATE_FILE, { days: pruneRotateDays(next.days, rotateDayOf(Date.now()), 7) }); }
+    catch (error) { log('[会话换新] 记账写盘失败：', error?.message ?? error); }
+  }
+  function rotateLastActivity(key) {
+    const st = socialV2?.conversations?.get(key);
+    const recent = Array.isArray(st?.recentMessages) ? st.recentMessages : [];
+    let last = Number(st?.lastIncomingAt) || 0;
+    for (const m of recent) last = Math.max(last, Number(m?.time) || 0);
+    return last;
+  }
+  async function rotateOneSession(key) {
+    const old = state.sessions[key];
+    if (!old) return false;
+    try { if (typeof sessionEpoch === 'number') sessionEpoch += 1; } catch {}
+    delete state.sessions[key];
+    delete state.sessionPolicies[key];
+    modelAppliedSessions.delete(old);
+    reverse.delete(old);
+    collectors.delete(old);
+    sendToolSucceededSessions.delete(old);
+    pendingSendToolCalls.delete(old);
+    v2TurnStartAt.delete(old);
+    toolCallNames.delete(old);
+    social.silentTurns.delete(old);
+    social.exitingSessions.delete(old);
+    sessionModels.delete(old);
+    // 角色卡指纹要一起忘掉：新会话得重新注入一次，否则她会没有角色卡。
+    roleCardInjectSeen.delete(key);
+    saveState();
+    try { await api.stopSessionWork(old); } catch {}
+    try { await api.workspace.archiveSession({ sessionId: old }); } catch {}
+    log(rotateLine(key, old));
+    return true;
+  }
+  let rotateRunning = false;
+  async function sessionRotateTick() {
+    if (rotateRunning) return;
+    const rc = rotateCfg(cfg);
+    if (!rc.enabled) return;
+    const now = Date.now();
+    const today = rotateDayOf(now);
+    const rs = readRotateState();
+    const done = new Set(Array.isArray(rs.days?.[today]?.keys) ? rs.days[today].keys : []);
+    const news = [];
+    for (const key of Object.keys(state.sessions)) {
+      if (done.has(key)) continue;
+      const busy = isConversationBusyV2(key, socialV2.conversations.get(key));
+      const verdict = shouldRotate(key, { now, cfg: rc, lastDay: done.has(key) ? today : null, busy, lastActivityAt: rotateLastActivity(key) });
+      if (!verdict.rotate) continue;
+      news.push(key);
+    }
+    if (!news.length) {
+      // 窗口里但没有可换的（都在忙/刚说话）：记一笔 attemptedAt，避免刷日志。
+      if (rs.days?.[today]?.attemptedAt) return;
+    }
+    rotateRunning = true;
+    try {
+      const swapped = [];
+      for (const key of news) {
+        try { if (await rotateOneSession(key)) swapped.push(key); }
+        catch (error) { log(`[会话换新] ${key} 失败：${error?.message ?? error}`); }
+      }
+      const next = readRotateState();
+      const prevKeys = Array.isArray(next.days?.[today]?.keys) ? next.days[today].keys : [];
+      next.days[today] = { keys: [...new Set([...prevKeys, ...swapped])], at: Date.now(), attemptedAt: Date.now() };
+      saveRotateState(next);
+      if (swapped.length) log(`[会话换新] 今天已换 ${swapped.length} 个会话：${swapped.join(', ')}`);
+    } finally {
+      rotateRunning = false;
+    }
   }
 
   function retireSession(key) {
