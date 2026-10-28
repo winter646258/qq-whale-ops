@@ -295,12 +295,18 @@ async function research({ sendJson, readBody }) {
   if (enabledError(this.ctx.cfg, sendJson)) return;
   const body = (await readBody()) ?? {};
   const ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
-  const candidates = ids.length
-    ? h.entries().filter((e) => ids.includes(e.id) && e.status === h.SLANG_STATUS.CANDIDATE)
-    : h.entries().filter((e) => e.status === h.SLANG_STATUS.CANDIDATE);
-  if (!candidates.length) { sendJson({ ok: false, error: '没有可研究的候选黑话' }, 400); return; }
-  h.queueTask(() => h.runResearch(candidates));
-  sendJson({ ok: true, count: candidates.length });
+  // MARKER: slang-research-on-demand —— 原来「不给 ids 就把全部候选塞进去」，
+  // 那等于一键点着一次 30~45 次联网调用。改成按需挑：词条门槛 + 每日配额。
+  const pick = h.pickResearch({ ids, limit: Number(body.limit) || 0 });
+  if (!pick.candidates.length) {
+    const why = pick.reason === 'quota'
+      ? '今天的黑话研究配额用完了'
+      : `没有达到研究门槛（被用过 ${pick.minCount} 次）且缺释义的词条`;
+    sendJson({ ok: false, error: why, reason: pick.reason, minCount: pick.minCount, quotaLeft: pick.quotaLeft }, 400);
+    return;
+  }
+  h.queueTask(() => h.runResearch(pick.candidates));
+  sendJson({ ok: true, count: pick.candidates.length, minCount: pick.minCount, quotaLeft: pick.quotaLeft, reason: pick.reason });
 }
 
 async function updateConfig({ sendJson, readBody }) {
@@ -326,6 +332,20 @@ async function updateConfig({ sendJson, readBody }) {
     merged.injectMax = Math.min(200, Math.max(1, Math.round(Number(merged.injectMax) || 1)));
   }
   if (merged.autoResearch !== undefined) merged.autoResearch = merged.autoResearch === true;
+  if (merged.researchMinCount !== undefined) {
+    // 按需研究门槛：只研究被用过这么多次的词（1~100，默认 5）。
+    const n = Number(merged.researchMinCount);
+    merged.researchMinCount = Number.isFinite(n) && n > 0 ? Math.min(100, Math.max(1, Math.round(n))) : 5;
+  }
+  if (merged.researchMaxPerDay !== undefined) {
+    // 每天最多研究几条（0 = 当天不研究，上限 50）。
+    const n = Number(merged.researchMaxPerDay);
+    merged.researchMaxPerDay = Number.isFinite(n) && n >= 0 ? Math.min(50, Math.round(n)) : 6;
+  }
+  if (merged.researchBatch !== undefined) {
+    const n = Number(merged.researchBatch);
+    merged.researchBatch = Number.isFinite(n) && n > 0 ? Math.min(20, Math.max(1, Math.round(n))) : 10;
+  }
   if (merged.softCap !== undefined) {
     // 黑话软上限 200~2000（默认 1200）。写坏或 0 一律回到 1200。
     const n = Number(merged.softCap);

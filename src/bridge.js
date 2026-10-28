@@ -96,6 +96,9 @@ import {
 
 // MARKER: diary-daily-import
 import { dailyCfg as dailyDiaryCfg, decideDailyDiary } from './diary-daily.js';
+
+// MARKER: slang-research-on-demand-import
+import { pickResearchCandidates, quotaFor, researchCfg } from './slang-research.js';
 import { LEARNER_RETRY_NUDGE, learnerOutcome } from './learner-retry.js';
 // 生图流式读取 + 分段探测：非流式时上游画完之前连接上一个字节都没有，中间层 35~40 秒就把
 // 空闲连接掐掉（2026-10-28 18:19 那次 38 秒的 terminated）。纯逻辑在 image-stream.js，带单测。
@@ -1699,6 +1702,8 @@ async function main() {
       setEntries: (next) => {
         slangEntries = Array.isArray(next) ? next : [];
       },
+      // MARKER: slang-research-pick
+      pickResearch: (opts) => slangResearchPick(opts),
       save: () => saveSlangStore(),
       createEntry: (input) => createSlangEntry(input),
       SLANG_STATUS,
@@ -3267,6 +3272,50 @@ async function main() {
   //
   // 为什么单独成函数：第一版写在「提取成功」分支里，实测因「未发现候选」而永不触发。
   // 现在由「每次提取后」和「服务启动后」两处调用，不依赖刚好有新词。
+  // MARKER: slang-research-quota
+  // 研究是全链最贵的一步：一轮研究会话实测 30~45 次 web_search/web_fetch、
+  // 180 秒必超时被丢弃。所以研究要过两道闸：词条门槛（count >= researchMinCount）
+  // 与每日配额（researchMaxPerDay）。配额记在独立状态文件里，换天自动归零。
+  const RESEARCH_QUOTA_FILE = path.join(STATE_DIR, 'slang-research-quota.json');
+  function researchDayKey(now = Date.now()) {
+    const d = new Date(Number(now));
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  }
+  function readResearchQuota(now = Date.now()) {
+    let raw = null;
+    try {
+      raw = readJsonSafe(RESEARCH_QUOTA_FILE, null, false);
+    } catch {
+      raw = null;
+    }
+    return quotaFor(raw, researchDayKey(now), researchCfg(cfg.slang).maxPerDay);
+  }
+  function writeResearchQuota(quota) {
+    try {
+      atomicWriteJson(RESEARCH_QUOTA_FILE, { day: quota.day, used: quota.used });
+    } catch (error) {
+      log(`[黑话研究] 配额落盘失败：${error?.message ?? error}`);
+    }
+  }
+  function slangResearchPick({ ids = [], limit = 0 } = {}) {
+    const rc = researchCfg(cfg.slang);
+    const quota = readResearchQuota();
+    const picked = pickResearchCandidates({
+      entries: Array.isArray(slangEntries) ? slangEntries : [],
+      statusCandidate: SLANG_STATUS.CANDIDATE,
+      ids,
+      minCount: rc.minCount,
+      limit: limit > 0 ? limit : rc.batch,
+      quotaLeft: quota.left
+    });
+    if (picked.candidates.length) {
+      writeResearchQuota({ ...quota, used: quota.used + picked.candidates.length });
+      log(`[黑话研究] 按需挑出 ${picked.candidates.length} 条（门槛 ${rc.minCount} 次，今天剩余 ${Math.max(0, quota.left - picked.candidates.length)} 条配额）`);
+    }
+    return { ...picked, minCount: rc.minCount, quotaLeft: Math.max(0, quota.left - picked.candidates.length) };
+  }
+
   function sweepUnresearchedSlang({ reason = '' } = {}) {
     try {
       if (cfg.slang?.autoResearch === false) return 0;
@@ -3275,11 +3324,15 @@ async function main() {
         ? cfg.slang.inferenceThresholds.map(Number).filter(Boolean)
         : [2, 4, 8];
       const maxThreshold = thresholdsC.length ? Math.max(...thresholdsC) : 8;
+      const researchMinCount = researchCfg(cfg.slang).minCount;
       const pending = slangEntries.filter((e) => {
         if (!e || e.status !== SLANG_STATUS.CANDIDATE) return false;
         const c = Number(e.count) || 0;
         const done = Number(e.lastInferenceCount) || 0;
         if (c < 1 || done >= c) return false;
+        // MARKER: slang-research-on-demand —— 只研究被真用过 researchMinCount 次的词。
+        // 原来门槛是「到过某个阈值（2/4/8）」，等于 count=2 也去联网查，钱花在碎句子上。
+        if (c < researchMinCount) return false;
         // 只补「已经到过某个阈值」的，避免把所有 count=1 的词一次性全塞进队列
         if (c > maxThreshold) return true;
         return thresholdsC.includes(c);
@@ -3296,7 +3349,12 @@ async function main() {
       });
       // MARKER: slang-backfill-fast —— 一次最多补 10 条（原 5 条）。
       // 轻量研究不联网，10 条一轮实测 40~60 秒，学习会话扛得住。
-      const batch = pending.slice(0, 10).filter((e) => !slangResearchingIds.has(e.id));
+      // MARKER: slang-research-quota-use —— 每天有配额，用完就停，不设闸就是无底洞。
+      const quota = readResearchQuota();
+      if (quota.left <= 0) return 0;
+      const batch = pending.slice(0, Math.min(10, quota.left)).filter((e) => !slangResearchingIds.has(e.id));
+      if (batch.length) writeResearchQuota({ ...quota, used: quota.used + batch.length });
+      if (!batch.length) return 0;
       if (!batch.length) return 0;
       log(`黑话研究：补偿扫描补入 ${batch.length} 条从未研究的候选${reason ? `（${reason}）` : ''}`);
       queueSlangTask(() => runSlangResearch(batch));

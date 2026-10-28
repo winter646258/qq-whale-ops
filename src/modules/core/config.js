@@ -36,7 +36,7 @@ export function normalizeSocialV2(body, current) {
   const merged = { ...current, ...body };
   // 子对象必须是非 null 对象；null / 数组 / 基本类型会覆盖默认值导致工具开关被绕过，
   // 这里直接保留当前值。
-  for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context']) {
+  for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context', 'diaryDaily']) {
     if (body[sub] !== undefined && (body[sub] === null || typeof body[sub] !== 'object' || Array.isArray(body[sub]))) {
       merged[sub] = current[sub] ?? {};
     }
@@ -116,6 +116,22 @@ export function normalizeSocialV2(body, current) {
     if (merged.proactive.probability !== undefined) merged.proactive.probability = clamp01(merged.proactive.probability);
   }
 
+  if (body.diaryDaily && typeof body.diaryDaily === 'object' && !Array.isArray(body.diaryDaily)) {
+    // MARKER: diary-daily-hot —— 「每天先日记」的旋钮也要能热改，
+    // 不然每次调冷却/次数都得重启 bridge、打断正在进行的回合。
+    merged.diaryDaily = { ...(current.diaryDaily ?? {}), ...body.diaryDaily };
+    const dd = merged.diaryDaily;
+    if (dd.enabled !== undefined) dd.enabled = dd.enabled !== false;
+    for (const k of ['cooldownMs', 'maxPerDay', 'keepDays']) {
+      if (dd[k] === undefined) continue;
+      dd[k] = num(dd[k], current.diaryDaily?.[k] ?? 0, { min: 1 });
+    }
+    for (const k of ['quietStart', 'quietEnd', 'strongAfterHour']) {
+      if (dd[k] === undefined) continue;
+      const n = Number(dd[k]);
+      dd[k] = Number.isFinite(n) ? Math.min(24, Math.max(0, Math.trunc(n))) : (current.diaryDaily?.[k] ?? 0);
+    }
+  }
   if (body.sticker && typeof body.sticker === 'object') {
     merged.sticker = { ...(current.sticker ?? {}), ...body.sticker };
     if (merged.sticker.enabled !== undefined) merged.sticker.enabled = merged.sticker.enabled === true;
