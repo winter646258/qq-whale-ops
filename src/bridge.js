@@ -124,6 +124,20 @@ import { moodDaysCfg, moodTrendLine, pruneMoodDays, recordMoodDay } from './mood
 import { buildThreadsAsk, threadsCfg, threadsLine, summarizeThreads, addThreads, dueThreads, markAsked, pruneThreads, resolveThreads } from './threads.js';
 import { buildWishesAsk, wishesCfg, wishesLine, summarizeWishes, addWishes, completeWishes, pruneWishes } from './wishes.js';
 import { addDates, buildDatesAsk, datesCfg, datesLine, summarizeDates } from './dates.js';
+// MARKER: world-c2-topics-import
+import {
+  TOPICS_DEFAULTS as TOPICS_DEFAULTS_C2,
+  topicsCfg,
+  dueTopicSlot,
+  markTopicSlot,
+  addTopics,
+  pruneTopics,
+  topicsLine,
+  summarizeTopics,
+  buildTopicAsk,
+  parseTopicJSON,
+  localDayOf as topicsDayOf
+} from './topics.js';
 // MARKER: shared-memory
 // 跨会话共享记忆：主人私聊能了解她在群里经历的重要事情，同时私聊专属内容
 // 不进群、群专属内容不自动进私聊。纯逻辑在 shared-memory-store.js，带单测。
@@ -3841,6 +3855,95 @@ async function main() {
       log(`[dates] 落盘失败：${error?.message ?? error}`);
     }
   }
+  // MARKER: world-c2-store
+  // 谈资：她自己的、不联网的、一天两次。只存标题 + 一句话，
+  // 因为注入进每一轮的每个字都要按 token 付钱，而「播报感」也来自长文本。
+  const TOPICS_FILE = path.join(STATE_DIR, 'topics.json');
+  function readTopicsStore() {
+    const raw = readJsonSafe(TOPICS_FILE, null);
+    const base = raw && typeof raw === 'object' ? raw : {};
+    return {
+      version: 1,
+      updatedAt: Number(base.updatedAt) || 0,
+      items: Array.isArray(base.items) ? base.items : [],
+      days: base.days && typeof base.days === 'object' ? base.days : {},
+    };
+  }
+  function saveTopicsStore(store) {
+    try {
+      atomicWriteJson(TOPICS_FILE, store);
+    } catch (error) {
+      log(`[谈资] 落盘失败：${error?.message ?? error}`);
+    }
+  }
+  let topicsBusy = false;
+  let topicsTimer = null;
+  async function generateTopic(slotInfo, tc) {
+    const store = readTopicsStore();
+    const sessionId = await ensureSettleSession();
+    const ask = buildTopicAsk({
+      hour: slotInfo.hour,
+      recent: summarizeTopics(store, { cfg: tc }),
+      cfg: tc,
+    });
+    const handle = waitSettleTurn(sessionId, 180000);
+    try {
+      unwrap(
+        await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: ask }] }),
+        'topic prompt',
+      );
+      const text = await handle.promise;
+      const topic = parseTopicJSON(text);
+      if (!topic) {
+        log('[谈资] 这轮没parse出 JSON，跳过');
+        return false;
+      }
+      const merged = addTopics(store, [topic], { now: Date.now(), cfg: tc });
+      if (!merged.added) {
+        log(`[谈资] 「${topic.title}」重复了，跳过`);
+        return false;
+      }
+      saveTopicsStore(pruneTopics(merged.store, { cfg: tc }));
+      log(`[谈资] 挑到一条：${topic.title}`);
+      return true;
+    } catch (error) {
+      log(`[谈资] 生成失败：${error?.message ?? error}`);
+      return false;
+    } finally {
+      handle.cancel();
+    }
+  }
+  async function topicTick() {
+    if (topicsBusy) return;
+    const tc = topicsCfg(cfg);
+    if (!tc.enabled) return;
+    const store = readTopicsStore();
+    const slotInfo = dueTopicSlot(store, { now: Date.now(), cfg: tc });
+    if (!slotInfo) return;
+    // 慢渠道时不抢算力：这条路是「锦上添花」，不是必须说的话。
+    try {
+      if (slangResearchChannelIsFallback()) {
+        log('[谈资] 当前在兜底渠道，今天就先不挑');
+        markTopicSlotSafely(store, slotInfo, tc);
+        return;
+      }
+    } catch {}
+    topicsBusy = true;
+    try {
+      const ok = await generateTopic(slotInfo, tc);
+      if (ok) markTopicSlotSafely(store, slotInfo, tc);
+    } finally {
+      topicsBusy = false;
+    }
+  }
+  function markTopicSlotSafely(store, slotInfo, tc) {
+    try {
+      saveTopicsStore(markTopicSlot(pruneTopics(store, { cfg: tc }), { ...slotInfo, now: Date.now() }));
+    } catch (error) {
+      log(`[谈资] 记账失败：${error?.message ?? error}`);
+    }
+  }
+
   function readLifeStore() {
     const raw = readJsonSafe(LIFE_FILE, null);
     return raw && typeof raw === 'object' && raw.days && typeof raw.days === 'object'
@@ -3866,6 +3969,18 @@ async function main() {
     } catch (error) {
       log(`[心情日历] 落盘失败：${error?.message ?? error}`);
     }
+  }
+
+  // MARKER: world-c2-boot
+  // 十分钟看一次点：10 点和 16 点各挑一次；错过 10 点不会在 15 点补。
+  try {
+    clearInterval(topicsTimer);
+    topicsTimer = setInterval(() => { void topicTick(); }, 10 * 60 * 1000);
+    topicsTimer.unref?.();
+    setTimeout(() => { void topicTick(); }, 90 * 1000).unref?.();
+    log('[谈资] 定时器已排上（10 点 / 16 点各一次）');
+  } catch (error) {
+    log(`[谈资] 定时器启动失败：${error?.message ?? error}`);
   }
 
   const SETTLE_SESSION_FILE = path.join(STATE_DIR, 'settle-session.json');
@@ -12721,7 +12836,16 @@ async function generateImageNow({ prompt, size }) {
     } catch (error) {
       log(`[dates] 注入失败：${error?.message ?? error}`);
     }
-    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    // MARKER: world-c2-inject
+    let topicsText = '';
+    try {
+      const tc2 = topicsCfg(cfg);
+      const isPro = String(reason ?? '').startsWith('proactive') || String(reason ?? '').startsWith('schedule');
+      topicsText = topicsLine(readTopicsStore(), { now: Date.now(), cfg: tc2, isProactive: isPro });
+    } catch (error) {
+      topicsText = '';
+    }
+    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + topicsText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
