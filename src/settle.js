@@ -285,7 +285,9 @@ export function parseSettleJSON(text) {
   const wishes = Array.isArray(parsed.wishes) ? parsed.wishes.slice(0, 10) : [];
   const doneWishes = Array.isArray(parsed.done) ? parsed.done.slice(0, 10) : [];
   const resolvedThreads = Array.isArray(parsed.resolved) ? parsed.resolved.slice(0, 10) : [];
-  return { ok: true, value: { mood, impressions, portraits, notes, life, threads, wishes, doneWishes, resolvedThreads } };
+  // 纪念日也不在这里洗（规则在 dates.js，带单测）。
+  const dates = Array.isArray(parsed.dates) ? parsed.dates.slice(0, 10) : [];
+  return { ok: true, value: { mood, impressions, portraits, notes, life, threads, wishes, doneWishes, resolvedThreads, dates } };
 }
 
 /**
@@ -360,6 +362,7 @@ export function planSettleWrites(
     wishes: Array.isArray(value.wishes) ? value.wishes : [],
     doneWishes: Array.isArray(value.doneWishes) ? value.doneWishes : [],
     resolvedThreads: Array.isArray(value.resolvedThreads) ? value.resolvedThreads : [],
+    dates: Array.isArray(value.dates) ? value.dates : [],
     impressions: list.slice(0, cap),
     skippedImpressions: Math.max(0, list.length - cap),
     portraits: selfList.slice(0, selfCap),

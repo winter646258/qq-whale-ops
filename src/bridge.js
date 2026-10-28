@@ -123,6 +123,7 @@ import {
 import { moodDaysCfg, moodTrendLine, pruneMoodDays, recordMoodDay } from './mood-days.js';
 import { buildThreadsAsk, threadsCfg, threadsLine, summarizeThreads, addThreads, dueThreads, markAsked, pruneThreads, resolveThreads } from './threads.js';
 import { buildWishesAsk, wishesCfg, wishesLine, summarizeWishes, addWishes, completeWishes, pruneWishes } from './wishes.js';
+import { addDates, buildDatesAsk, datesCfg, datesLine, summarizeDates } from './dates.js';
 // MARKER: shared-memory
 // 跨会话共享记忆：主人私聊能了解她在群里经历的重要事情，同时私聊专属内容
 // 不进群、群专属内容不自动进私聊。纯逻辑在 shared-memory-store.js，带单测。
@@ -3825,6 +3826,21 @@ async function main() {
       log(`[wishes] 落盘失败：${error?.message ?? error}`);
     }
   }
+  // MARKER: world-c-store
+  const DATES_FILE = path.join(STATE_DIR, 'dates.json');
+  function readDatesStore() {
+    const raw = readJsonSafe(DATES_FILE, null);
+    return raw && typeof raw === 'object' && Array.isArray(raw.items)
+      ? raw
+      : { version: 1, items: [] };
+  }
+  function saveDatesStore(store) {
+    try {
+      atomicWriteJson(DATES_FILE, store);
+    } catch (error) {
+      log(`[dates] 落盘失败：${error?.message ?? error}`);
+    }
+  }
   function readLifeStore() {
     const raw = readJsonSafe(LIFE_FILE, null);
     return raw && typeof raw === 'object' && raw.days && typeof raw.days === 'object'
@@ -4020,6 +4036,7 @@ async function main() {
       const parts = [];
       if (tc.enabled) parts.push(buildThreadsAsk({ maxInject: tc.maxInject }));
       if (wc.enabled) parts.push(buildWishesAsk({ maxItems: wc.maxInject }));
+      if (datesCfg(cfg).enabled) parts.push(buildDatesAsk());
       if (parts.length) {
         parts.push('把结果并进同一个 JSON 里，加这几个可选键：');
         parts.push('- `threads`: 这次新记下的「还挂着的话」；`wishes`: 这次新记下的愿望；`done`: 已经做完的愿望原文；`resolved`: 已经问到答案的话题 id。');
@@ -4229,6 +4246,18 @@ async function main() {
           }
         } catch (error) {
           log(`[wishes] 写入失败：${error?.message ?? error}`);
+        }
+        // MARKER: world-c-write
+        let wroteDates = 0;
+        try {
+          const dc = datesCfg(cfg);
+          if (dc.enabled && plan.dates.length) {
+            const merged = addDates(readDatesStore(), { items: plan.dates, now: Date.now(), cfg: dc });
+            saveDatesStore(merged.store);
+            wroteDates = merged.added;
+          }
+        } catch (error) {
+          log(`[dates] 写入失败：${error?.message ?? error}`);
         }
         settleDone = true;
         st.lastSettleAt = Date.now();
@@ -12683,7 +12712,16 @@ async function generateImageNow({ prompt, size }) {
     } catch (error) {
       log(`[wishes] 注入失败：${error?.message ?? error}`);
     }
-    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    // MARKER: world-c-inject
+    // 纪念日：只在今天 / 快到了的时候出现，平时一个字都不占。
+    let datesText = '';
+    try {
+      const dc = datesCfg(cfg);
+      if (dc.enabled) datesText = datesLine(readDatesStore(), { now: Date.now(), cfg: dc });
+    } catch (error) {
+      log(`[dates] 注入失败：${error?.message ?? error}`);
+    }
+    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
