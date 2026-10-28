@@ -93,6 +93,9 @@ import {
   ventUndercurrent, resolveUndercurrent, setBaseline, moodStats, recordMoodSample, settleBaseline,
   MOOD_FILE as MOOD_STORE_FILE
 } from './mood-store.js';
+
+// MARKER: diary-daily-import
+import { dailyCfg as dailyDiaryCfg, decideDailyDiary } from './diary-daily.js';
 import { LEARNER_RETRY_NUDGE, learnerOutcome } from './learner-retry.js';
 // 生图流式读取 + 分段探测：非流式时上游画完之前连接上一个字节都没有，中间层 35~40 秒就把
 // 空闲连接掐掉（2026-10-28 18:19 那次 38 秒的 terminated）。纯逻辑在 image-stream.js，带单测。
@@ -219,6 +222,7 @@ const SHARE_SIGNAL_FILE = path.join(STATE_DIR, 'share-signal.json');
 // MARKER: group-digest-file
 // 睡眠回顾的「今天做过没」记账（{ reviewDays: { [key]: 'YYYY-MM-DD' } }）。
 const SLEEP_REVIEW_FILE = path.join(STATE_DIR, 'sleep-review.json');
+const DIARY_DAILY_FILE = path.join(STATE_DIR, 'diary-daily.json');
 
 // MARKER: affinity-file
 const AFFINITY_FILE = path.join(STATE_DIR, 'affinity.json');  // MARKER: share-signal-file
@@ -6278,6 +6282,51 @@ async function main() {
     return `[${e.time || '未知时间'}]${fmtLevelTag(lv)}${e.mood ? `（${e.mood}）` : ''} ${e.text}${e.art && e.art.file ? ' 〔配图〕' : ''}${e.id ? ` 〔${e.id}〕` : ''}`;
   }
 
+  // MARKER: diary-daily
+  // 每天先日记：今天还没写就在私聊里提醒一次，冷却 3 小时、当天最多 3 次、安静时段不催。
+  // 记账放独立状态文件，不塞进 conversation —— 免得和 social-v2.json 的整块落盘互相覆盖。
+  let diaryDailyCache = null;
+  function readDiaryDailyState() {
+    if (diaryDailyCache) return diaryDailyCache;
+    try {
+      const raw = readJsonSafe(DIARY_DAILY_FILE, null, false);
+      diaryDailyCache = raw && typeof raw === 'object' && raw.days && typeof raw.days === 'object' ? raw : { days: {} };
+    } catch (error) {
+      log(`[diary-daily] 状态读取失败：${error?.message ?? error}`);
+      diaryDailyCache = { days: {} };
+    }
+    return diaryDailyCache;
+  }
+  function saveDiaryDailyState(next) {
+    diaryDailyCache = next;
+    try {
+      atomicWriteJson(DIARY_DAILY_FILE, next);
+    } catch (error) {
+      log(`[diary-daily] 状态落盘失败：${error?.message ?? error}`);
+    }
+  }
+  function buildDailyDiaryLineFor(key) {
+    const local = dailyDiaryCfg(cfg);
+    if (!local.enabled) return '';
+    // 只在私聊催：群里催人写日记很奇怪，而且她不一定在群里说话。
+    if (!String(key ?? '').startsWith('private:')) return '';
+    let entries = [];
+    try {
+      entries = readDiary(path.join(ROOT, 'diary', DIARY_JSONL));
+    } catch {
+      return '';
+    }
+    const now = Date.now();
+    const out = decideDailyDiary({ entries, now, hour: new Date(now).getHours(), state: readDiaryDailyState(), cfg: local });
+    if (out.nudged) {
+      saveDiaryDailyState(out.state);
+      log(`[diary-daily] ${key} 今天还没写日记，提醒一次（今天第 ${out.count} 次）`);
+      return out.line;
+    }
+    if (out.dirty) saveDiaryDailyState(out.state);
+    return '';
+  }
+
   function buildSleepReviewLineFor(key) {
     if (cfg.socialV2?.sleepReview?.enabled === false) return '';
     let sleepSt;
@@ -12302,6 +12351,8 @@ async function generateImageNow({ prompt, size }) {
     const groupDigestLine = buildGroupDigestLineFor(key);
     // 睡眠整合：4 点后第一次醒来时回顾今天（会落盘记账，当天只念一次）。
     const sleepReviewLine = buildSleepReviewLineFor(key);
+    // MARKER: diary-daily-inject
+    const diaryDailyLine = buildDailyDiaryLineFor(key);
     // MARKER: style-hint
     // 每轮都念的断句硬规则。放在 base 末尾：紧跟 reason 之外的最后一段，注意力权重最高。
     // 之所以单独占一段而不并进角色卡：角色卡正文只在部分唤醒里注入，这条必须每轮都在。
@@ -12323,7 +12374,7 @@ async function generateImageNow({ prompt, size }) {
     }
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    const base = roleLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
