@@ -11,6 +11,8 @@
 // 复用 `threads.js` 的几个小工具口味（num / cleanText 各写一份，模块之间不互相 import
 // 私有函数，避免一个模块的改动把另一个弄坏）。
 
+import { withScope, filterByScope } from './scoped-store.js';
+
 export const WISHES_DEFAULTS = {
   enabled: true,
   maxItems: 30,
@@ -66,7 +68,7 @@ export function normalizeWish(raw, { now = Date.now(), addedBy = '她', cfg = WI
  * 不按「最老/最新」硬挤 —— 清单的意义就是那些一直没做成的旧愿望，
  * 静悄悄丢掉它比加不进去更糟。
  */
-export function addWishes(store, { items = [], now = Date.now(), addedBy = '她', cfg = WISHES_DEFAULTS } = {}) {
+export function addWishes(store, { items = [], now = Date.now(), addedBy = '她', cfg = WISHES_DEFAULTS, key = '' } = {}) {
   const c = { ...WISHES_DEFAULTS, ...(cfg || {}) };
   const base = store && typeof store === 'object' ? store : {};
   const list = Array.isArray(base.items) ? base.items.map((x) => ({ ...x })) : [];
@@ -92,15 +94,15 @@ export function addWishes(store, { items = [], now = Date.now(), addedBy = '她'
       list.splice(victim, 1);
     }
     item.id = `w${now.toString(36).slice(-5)}${(list.length + 1).toString(36)}`;
-    list.push(item);
+    list.push(withScope(item, key));   // 记下是谁那儿聊出来的，注入时按会话过滤
     added += 1;
   }
   return { store: { ...base, version: 1, items: list }, added, skipped };
 }
 
 /** 未完成的愿望，老的优先（快要被忘的才需要捞）。 */
-export function openWishes(store, { limit = WISHES_DEFAULTS.maxInject } = {}) {
-  const list = store && Array.isArray(store.items) ? store.items : [];
+export function openWishes(store, { limit = WISHES_DEFAULTS.maxInject, key = '' } = {}) {
+  const list = filterByScope(store && Array.isArray(store.items) ? store.items : [], key);
   return list
     .filter((x) => x && !x.done)
     .sort((a, b) => Number(a.addedAt || 0) - Number(b.addedAt || 0))
@@ -135,10 +137,10 @@ export function pruneWishes(store, { now = Date.now(), cfg = WISHES_DEFAULTS } =
 }
 
 /** 注入行：最多 3 条，明说「聊到才提」。 */
-export function wishesLine(store, { cfg = WISHES_DEFAULTS } = {}) {
+export function wishesLine(store, { cfg = WISHES_DEFAULTS, key = '' } = {}) {
   const c = { ...WISHES_DEFAULTS, ...(cfg || {}) };
   if (!c.enabled || c.maxInject <= 0) return '';
-  const list = openWishes(store, { limit: c.maxInject });
+  const list = openWishes(store, { limit: c.maxInject, key });
   if (!list.length) return '';
   const parts = list.map((x) => x.text);
   return `【一起想做还没做的】${parts.join('；')}。聊到相关的再接，不用故意提起。`;

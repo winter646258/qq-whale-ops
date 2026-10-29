@@ -7,6 +7,8 @@
 //   2. 提前 `lookaheadDays` 天预告，当天单独一段：预告让她有时间准备，当天才是「说点什么」的时刻。
 //   3. 生成图只是**提示**（`giftType` 里写着），发不发、画不画由她决定；代码不做自动发送。
 
+import { withScope, filterByScope } from './scoped-store.js';
+
 export const DATES_DEFAULTS = {
   enabled: true,
   lookaheadDays: 3,
@@ -91,7 +93,7 @@ export function normalizeDate(raw, { now = Date.now(), cfg = DATES_DEFAULTS } = 
   };
 }
 
-export function addDates(store, { items = [], now = Date.now(), cfg = DATES_DEFAULTS } = {}) {
+export function addDates(store, { items = [], now = Date.now(), cfg = DATES_DEFAULTS, key = '' } = {}) {
   const c = { ...DATES_DEFAULTS, ...(cfg || {}) };
   const base = store && typeof store === 'object' ? store : {};
   const list = Array.isArray(base.items) ? base.items.map((x) => ({ ...x })) : [];
@@ -109,7 +111,7 @@ export function addDates(store, { items = [], now = Date.now(), cfg = DATES_DEFA
       continue;
     }
     item.id = `d${now.toString(36).slice(-5)}${(list.length + 1).toString(36)}`;
-    list.push(item);
+    list.push(withScope(item, key));
     added += 1;
   }
   while (list.length > c.maxItems) list.shift();
@@ -127,10 +129,10 @@ export function daysUntil(month, day, now = Date.now()) {
 }
 
 /** 今天 / 快到了（lookaheadDays 内），按剩余天数升序。 */
-export function upcomingDates(store, { now = Date.now(), cfg = DATES_DEFAULTS } = {}) {
+export function upcomingDates(store, { now = Date.now(), cfg = DATES_DEFAULTS, key = '' } = {}) {
   const c = { ...DATES_DEFAULTS, ...(cfg || {}) };
   if (!c.enabled) return { today: [], soon: [] };
-  const list = store && Array.isArray(store.items) ? store.items : [];
+  const list = filterByScope(store && Array.isArray(store.items) ? store.items : [], key);
   const today = [];
   const soon = [];
   for (const x of list) {
@@ -148,10 +150,10 @@ export function upcomingDates(store, { now = Date.now(), cfg = DATES_DEFAULTS } 
 }
 
 /** 注入行：当天一段 + 预告一段（都是事实，怎么反应由她决定）。 */
-export function datesLine(store, { now = Date.now(), cfg = DATES_DEFAULTS } = {}) {
+export function datesLine(store, { now = Date.now(), cfg = DATES_DEFAULTS, key = '' } = {}) {
   const c = { ...DATES_DEFAULTS, ...(cfg || {}) };
   if (!c.enabled || c.maxInject <= 0) return '';
-  const { today, soon } = upcomingDates(store, { now, cfg: c });
+  const { today, soon } = upcomingDates(store, { now, cfg: c, key });
   const parts = [];
   if (today.length) {
     const who = today.map((x) => `${x.name}${x.note ? `（${x.note}）` : ''}`).join('、');

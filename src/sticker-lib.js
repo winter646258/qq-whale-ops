@@ -307,7 +307,24 @@ export function buildStickerContext(entries, max = 8, options = {}) {
     .filter((e) => (e.useCount || 0) > 0)
     .sort((a, b) => (b.useCount || 0) - (a.useCount || 0) || (hasInfoDesc(b) ? 1 : 0) - (hasInfoDesc(a) ? 1 : 0));
   // 轮换池：过三重过滤的图（不因“用过”而退出，池子不会枯竭）
-  const pool = list.filter(inPool).sort((a, b) => (b.localNote ? 1 : 0) - (a.localNote ? 1 : 0));
+  // MARKER: sticker-fresh-first
+  // 刚学会的表情当天优先露脸 —— 否则它 useCount=0、没 localNote，
+  // 在轮换池里永远排不进 mixTail 那几个名额，学完等于没学。
+  // 只让「今天入库」的优先，第二天照常轮换，避免老表情被永久饿死。
+  const freshDay = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+  const isFresh = (e) => {
+    const at = String(e.createdAt || '');
+    if (!at) return false;
+    const d = new Date(at);
+    if (Number.isNaN(d.getTime())) return false;
+    return new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10) === freshDay;
+  };
+  const pool = list.filter(inPool).sort((a, b) => {
+    const fa = isFresh(a) ? 1 : 0;
+    const fb = isFresh(b) ? 1 : 0;
+    if (fa !== fb) return fb - fa;
+    return (b.localNote ? 1 : 0) - (a.localNote ? 1 : 0);
+  });
 
   const headCount = Math.max(0, limit - mixTail);
   const seen = new Set();

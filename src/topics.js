@@ -8,6 +8,8 @@
 // 3) 只留标题 + 两句话。注入进提示词的东西越长越贵，也越容易变成「播报」。
 // 4) 只在主动开口时注入。被动回话时塞谈资，她会答得前言不搭后语。
 
+import { withScope, filterByScope } from './scoped-store.js';
+
 export const TOPICS_DEFAULTS = {
   enabled: true,
   slots: [10, 16],        // 每天几点各挑一次（小时，24 小时制）
@@ -80,7 +82,7 @@ export function normalizeTopic(raw, opts = {}) {
   };
 }
 
-export function addTopics(store, list, { now = Date.now(), cfg = TOPICS_DEFAULTS } = {}) {
+export function addTopics(store, list, { now = Date.now(), cfg = TOPICS_DEFAULTS, key = '' } = {}) {
   const next = { ...(store || {}) };
   const items = Array.isArray(next.items) ? [...next.items] : [];
   let added = 0;
@@ -88,7 +90,7 @@ export function addTopics(store, list, { now = Date.now(), cfg = TOPICS_DEFAULTS
     const t = normalizeTopic(raw, cfg);
     if (!t) continue;
     if (items.some((x) => x.title === t.title)) continue;
-    items.unshift({ ...t, at: now });
+    items.unshift(withScope({ ...t, at: now }, key));
     added += 1;
   }
   items.sort((a, b) => b.at - a.at);
@@ -132,12 +134,12 @@ export function markTopicSlot(store, { day, slot, now = Date.now() } = {}) {
   return next;
 }
 
-export function topicsLine(store, { now = Date.now(), cfg = TOPICS_DEFAULTS, isProactive = false } = {}) {
+export function topicsLine(store, { now = Date.now(), cfg = TOPICS_DEFAULTS, isProactive = false, key = '' } = {}) {
   if (!isProactive) return '';        // 被动回话不塞谈资
   const maxInject = cfg.maxInject ?? TOPICS_DEFAULTS.maxInject;
   if (maxInject <= 0) return '';
   const keep = Math.max(1, cfg.keepDays ?? TOPICS_DEFAULTS.keepDays) * 86400000;
-  const items = (Array.isArray(store?.items) ? store.items : [])
+  const items = filterByScope(Array.isArray(store?.items) ? store.items : [], key)
     .filter((x) => x && x.title && now - Number(x.at) < keep)
     .slice(0, maxInject);
   if (!items.length) return '';

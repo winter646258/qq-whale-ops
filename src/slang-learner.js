@@ -80,7 +80,7 @@ export function normalizeSlangEntry(raw) {
     risk: clip(entry.risk, SLANG_FIELD_MAX),
     sources: Array.isArray(entry.sources) ? entry.sources.map((s) => clip(s, SLANG_FIELD_MAX)).filter(Boolean).slice(-10) : [],
     status,
-    source: entry.source === 'manual' ? 'manual' : 'ai',
+    source: ['manual', 'taught'].includes(entry.source) ? entry.source : 'ai',
     count: Math.max(0, Number(entry.count) || 0),
     // 证据同样要限长：它是从群聊消息里截来的原文，是文件膨胀的主要来源。
     evidence: Array.isArray(entry.evidence)
@@ -298,6 +298,18 @@ export function buildSlangContext(entries, max = 8, key = '') {
   if (!confirmed.length) return '';
   const byCount = (a, b) => (b.count || 0) - (a.count || 0);
   const sessionKey = String(key || '').trim();
+  // MARKER: slang-taught-rank —— 教过的词排最前。
+  // 理由：注入位只有 8 个，按 count 排的话「今天有人教过我的词」拼不过历史高频词，
+  // 她学完下一轮就看不见了，等于没学。教学 = 有人当面告诉我，优先级应当高于统计。
+  const rank = (e) => {
+    let s = 0;
+    if (e && e.source === 'taught') s += 1000;
+    if (sessionKey) {
+      const evs = Array.isArray(e?.evidence) ? e.evidence : [];
+      if (evs.some((ev) => ev && String(ev.key ?? '') === sessionKey)) s += 100;
+    }
+    return s;
+  };
   let ordered;
   if (sessionKey) {
     const mine = [];
@@ -307,11 +319,11 @@ export function buildSlangContext(entries, max = 8, key = '') {
       const inThis = evs.some((ev) => ev && String(ev.key ?? '') === sessionKey);
       (inThis ? mine : rest).push(e);
     }
-    mine.sort(byCount);
-    rest.sort(byCount);
+    mine.sort((a, b) => rank(b) - rank(a) || byCount(a, b));
+    rest.sort((a, b) => rank(b) - rank(a) || byCount(a, b));
     ordered = mine.concat(rest);
   } else {
-    ordered = confirmed.sort(byCount);
+    ordered = confirmed.sort((a, b) => rank(b) - rank(a) || byCount(a, b));
   }
   const confirmedList = ordered.slice(0, limit);
   if (!confirmedList.length) return '';
@@ -323,6 +335,86 @@ export function buildSlangContext(entries, max = 8, key = '') {
     return line;
   });
   return `【群聊黑话表】群里已确认/常用的网络用语和梗（按出现次数排序，知道即可，不要刻意堆砌）：\n${lines.join('\n')}`;
+}
+
+// MARKER: slang-taught —— 2026-10-30
+//
+// 「教学的梗」要真的学会，就不能跟「猜出来的梗」走同一条慢路。
+// 现在链路是：LLM 抽候选 → 够次数才 research → 有释义且 count>=3 才转正 → 才进注入表。
+// 一个词从被人教到进提示词，中间要过三道，而教它的那句话早就被刷走几十条了。
+//
+// 这里补一条**本地正则直通**：群里有人说「X 的意思是 Y」「X 指的就是 Y」「X（Y）」，
+// 当场把 (X, Y) 收下、直接标 CONFIRMED、source='taught'，下一轮就进黑话表。
+// 不花 LLM、不占 research 队列。
+//
+// 三条防误判：
+//   ① 词 2~8 字、释义 2~40 字，且释义不能是「什么/啥/那个/这个」这类空话；
+//   ② 释义里出现提示词注入话术（忽略/系统/你现在是/扮演）整条丢弃 ——
+//      群友说的原文是不可信文本，教学只能当「词条释义」入库，绝不能当指令；
+//   ③ 已经被人工拉黑（REJECTED）的词，教学也不许翻回来。
+const TEACH_STOP_WORDS = new Set([
+  '什么', '啥', '那个', '这个', '不知道', '不清楚', '谁', '啥意思', '什么鬼',
+  '东西', '意思', '问题', '事情', '原因', '办法', '地方', '时候',
+]);
+
+const TEACH_INJECTION = /(忽略|无视|忽略掉|系统|指令|提示词|prompt|system|忘掉|忘记|从现在起|你现在是|请扮演|扮演你)/i;
+
+const TEACH_PATTERNS = [
+  // 「X 的意思是 Y」/「X 的意思就是 Y」
+  { re: /([\u4e00-\u9fa5A-Za-z0-9]{2,8})\s*的意思\s*(?:是|就是)\s*([^。！？!?\n；;]{2,40})/, ci: 1, mi: 2 },
+  // 「X 就是 Y 的意思」
+  { re: /([\u4e00-\u9fa5A-Za-z0-9]{2,8})\s*就是\s*([^。！？!?\n；;]{2,30})\s*的意思/, ci: 1, mi: 2 },
+  // 「X 指的是 Y」
+  { re: /([\u4e00-\u9fa5A-Za-z0-9]{2,8})\s*指的\s*(?:是|就是)\s*([^。！？!?\n；;]{2,40})/, ci: 1, mi: 2 },
+  // 「X 意思是 Y」
+  { re: /([\u4e00-\u9fa5A-Za-z0-9]{2,8})\s*意思是\s*([^。！？!?\n；;]{2,40})/, ci: 1, mi: 2 },
+  // 「X（释义）」—— 单字梗（典/孝/急/乐）大多是这种显式括注形式，所以只这一条放开到 1 字
+  { re: /([\u4e00-\u9fa5A-Za-z0-9]{1,8})\s*[（(]([^）)\n]{2,30})[）)]/, ci: 1, mi: 2, mono: true },
+];
+
+/**
+ * 从一批聊天消息里抽「有人在教」的词条。
+ * @returns {Array<{content:string, meaning:string, speaker:string, text:string, time:any}>}
+ */
+export function detectTeachings(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const out = [];
+  const seen = new Set();
+  for (const msg of list) {
+    const raw = String(msg?.text ?? '').trim();
+    if (!raw || raw.length < 5 || raw.length > 300) continue;
+    // 整条命中注入话术的直接跳过，别在它里面再挑词。
+    if (TEACH_INJECTION.test(raw)) continue;
+    for (const p of TEACH_PATTERNS) {
+      const m = raw.match(p.re);
+      if (!m) continue;
+      const content = String(m[p.ci] ?? '').trim();
+      const meaning = String(m[p.mi] ?? '').trim();
+      if (!content || !meaning) continue;
+      // 单字梗（典/孝/急/乐/蚌）很常见，但只在显式括注里认；其它说法要求 >=2 字防误判
+      const minContent = p.mono ? 1 : 2;
+      if (content.length < minContent || content.length > 8) continue;
+      if (meaning.length < 2 || meaning.length > 40) continue;
+      if (content === meaning) continue;
+      if (TEACH_STOP_WORDS.has(content) || TEACH_STOP_WORDS.has(meaning)) continue;
+      if (TEACH_INJECTION.test(meaning)) continue;
+      // 「这个」「那个」开头的 "词" 不是词
+      if (/^(这个|那个|那|这)/.test(content) && content.length <= 3) continue;
+      const dedupe = content + '\u0000' + meaning;
+      if (seen.has(dedupe)) continue;
+      seen.add(dedupe);
+      out.push({
+        content,
+        meaning,
+        speaker: String(msg?.sender ?? ''),
+        text: raw.slice(0, 200),
+        time: msg?.time ?? 0,
+      });
+      break;   // 一条消息只取第一个命中，避免同一句话拆成两个词条
+    }
+    if (out.length >= 12) break;
+  }
+  return out;
 }
 
 export function buildExtractionPrompt(messages) {

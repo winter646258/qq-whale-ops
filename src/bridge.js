@@ -61,6 +61,7 @@ import {
   upsertSlangEntry,
   buildSlangContext,
   buildExtractionPrompt,
+  detectTeachings,
   buildResearchPrompt,
   parseExtractionJson,
   parseResearchJson,
@@ -240,7 +241,9 @@ import { SpotifyClient, SecretBox } from './spotify-client.js';
 // 装载失败不该连累 24/7 主进程，所以装载处用 try 兜住，失败只降级为「没有模块」。
 import { createModuleHost } from './modules/registry.js';
 import { defineModules } from './modules/index.js';
-import { initSightings, recordSightings } from './sticker-sightings.js';
+import { initSightings, readSightings, recordSightings } from './sticker-sightings.js';
+// MARKER: sticker-learn-import
+import { buildLearnRemark, buildRecentIndex, learnQuota, pickLearnCandidates, recordLearnAttempt } from './sticker-learn.js';
 // MARKER: bili-import
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1190,6 +1193,20 @@ function loadConfig() {
     includeInPrompt: true,
     promptMaxStickers: 8,
     allowIds: [],
+    // MARKER: sticker-learn-config
+    // 自己学会表情：观测到够多次数的图自动收进库。
+    // 为什么要有：sightings 早就记了群里哪些图在反复出现，但没有任何东西去用它，
+    // 实测一张都没自动收藏过。
+    learn: {
+      enabled: true,
+      minCount: 3,
+      maxPerDay: 5,
+      minIntervalMs: 3600000,
+      maxPerTick: 2,
+      retryAfterMs: 6 * 3600 * 1000,
+      remarkMaxChars: 20,
+      ...((cfg.socialV2?.sticker?.learn) ?? {})
+    },
     collect: {
       enabled: true,
       maxPerMinute: 2,
@@ -3426,6 +3443,34 @@ async function main() {
     if (cfg.slang?.enabled === false) return;
     if (!dshReady) return;
     const messages = slangWindows.get(key) ?? [];
+    // MARKER: slang-taught-wire —— 先吃「有人明确教」的，再跑 LLM 抽取。
+    // 放在 min 门槛之前：教一句话不该等凑满 10 条才记，那时候早被刷走了。
+    // 教学条目直接 CONFIRMED，下一轮就进黑话表（buildSlangContext 里 taught 排最前）。
+    if (messages.length) {
+      try {
+        const taught = detectTeachings(messages);
+        let learned = 0;
+        for (const t of taught) {
+          const prev = slangEntries.find((e) => e && e.content === t.content);
+          // 人工拉黑的不许被教学翻回来（与 promoteSlangEntries 的口径一致）。
+          if (prev && prev.status === SLANG_STATUS.REJECTED) continue;
+          upsertSlangEntry(slangEntries, t.content, {
+            meaning: t.meaning,
+            status: SLANG_STATUS.CONFIRMED,
+            source: 'taught',
+            evidence: [{ key, sender: t.speaker, text: t.text, time: t.time }],
+            countIncrement: 3
+          });
+          learned += 1;
+        }
+        if (learned > 0) {
+          saveSlangStore();
+          log(`黑话教学：${key} 直接学到 ${learned} 条（${taught.slice(0, 4).map((t) => t.content).join('/')}${taught.length > 4 ? '…' : ''}）`);
+        }
+      } catch (error) {
+        log('黑话教学解析失败（已忽略）:', error?.message ?? error);
+      }
+    }
     const min = Math.max(1, Number(cfg.slang?.extractMinMessages ?? 10));
     if (messages.length < min) return;
 
@@ -4294,7 +4339,7 @@ async function main() {
         log('[谈资] 这轮没parse出 JSON，跳过');
         return false;
       }
-      const merged = addTopics(store, [topic], { now: Date.now(), cfg: tc });
+      const merged = addTopics(store, [topic], { now: Date.now(), cfg: tc, key });
       if (!merged.added) {
         log(`[谈资] 「${topic.title}」重复了，跳过`);
         return false;
@@ -4394,6 +4439,8 @@ async function main() {
     topicsTimer = setInterval(() => { void topicTick(); }, 10 * 60 * 1000);
     // 自己刷 B 站：每 10 分钟问一次要不要刷，真正的间隔由 biliBrowseTick 里判
     setInterval(() => { void biliBrowseTick(); }, 10 * 60 * 1000);
+    // 自己学表情：同一个节奏，配额和冷却由 stickerLearnTick 里判
+    setInterval(() => { void stickerLearnTick(); }, 10 * 60 * 1000);
     topicsTimer.unref?.();
     setTimeout(() => { void topicTick(); }, 90 * 1000).unref?.();
     log('[谈资] 定时器已排上（10 点 / 16 点各一次）');
@@ -4784,7 +4831,7 @@ async function main() {
               store = done.store;
             }
             if (plan.wishes.length) {
-              const merged = addWishes(store, { items: plan.wishes, now: Date.now(), addedBy: '她', cfg: wc });
+              const merged = addWishes(store, { items: plan.wishes, now: Date.now(), addedBy: '她', cfg: wc, key });
               store = merged.store;
               wroteWishes = merged.added;
             }
@@ -4799,7 +4846,7 @@ async function main() {
         try {
           const dc = datesCfg(cfg);
           if (dc.enabled && plan.dates.length) {
-            const merged = addDates(readDatesStore(), { items: plan.dates, now: Date.now(), cfg: dc });
+            const merged = addDates(readDatesStore(), { items: plan.dates, now: Date.now(), cfg: dc, key });
             saveDatesStore(merged.store);
             wroteDates = merged.added;
           }
@@ -7511,6 +7558,128 @@ async function biliBrowseTick() {
     log(`[bili-browse] 抛错：${error?.message ?? error}`);
   } finally {
     biliBrowseBusy = false;
+  }
+}
+
+// MARKER: sticker-learn
+// 表情包「自己学会」：群里反复出现的图，自己收进库。
+//
+// 为什么是这个通道：state/sticker-sightings.json 里的 url 是入站签名地址，
+// 几小时就失效（实测直下 3/3 全部 HTTP 400），补不了图。
+// 能取到字节的只有 social-v2.json 的 recentMessages[].media —— collectStickerV2
+// 内部走 fetchOneBotImage 再 get_image 换新鲜 url，这条路实测可通。
+//
+// 一句话：观测次数达标 + 还留在 recentMessages 里 + 不在库 + 没被自己发过，
+// 四个条件同时成立才收，收的时候把语境写进备注（不猜用法）。
+const STICKER_LEARN_FILE = path.join(STATE_DIR, 'sticker-learn.json');
+let stickerLearnBusy = false;
+function readStickerLearn() {
+  return readBrowse(STICKER_LEARN_FILE);
+}
+function writeStickerLearn(data) {
+  return writeBrowse(STICKER_LEARN_FILE, data);
+}
+
+/**
+ * 把刚学会的 emojiId 加进提示词白名单。
+ *
+ * 为什么必须加：buildStickerContext 的 allowIds 非空时只放行名单内的 id，
+ * 不加进去的话「学了也看不见」，等于白学。
+ * 白名单原本为空时直接返回 —— 空 = 全部放行，比追加成白名单更宽松。
+ */
+function addStickerToAllowlist(emojiId) {
+  const id = String(emojiId || '').trim();
+  if (!id) return;
+  try {
+    const cur = Array.isArray(cfg.socialV2?.sticker?.allowIds)
+      ? cfg.socialV2.sticker.allowIds.map(String).filter(Boolean)
+      : [];
+    if (!cur.length) return;
+    if (cur.includes(id)) return;
+    // 上限 60，先清失效 id。原来的 `slice(-40)` 是纯 FIFO，实测第一轮就把手工挑的
+    // mfuns-02 挤掉了 —— 而库里 27 个 QQ 表情有 10 个 useCount=0 从没被淘汰过。
+    // 真正卡提示词长度的是 buildStickerContext 的 max（promptMaxStickers=30），
+    // allowIds 只是粗筛，没必要勒到 40。
+    const LIMIT = 60;
+    const libEntries = Array.isArray(stickerEntries) ? stickerEntries : [];
+    const libIds = new Set(libEntries.map((e) => String(e?.id || '')));
+    let next = [...cur, id];
+    if (libIds.size) next = next.filter((x) => x === id || libIds.has(x));
+    let victim = '';
+    if (next.length > LIMIT) {
+      // 只淘汰 QQ 收藏表情，手工挑的不动；挤出去的是最早进名单的那张。
+      const dropIdx = next.findIndex((x) => x !== id && String(x).startsWith('2157801858_'));
+      if (dropIdx >= 0) {
+        victim = next[dropIdx];
+        next = next.filter((_, i) => i !== dropIdx);
+      }
+    }
+    const configFile = path.join(ROOT, 'config.json');
+    const file = readConfigObject(configFile);
+    if (!file.socialV2 || typeof file.socialV2 !== 'object') file.socialV2 = {};
+    if (!file.socialV2.sticker || typeof file.socialV2.sticker !== 'object') file.socialV2.sticker = {};
+    file.socialV2.sticker.allowIds = next;
+    atomicWriteJson(configFile, file);
+    cfg.socialV2.sticker.allowIds = next;
+    log(`[sticker-learn] 白名单加进 ${id}（现 ${next.length} 张${victim ? '，挤掉 ' + String(victim).slice(-20) : ''}）`);
+  } catch (error) {
+    log(`[sticker-learn] 写白名单失败：${error?.message ?? error}`);
+  }
+}
+
+async function stickerLearnTick() {
+  if (stickerLearnBusy) return;
+  const sc = cfg.socialV2?.sticker ?? {};
+  const lc = sc.learn ?? {};
+  if (sc.enabled === false) return;
+  if (lc.enabled === false) return;
+  if (sc.sightings?.enabled === false) return;   // 没有观测就没有输入，直接跳过
+  const now = Date.now();
+  const record = readStickerLearn() || {};
+  if (!learnQuota(record, lc, now).can) return;
+
+  let sightings = [];
+  try {
+    const res = readSightings(STATE_DIR, { minCount: Math.max(1, Number(lc.minCount) || 3) });
+    sightings = Array.isArray(res?.items) ? res.items : [];
+  } catch (error) {
+    log(`[sticker-learn] 读观测失败：${error?.message ?? error}`);
+    return;
+  }
+  if (!sightings.length) return;
+
+  // 用内存里的会话状态而不是文件：文件是定时落盘的，内存才是最新的。
+  const recentIndex = buildRecentIndex(Object.fromEntries(socialV2.conversations));
+  const perTick = Math.max(1, Number(lc.maxPerTick) || 2);
+  const candidates = pickLearnCandidates({
+    sightings, library: stickerEntries, recentIndex, record, now, opts: lc
+  }).slice(0, perTick);
+  if (!candidates.length) return;
+
+  stickerLearnBusy = true;
+  try {
+    let learned = 0;
+    let next = record;
+    for (const cand of candidates) {
+      const remark = buildLearnRemark(cand, lc);
+      try {
+        const got = await collectStickerV2(cand.key, cand.messageId, remark);
+        next = recordLearnAttempt(next, cand.hash, { ok: true, now: Date.now() });
+        writeStickerLearn(next);
+        learned += 1;
+        log(`[sticker-learn] 学会一张 ${String(cand.hash).slice(0, 8)}（${cand.key} 里出现 ${cand.count} 次）：${remark}`);
+        if (got?.emojiId) addStickerToAllowlist(got.emojiId);
+      } catch (error) {
+        next = recordLearnAttempt(next, cand.hash, { ok: false, error: error?.message ?? String(error), now: Date.now() });
+        writeStickerLearn(next);
+        log(`[sticker-learn] 没学成 ${String(cand.hash).slice(0, 8)}：${error?.message ?? error}`);
+      }
+    }
+    if (learned) log(`[sticker-learn] 这轮共学会 ${learned} 张`);
+  } catch (error) {
+    log(`[sticker-learn] 抛错：${error?.message ?? error}`);
+  } finally {
+    stickerLearnBusy = false;
   }
 }
 
@@ -13820,7 +13989,7 @@ async function generateImageNow({ prompt, size }) {
     }
     try {
       const wc = wishesCfg(cfg);
-      if (wc.enabled) wishesText = wishesLine(readWishesStore(), { cfg: wc });
+      if (wc.enabled) wishesText = wishesLine(readWishesStore(), { cfg: wc, key });
     } catch (error) {
       log(`[wishes] 注入失败：${error?.message ?? error}`);
     }
@@ -13829,7 +13998,7 @@ async function generateImageNow({ prompt, size }) {
     let datesText = '';
     try {
       const dc = datesCfg(cfg);
-      if (dc.enabled) datesText = datesLine(readDatesStore(), { now: Date.now(), cfg: dc });
+      if (dc.enabled) datesText = datesLine(readDatesStore(), { now: Date.now(), cfg: dc, key });
     } catch (error) {
       log(`[dates] 注入失败：${error?.message ?? error}`);
     }
@@ -13838,7 +14007,7 @@ async function generateImageNow({ prompt, size }) {
     try {
       const tc2 = topicsCfg(cfg);
       const isPro = String(reason ?? '').startsWith('proactive') || String(reason ?? '').startsWith('schedule');
-      topicsText = topicsLine(readTopicsStore(), { now: Date.now(), cfg: tc2, isProactive: isPro });
+      topicsText = topicsLine(readTopicsStore(), { now: Date.now(), cfg: tc2, isProactive: isPro, key });
     } catch (error) {
       topicsText = '';
     }

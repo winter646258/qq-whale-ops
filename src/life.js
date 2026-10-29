@@ -97,6 +97,13 @@ export function normalizeLifePlan(raw, opts = {}) {
     if (!body) continue;
     const dedupe = `${period}|${body}`;
     if (seen.has(dedupe)) continue;
+    // MARKER: life-no-reference
+    // 串味的真正来源：这条计划是 settle 从**某个会话**的对话里编出来的，
+    // 常带「等他讲压了谁」这种针对聊天对手的指代。计划本身是全局的（她只有一份日子），
+    // 所以不能按会话隔离 —— 能做的是把带指代的整条丢掉，留纯描述自己动作的。
+    // 2026-10-30 线上：「看半场CS比赛，等他讲压了谁」进了 life.json，她在两个群里
+    // 都说「我今天说要看半场CS」，而那个「他」本来是主人。
+    if (/(你|您|他|她|主人|群友|大家|有人)/.test(body)) continue;
     seen.add(dedupe);
     plans.push({ period, text: body });
     if (plans.length >= maxPlans) break;
@@ -156,7 +163,9 @@ export function lifeLineFor(store, now = Date.now()) {
   let line = `【今天】${parts.length ? parts.join('；') : '没什么安排，随便过'}`;
   if (entry.outfit) line += `（穿：${entry.outfit}）`;
   if (entry.moodHint) line += `（心情：${entry.moodHint}）`;
-  return `${line.slice(0, 220)}。这是你自己记下的日子，被问到就照这个说，不用逐条汇报。`;
+  // 措辞：「被问到就照这个说」会让她把日程当成必须汇报的内容（她真的在三个会话里
+  // 各说了三遍「我今天要看半场CS」）。改成「背景」：她想提可以提，但不需要主动交代。
+  return `${line.slice(0, 220)}。这是你自己过的日子，是背景，不用主动说，被问到才提。`;
 }
 
 /** 一句话摘要某一天的安排（用来告诉模型「别重复」）。 */
