@@ -126,6 +126,7 @@ import {
 } from './life.js';
 // MARKER: session-rotate-import
 import { ROTATE_DEFAULTS, kindOfKey, localDayOf as rotateDayOf, pruneRotateDays, rotateCfg, rotateLine, shouldRotate } from './session-rotate.js';
+import { buildContinuityAsk, composeContinuityText, continuityCfg, continuityLine, dayOf, markContinuityUsed, parseContinuityJSON, pickContinuityLines, pruneContinuity } from './continuity.js';
 import { moodDaysCfg, moodTrendLine, pruneMoodDays, recordMoodDay } from './mood-days.js';
 import { buildThreadsAsk, threadsCfg, threadsLine, summarizeThreads, addThreads, dueThreads, markAsked, pruneThreads, resolveThreads } from './threads.js';
 import { buildWishesAsk, wishesCfg, wishesLine, summarizeWishes, addWishes, completeWishes, pruneWishes } from './wishes.js';
@@ -3904,6 +3905,109 @@ async function main() {
     return true;
   }
 
+  // MARKER: continuity-runtime
+  // 换会话前的交接：把「还挂着的约定 / 正在聊的话题 / 最近要紧的话」压成 300 字以内，
+  // 存进 state/continuity.json，新会话第一轮读一次就作废。
+  // 动机：每天 04:10 换新会话是为了省 token 与防上下文爆，但她会断片 —— 昨天答应的事、
+  // 没聊完的话题全留在旧会话里。星璃那套的做法是「会话负责刚才，记忆负责以前」，
+  // 换之前写一张交接条。我们照做，只写三件事，宁短不长。
+  const CONTINUITY_FILE = path.join(STATE_DIR, 'continuity.json');
+  let continuityRunning = false;
+
+  function readContinuityStore() {
+    const raw = readJsonSafe(CONTINUITY_FILE, null);
+    const base = raw && typeof raw === 'object' ? raw : {};
+    return {
+      version: 1,
+      updatedAt: Number(base.updatedAt) || 0,
+      items: base.items && typeof base.items === 'object' && !Array.isArray(base.items) ? base.items : {},
+    };
+  }
+  function saveContinuityStore(store) {
+    try {
+      atomicWriteJson(CONTINUITY_FILE, store);
+    } catch (error) {
+      log(`[continuity] 落盘失败：${error?.message ?? error}`);
+    }
+  }
+
+  /** 每轮注入：有新鲜的交接就注入一次，注入完立刻作废（一天只提醒一次）。 */
+  function continuityHintFor(key) {
+    try {
+      const cc = continuityCfg(cfg);
+      if (!cc.enabled) return '';
+      const store = readContinuityStore();
+      const text = continuityLine(store.items[key], { now: Date.now(), ttlHours: cc.ttlHours });
+      if (!text) return '';
+      const now = Date.now();
+      saveContinuityStore(pruneContinuity(markContinuityUsed(store, key, now), { now, keepDays: cc.keepDays }));
+      log(`[continuity] ${key} 注入交接条（${text.length} 字）`);
+      return text;
+    } catch (error) {
+      log(`[continuity] 注入失败：${error?.message ?? error}`);
+      return '';
+    }
+  }
+
+  /** 换会话前生成交接条。失败一律不挡换会话 —— 宁可断片，也不能把定时任务卡住。 */
+  async function generateContinuity(key) {
+    const cc = continuityCfg(cfg);
+    if (!cc.enabled) return false;
+    if (continuityRunning) return false;
+    const kind = kindOfKey(key);
+    if (kind !== 'private' && kind !== 'group') return false;
+    const st = getSocialV2State(key);
+    const lines = pickContinuityLines(st?.recentMessages, {
+      now: Date.now(),
+      hours: cc.hours,
+      maxLines: cc.maxLines,
+      lineChars: cc.lineChars,
+    });
+    if (!lines.length) {
+      log(`[continuity] ${key} 最近没对话，不做交接`);
+      return false;
+    }
+    continuityRunning = true;
+    try {
+      const sessionId = await ensureSettleSession();
+      const ask = buildContinuityAsk({ key, isGroup: kind === 'group', lines });
+      const handle = waitSettleTurn(sessionId, cc.timeoutMs);
+      try {
+        unwrap(
+          await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: ask }] }),
+          'continuity prompt',
+        );
+        const text = await handle.promise;
+        const parsed = parseContinuityJSON(text, { fieldChars: cc.fieldChars });
+        const body = composeContinuityText(parsed, { chars: cc.chars });
+        if (!body) {
+          log(`[continuity] ${key} 这轮没什么可交接的`);
+          return false;
+        }
+        const now = Date.now();
+        const store = readContinuityStore();
+        const next = {
+          ...store,
+          updatedAt: now,
+          items: {
+            ...store.items,
+            [key]: { text: body, at: now, day: dayOf(now), usedAt: 0 },
+          },
+        };
+        saveContinuityStore(pruneContinuity(next, { now, keepDays: cc.keepDays }));
+        log(`[continuity] ${key} 交接已写好（${body.length} 字）`);
+        return true;
+      } finally {
+        handle.cancel();
+      }
+    } catch (error) {
+      log(`[continuity] ${key} 生成失败（不影响换会话）：${error?.message ?? error}`);
+      return false;
+    } finally {
+      continuityRunning = false;
+    }
+  }
+
   // MARKER: settle-runtime
   // 结算通道：回合收工 → 隔几十秒 → 一个独立小会话读最近几轮原文 → 写情绪/印象。
   //
@@ -5144,6 +5248,8 @@ async function main() {
     const old = state.sessions[key];
     if (!old) return false;
     try { if (typeof sessionEpoch === 'number') sessionEpoch += 1; } catch {}
+    // 换之前先写交接条：新会话第一轮才能接上昨天的话（失败不影响换会话）。
+    await generateContinuity(key);
     delete state.sessions[key];
     delete state.sessionPolicies[key];
     modelAppliedSessions.delete(old);
@@ -13326,7 +13432,9 @@ async function generateImageNow({ prompt, size }) {
     }
     // MARKER: untrusted-rules —— 群聊专用：先划清「素材 vs 指令」。
     const untrustedLine = String(key).startsWith('group:') ? GROUP_RULES : '';
-    const base = roleLine + untrustedLine + tokenLine + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + topicsText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    // MARKER: continuity-inject —— 换会话前的交接条，注入一次就作废。
+    const continuityText = continuityHintFor(key);
+    const base = roleLine + untrustedLine + tokenLine + continuityText + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + topicsText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
