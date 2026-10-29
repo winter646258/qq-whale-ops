@@ -26,8 +26,11 @@ import { createBlipTracker } from './upstream-blip.js'; // MARKER: upstream-blip
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage, describeAge } from './qq-model-view.js';
-import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+import { safeFetchBuffer, safeFetchRaw, looksLikeImageBuffer } from './safe-fetch.js';
 import { normalizeImageForModel } from './media-normalize.js';
+// MARKER: video-seg
+// 视频抽帧拼图：把视频变成几张带时序的拼图，再走图片那条现成管线。
+import { normalizeVideoForModel } from './video-frames.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
@@ -1605,6 +1608,21 @@ function extractMediaFromSegments(segments) {
         subType: (d.sub_type ?? d.subType) != null ? String(d.sub_type ?? d.subType) : '',
         summary: sanitizeMediaSummary(d.summary),
         ...emojiFields
+      });
+    } else if (seg.type === 'video') {
+      // MARKER: video-media
+      // 视频段以前在这里什么都不收，mediaList 里没有它，所以她只能从文本渲染
+      // 那边看到一句「[视频]」，连「有视频可看」都不知道，更别说去看。
+      // 这里只记元数据 —— 真正取字节和抽帧在 fetchMediaData 里按需做：
+      // 视频动辄几十 MB，不能在她没开口时就去下载转码。
+      media.push({
+        kind: 'video',
+        file: String(d.file ?? ''),
+        url: String(d.url ?? ''),
+        // OneBot v11 的 video 段常见字段是 duration（秒）。没有就记 0，
+        // 0 在这里的含义是「不知道」，不是「时长为零」。
+        durationSec: Number(d.duration ?? d.duration_sec ?? 0) || 0,
+        summary: sanitizeMediaSummary(d.summary)
       });
     } else if (seg.type === 'face') {
       media.push({
@@ -9673,6 +9691,58 @@ async function main() {
     return { buffer: buf, mimeType: mimeFromBuffer(buf) };
   }
 
+  // 视频 → 几张拼图。取字节走 safeFetchBuffer（和图片同一条出站口径），
+  // 绝不把消息里的 URL 直接喂给 ffmpeg 的 -i —— 那等于开一个任意 URL 读取口。
+  const MAX_VIDEO_BYTES = 48 * 1024 * 1024;
+  async function fetchVideoTiles(media) {
+    // 视频段的字段在不同网关上不一致：有的给 url，有的只给 file（可能是
+    // http 地址，也可能是 SnowLuma 落在本机的绝对路径）。三种都试一遍，
+    // 都不行才报错 —— 群里视频本来就少，遇到一条读不了等于白等一天。
+    const url = String(media?.url ?? '').trim();
+    const fileField = String(media?.file ?? '').trim();
+    const httpUrl = /^https?:\/\//i.test(url) ? url
+      : (/^https?:\/\//i.test(fileField) ? fileField : '');
+    const localPath = (!httpUrl && fileField.startsWith('/')) ? fileField : '';
+    if (!httpUrl && !localPath) {
+      const seen = JSON.stringify({ url, file: fileField }).slice(0, 300);
+      return { ok: false, error: `视频段没有可用的 url 或本地路径（${seen}）` };
+    }
+    let tmpDir = null;
+    try {
+      let buf;
+      if (httpUrl) {
+        // 视频不是图片，safeFetchBuffer 会在返回前做图片签名校验把这里拦死，
+        // 所以用同防护口径、不做类型校验的 safeFetchRaw。
+        const fetched = await safeFetchRaw(httpUrl, MAX_VIDEO_BYTES);
+        buf = fetched?.buffer;
+      } else {
+        // 同机路径：先看大小，别把一个几百 MB 的文件整个读进这台 1.7GB 的机器
+        const st = await fs.promises.stat(localPath).catch(() => null);
+        if (!st?.isFile()) return { ok: false, error: '视频文件不存在' };
+        if (st.size > MAX_VIDEO_BYTES) {
+          return { ok: false, error: `视频太大（${Math.round(st.size / 1048576)}MB）` };
+        }
+        buf = await fs.promises.readFile(localPath);
+      }
+      if (!buf?.length) return { ok: false, error: '拿到空文件' };
+      tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'qqvid-'));
+      const tmpFile = path.join(tmpDir, 'v.bin');
+      await fs.promises.writeFile(tmpFile, buf);
+      const out = await normalizeVideoForModel(tmpFile, {
+        ffmpegPath: process.env.FFMPEG_PATH || cfg.socialV2?.media?.ffmpegPath || null,
+        ffprobePath: process.env.FFPROBE_PATH || cfg.socialV2?.media?.ffprobePath || null,
+        tmpDir
+      });
+      return out;
+    } catch (error) {
+      return { ok: false, error: `视频处理异常：${error?.message ?? error}` };
+    } finally {
+      if (tmpDir) {
+        try { await fs.promises.rm(tmpDir, { recursive: true, force: true }); } catch {}
+      }
+    }
+  }
+
   async function fetchOneBotImage(media) {
     // MARKER: sticker-cdn-first
     // 表情包（市场/收藏表情）优先走 CDN：get_image 对市场表情必然失败
@@ -9895,6 +9965,30 @@ async function main() {
         } else {
           out.push({ index, kind: 'face', faceId: media.faceId ? String(media.faceId) : undefined, text: face.text || `[表情#${media.faceId}]` });
         }
+      } else if (media.kind === 'video') {
+        // 视频不走「一项一张图」：抽帧拼图出来是 N 张，各自带序号，
+        // 下游 transcribeMediaImages 会逐张代看，模型拿到的是一串有时序的画面。
+        const vid = await fetchVideoTiles(media);
+        if (!vid.ok) {
+          out.push({ index, kind: 'video', text: `（视频读不了：${vid.error}）` });
+          continue;
+        }
+        const beforeBytes = totalBytes;
+        for (const tile of vid.tiles) {
+          if (totalBytes + tile.buffer.length > MAX_MEDIA_BYTES) {
+            out.push({ index, kind: 'video', text: `（${tile.label} 超总大小上限，已跳过）` });
+            continue;
+          }
+          totalBytes += tile.buffer.length;
+          out.push({
+            index,
+            kind: 'image',
+            mimeType: tile.mimeType,
+            data: tile.buffer.toString('base64'),
+            text: `${tile.label}（${tile.rangeText}）`
+          });
+        }
+        log(`[video] ${vid.frameCount} 帧 → ${vid.tiles.length} 张拼图，${Math.round((totalBytes - beforeBytes) / 1024)}KB`);
       } else {
         // MARKER: sticker-fields-out
         // 表情包必须把 kind/emojiId/summary/subType 一并交出去：

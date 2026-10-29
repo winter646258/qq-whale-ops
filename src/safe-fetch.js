@@ -361,6 +361,37 @@ export function looksLikeImageBuffer(buf) {
 }
 
 /** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
+/**
+ * 抓取任意字节（带 SSRF 防护，不做图片签名校验）。
+ *
+ * 给视频这类非图片内容用：safeFetchBuffer 会在返回前强制校验 PNG/JPEG/GIF/WebP，
+ * 视频必然被拒。防护口径与 safeFetchBuffer 完全一致 —— 同一个 validateFetchUrl，
+ * 同样是「按已校验的地址发请求、禁止重新解析 DNS、逐跳校验重定向」。
+ * 上界由调用方给，自己管住，别把 1.7GB 的机器撑爆。
+ */
+export async function safeFetchRaw(urlString, maxBytes = 4 * 1024 * 1024, options = {}) {
+  validateLimit(maxBytes, 'maxBytes');
+  const accept = typeof options?.accept === 'function' ? options.accept : null;
+  const MAX_REDIRECTS = 5;
+  let { url, addresses } = await validateFetchUrl(urlString);
+  for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    const result = await requestOnce(url, addresses, maxBytes, true);
+    if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
+      if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
+      const next = new URL(result.redirect, url).toString();
+      ({ url, addresses } = await validateFetchUrl(next));
+      continue;
+    }
+    if (result.statusCode < 200 || result.statusCode >= 300) {
+      throw new Error(`抓取失败：HTTP ${result.statusCode}`);
+    }
+    if (!result.buffer?.length) throw new Error('抓取到空内容');
+    if (accept && !accept(result.buffer)) throw new Error('抓取内容不符合预期类型');
+    return { url: url.toString(), statusCode: result.statusCode, buffer: result.buffer };
+  }
+  throw new Error('重定向次数过多，已停止');
+}
+
 export async function safeFetchBuffer(urlString, maxBytes = 4 * 1024 * 1024) {
   validateLimit(maxBytes, 'maxBytes');
   const MAX_REDIRECTS = 5;
