@@ -1358,6 +1358,64 @@ if (cfg.socialV2?.tools?.getForwardMsg !== false) {
 }
 
 await 
+// ── 回忆（recall）────────────────────────────────────────────────────────────
+// 她的 recentMessages 每会话只留 100 条，过去的原文会被挤掉。
+// 桥接按月存档了全部原文（state/history/YYYY-MM.jsonl），这个工具用来「按原话去找」。
+server.tool(
+  'qq_recall',
+  '翻自己的旧聊天记录。当你想不起「上次说的那个」、想确认谁哪天说了什么、或者要把很久以前的一句原话找回来时用它。'
+  + 'text 是要找的话（几个字就行，会按字面匹配，不是语义搜索）；who 限定是谁说的；days 是往前翻几天（默认 7，最多 90）。'
+  + '返回的是原话摘录，带日期和说话人。找不到就直说找不到，别编。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    text: z.string().optional().describe('要找的话，几个字就够'),
+    who: z.string().optional().describe('只看谁说的（例：管理员 / 浮浮）'),
+    days: z.number().optional().describe('往前翻几天，默认 7，最多 90')
+  },
+  async ({ key, token, text, who, days }) => {
+    try {
+      const q = new URLSearchParams({ key });
+      if (text) q.set('text', text);
+      if (who) q.set('who', who);
+      if (days) q.set('days', String(days));
+      const data = await agentApi('/api/socialV2/recall?' + q.toString(), { headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `回忆失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+// ── 回忆（recall）────────────────────────────────────────────────────────────
+// 她的 recentMessages 每会话只留 100 条，过去的原文会被挤掉。
+// 桥接按月存档了全部原文（state/history/YYYY-MM.jsonl），这个工具用来「按原话去找」。
+server.tool(
+  'qq_recall',
+  '翻自己的旧聊天记录。当你想不起「上次说的那个」、想确认谁哪天说了什么、或者要把很久以前的一句原话找回来时用它。'
+  + 'text 是要找的话（几个字就行，会按字面匹配，不是语义搜索）；who 限定是谁说的；days 是往前翻几天（默认 7，最多 90）。'
+  + '返回的是原话摘录，带日期和说话人。找不到就直说找不到，别编。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    text: z.string().optional().describe('要找的话，几个字就够'),
+    who: z.string().optional().describe('只看谁说的（例：管理员 / 浮浮）'),
+    days: z.number().optional().describe('往前翻几天，默认 7，最多 90')
+  },
+  async ({ key, token, text, who, days }) => {
+    try {
+      const q = new URLSearchParams({ key });
+      if (text) q.set('text', text);
+      if (who) q.set('who', who);
+      if (days) q.set('days', String(days));
+      const data = await agentApi('/api/socialV2/recall?' + q.toString(), { headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `回忆失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
 // ── 日记 / 相册（diary-album-tools）──────────────────────────────────────────────
 // 作用域严格受限：只能碰 diary/ 与 album/ 两处。
 // MARKER: diary-jsonl

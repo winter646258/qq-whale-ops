@@ -127,6 +127,7 @@ import {
 // MARKER: session-rotate-import
 import { ROTATE_DEFAULTS, kindOfKey, localDayOf as rotateDayOf, pruneRotateDays, rotateCfg, rotateLine, shouldRotate } from './session-rotate.js';
 import { buildContinuityAsk, composeContinuityText, continuityCfg, continuityLine, dayOf, markContinuityUsed, parseContinuityJSON, pickContinuityLines, pruneContinuity } from './continuity.js';
+import { archivePath, clampDays, decodeLine, encodeRecord, formatRecall, historyCfg, monthOf, queryArchive, toRecord } from './history-archive.js';
 import { moodDaysCfg, moodTrendLine, pruneMoodDays, recordMoodDay } from './mood-days.js';
 import { buildThreadsAsk, threadsCfg, threadsLine, summarizeThreads, addThreads, dueThreads, markAsked, pruneThreads, resolveThreads } from './threads.js';
 import { buildWishesAsk, wishesCfg, wishesLine, summarizeWishes, addWishes, completeWishes, pruneWishes } from './wishes.js';
@@ -3903,6 +3904,88 @@ async function main() {
       for (let i = 0; i < entries.length - 50; i += 1) delete st.memberImpressions[entries[i][0]];
     }
     return true;
+  }
+
+  // MARKER: history-archive-runtime
+  // 消息长寿存档：recentMessages 每会话只留 100 条，超出就被挤掉，她自然「想不起上周」。
+  // 按月落进 state/history/YYYY-MM.jsonl，只存检索要用的字段；检索按字面双字词重叠，
+  // 不建向量库（available 只剩 450MB，装不下 bge-small 那套）。
+  const HISTORY_DIR = path.join(STATE_DIR, 'history');
+  let historyDirReady = false;
+  function ensureHistoryDir() {
+    if (historyDirReady) return true;
+    try {
+      fs.mkdirSync(HISTORY_DIR, { recursive: true });
+      historyDirReady = true;
+      return true;
+    } catch (error) {
+      log(`[history] 建目录失败：${error?.message ?? error}`);
+      return false;
+    }
+  }
+  /** 存档一条。永不抛、永不 await 阻塞主流程（丢一行存档远好过卡住回合）。 */
+  function appendArchive(key, msg) {
+    const hc = historyCfg(cfg);
+    if (!hc.enabled) return;
+    const record = toRecord(key, msg, { lineChars: hc.lineChars });
+    if (!record) return;
+    if (!ensureHistoryDir()) return;
+    const file = archivePath(HISTORY_DIR, monthOf(record.t));
+    if (!file) return;
+    const line = encodeRecord(record);
+    if (!line) return;
+    fs.appendFile(file, line + '\n', (error) => {
+      if (error) log(`[history] 写存档失败：${error?.message ?? error}`);
+    });
+    void hc;
+  }
+  /** 读最近 N 天覆盖到的月份文件，逐行解回记录。坏行直接跳过。 */
+  function readArchiveRecords(days) {
+    const hc = historyCfg(cfg);
+    const out = [];
+    const now = Date.now();
+    const months = new Set();
+    for (let i = 0; i <= days; i += 1) months.add(monthOf(now - i * 24 * 3600 * 1000));
+    for (const m of months) {
+      const file = archivePath(HISTORY_DIR, m);
+      if (!file) continue;
+      let text = '';
+      try {
+        text = fs.readFileSync(file, 'utf8');
+      } catch {
+        continue;
+      }
+      const lines = text.split('\n');
+      const from = Math.max(0, lines.length - hc.scanLines);
+      for (let i = from; i < lines.length; i += 1) {
+        const rec = decodeLine(lines[i]);
+        if (rec) out.push(rec);
+      }
+    }
+    return out;
+  }
+  /** 回忆：找「谁在什么时候说过什么」。默认近 7 天，最多 20 条。 */
+  function recallArchive({ text = '', who = '', days, key = '', excludeSelf = false } = {}) {
+    const hc = historyCfg(cfg);
+    if (!hc.enabled) return { ok: false, count: 0, text: '存档功能没开。' };
+    const useDays = clampDays(days, hc);
+    const records = readArchiveRecords(useDays);
+    const hits = queryArchive(records, {
+      text,
+      who,
+      days: useDays,
+      now: Date.now(),
+      limit: hc.maxResults,
+      keyOnly: key || undefined,
+      excludeSelf,
+    });
+    return {
+      ok: true,
+      count: hits.length,
+      days: useDays,
+      text: formatRecall(hits, { text, days: useDays, now: Date.now() }),
+      items: hits.map((r) => ({ t: r.t, who: r.who, text: r.text })),
+    };
   }
 
   // MARKER: continuity-runtime
@@ -8332,6 +8415,23 @@ async function main() {
               }
               return;
             }
+            // MARKER: history-recall-route —— 「上周你说过的那个」得找得回来。
+            if (url.pathname === '/api/socialV2/recall') {
+              try {
+                const q = url.searchParams;
+                const result = recallArchive({
+                  text: String(q.get('text') ?? '').trim(),
+                  who: String(q.get('who') ?? '').trim(),
+                  days: q.get('days'),
+                  key: String(q.get('key') ?? '').trim(),
+                  excludeSelf: q.get('excludeSelf') === '1'
+                });
+                sendJson(result);
+              } catch (error) {
+                sendJson({ ok: false, error: `回忆失败：${error?.message ?? error}` }, 500);
+              }
+              return;
+            }
             if (req.method === 'GET' && url.pathname === '/api/socialV2/diary/book') {
               const DIARY_BOOK_FILE = path.join(ROOT, 'diary', DIARY_JSONL);
               const DIARY_ART_ROOT = path.join(ROOT, 'diary', 'art');
@@ -12416,6 +12516,8 @@ async function generateImageNow({ prompt, size }) {
     st.preSleepWaitAccumMs = 0;
     st.recentMessages.push(msg);
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    // MARKER: history-archive-incoming —— 进 store 的同时落一份月度存档（异步，永不抛）。
+    appendArchive(key, msg);
     // MARKER: sticker-sightings-v2 —— 观测层在这里也必须挂一份。
     // 踩过的坑：群里天天有图（vision 一条条在识别），可 state/sticker-sightings.json
     //           停在「items: []」二十多个小时不动、启动日志永远「已记录 0 张图」。
@@ -12523,6 +12625,8 @@ async function generateImageNow({ prompt, size }) {
         isSelf: true,
         time: now + i * 1000
       });
+      // MARKER: history-archive-self —— 她自己说的话同样存档：以后想翻「我那天怎么说的」才有得翻。
+      appendArchive(key, st.recentMessages[st.recentMessages.length - 1]);
     }
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     // AI 实际发言/参与了，说明这轮选择“继续回复”，沉睡前观察状态作废；下次想睡需重新走 5 分钟等待。
