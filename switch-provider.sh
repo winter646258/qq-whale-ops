@@ -68,7 +68,11 @@ SLOW_MIN_SAMPLES="${SLOW_MIN_SAMPLES:-3}"    # 至少要有这么多条新请求
 SLOW_STRIKES="${SLOW_STRIKES:-2}"            # 连续这么多次检查都慢 -> 降级
 
 # 失败关键词。2026-10-19 补「限流」；2026-10-21 补渠道白名单相关。
-FAIL_PATTERN="unauthorized|quota|insufficient|balance|rate.?limit|额度不足|余额不足|发送失败|限流|解禁|所有账号|可用账号|AI 反馈.*error|agent 处理出错|Illegal API invocation|unapproved channel"
+# 2026-10-29：摘掉过于宽泛的「agent 处理出错」。它既罩渠道故障，也罩内容被拒
+# （unpaired surrogate、Illegal API invocation from buddy 之类），后者一律被误判成
+# 「渠道坏了」-> 降级 -> 300 秒后又探回 -> 成对重启。今天 18 次重启里大半是这么来的。
+# 渠道故障改由下面几条具体信号判定（都只在真断/真没额度时出现）。
+FAIL_PATTERN="unauthorized|quota|insufficient|balance|rate.?limit|额度不足|余额不足|发送失败|限流|解禁|所有账号|可用账号|AI 反馈.*error|Illegal API invocation|unapproved channel|522 with an HTML error page|521 with an HTML error page|no usable credential|ENOTFOUND|Service temporarily unavailable"
 
 # 候选链：从优到劣。加渠道就往这三个数组尾部追加，判定逻辑会自动跟上。
 # 2026-10-28：把 our-free-model 提到链首。
