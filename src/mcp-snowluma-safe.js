@@ -1149,22 +1149,27 @@ if (cfg.socialV2?.tools?.qzone !== false) {
 if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
   server.tool(
     'qq_send_voice',
-    '在指定会话发一条 QQ 语音（把语音库里准备好的音频当语音条发出去）。voice 传 qq_list_voices 返回的 name（文件名，可带子目录），也可以直接传语音库里的文件名（不带扩展名也能匹配）。注意：① 只能发语音库（qq-bridge/audio/）里的文件，不能发任意本地路径，也不能发 URL/base64；② 受时长与频率上限约束（见 qq_list_voices 的 limits），超限会被拒绝；③ 语音是「开口说话」的强表达，别滥用，闲聊里偶尔发一条即可；④ 返回的 verified=true 表示已经用 get_msg 回读到这条消息的 record 段（语音确实落地了）—— 只有 verified=true 才能对用户说你发了语音；⑤ readback 只对「收到的」语音有意义（QQ 会转写别人的语音），自己发的语音一般拿不到转写文本，默认关闭，别依赖它。',
+    '在 QQ 会话里开口说话（发一条语音条）。两种用法，**优先第一种**：① text = 你想说的那句话，系统现场合成语音再发出去，不需要任何库存文件；② voice = 语音库里已存好的音频文件名（来自 qq_list_voices），只有想发固定音频时才用。注意：① 用 voice 时只能发语音库（qq-bridge/audio/）里的文件，不能发任意本地路径、URL、base64；用 text 时没有这个限制；② 受时长与频率上限约束（见 qq_list_voices 的 limits），超限会被拒绝；③ 语音是「开口说话」的强表达，别滥用，闲聊里偶尔发一条即可；④ 返回的 verified=true 表示已经用 get_msg 回读到这条消息的 record 段（语音确实落地了）—— 只有 verified=true 才能对用户说你发了语音；⑤ readback 只对「收到的」语音有意义（QQ 会转写别人的语音），自己发的语音一般拿不到转写文本，默认关闭，别依赖它。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      voice: z.string().describe('语音库里的文件名（来自 qq_list_voices 的 name，可带子目录/可省略扩展名）'),
+      text: z.string().optional().describe('要「说」出来的那句话（推荐用法）。传了它就不用管 voice，系统会现场合成语音。60 字以内最自然，超过 600 字只念前面一段。'),
+      voice: z.string().optional().describe('语音库里的文件名（来自 qq_list_voices 的 name）。只想发库存音频时才用；想说话请用 text。'),
       label: z.string().optional().describe('可选：写进会话记录里的说明，如「说了句晚安」'),
       verify: z.boolean().optional().describe('是否回读校验语音已落地（默认 true，建议保持开启）'),
       readback: z.boolean().optional().describe('是否额外索取 QQ 转写文本（自己发的语音通常没有，默认 false）')
     },
-    async ({ key, token, voice, label, verify, readback }) => {
+    async ({ key, token, text, voice, label, verify, readback }) => {
       try {
+        if (!text && !voice) {
+          return { content: [{ type: 'text', text: '要么给 text（想说的话），要么给 voice（库存文件名），两个都是空的就没法发。' }], isError: true };
+        }
         const data = await agentApi('/api/socialV2/send-voice', {
           method: 'POST',
           body: JSON.stringify({
             key,
-            voice: String(voice),
+            text: text ? String(text) : '',
+            voice: voice ? String(voice) : '',
             label: label || '',
             verify: verify !== false,
             readback: readback === true,
@@ -1182,7 +1187,7 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
 
   server.tool(
     'qq_list_voices',
-    '查看可用的语音库（qq-bridge 的 audio 目录里准备好的音频文件）：文件名、时长、大小。想发语音前先调用这个看有哪些能发（名字用返回的 name）。返回里 limits 是时长/体积/频率上限。语音库里没有合适内容时不要硬发，也不要假装发了语音。',
+    '查看语音库里已存好的音频文件（文件名、时长、大小）。**注意：想说话不需要调用这个** —— 直接用 qq_send_voice 的 text 参数，系统会现场合成。这个工具只在你想发某个固定音频时才用。库为空是正常的，别因此以为不能发语音。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
