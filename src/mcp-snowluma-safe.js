@@ -1387,35 +1387,6 @@ server.tool(
   }
 );
 
-// ── 回忆（recall）────────────────────────────────────────────────────────────
-// 她的 recentMessages 每会话只留 100 条，过去的原文会被挤掉。
-// 桥接按月存档了全部原文（state/history/YYYY-MM.jsonl），这个工具用来「按原话去找」。
-server.tool(
-  'qq_recall',
-  '翻自己的旧聊天记录。当你想不起「上次说的那个」、想确认谁哪天说了什么、或者要把很久以前的一句原话找回来时用它。'
-  + 'text 是要找的话（几个字就行，会按字面匹配，不是语义搜索）；who 限定是谁说的；days 是往前翻几天（默认 7，最多 90）。'
-  + '返回的是原话摘录，带日期和说话人。找不到就直说找不到，别编。',
-  {
-    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
-    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    text: z.string().optional().describe('要找的话，几个字就够'),
-    who: z.string().optional().describe('只看谁说的（例：管理员 / 浮浮）'),
-    days: z.number().optional().describe('往前翻几天，默认 7，最多 90')
-  },
-  async ({ key, token, text, who, days }) => {
-    try {
-      const q = new URLSearchParams({ key });
-      if (text) q.set('text', text);
-      if (who) q.set('who', who);
-      if (days) q.set('days', String(days));
-      const data = await agentApi('/api/socialV2/recall?' + q.toString(), { headers: { 'x-agent-token': token } });
-      return { content: [{ type: 'text', text: serializeModelData(data) }] };
-    } catch (error) {
-      return { content: [{ type: 'text', text: `回忆失败：${error?.message ?? error}` }], isError: true };
-    }
-  }
-);
-
 // ── 日记 / 相册（diary-album-tools）──────────────────────────────────────────────
 // 作用域严格受限：只能碰 diary/ 与 album/ 两处。
 // MARKER: diary-jsonl
@@ -1612,7 +1583,7 @@ server.tool(
     + '要拿刚画那张的本地路径（比如配说说、或再转发给别人），调 action:"recent" 取 items[0].path。\n'
     + '**想看图**用 action:"see"：不填参数就看这个会话最近一条带图的；也可以给 messageRef（哪条消息）/ url / file。'
     + '画完的图会顺手描述一遍并记进你自己的记忆里，所以下一轮你「记得」自己画了什么；'
-    + '但别人发的老图要看清楚，还是得调一次 see（识别结果会缓存，第二次不再花钱）。',
+    + '但别人发的老图要看清楚，还是得调一次 see（识别结果会缓存，第二次不再花钱）。'
     // MARKER: selfie-tool
     + '**自拍/合照**用 action:"selfie"：这条不用写 prompt，只写 scene（在哪儿、在干什么，一句话）。'
     + '服务端会拿「她自己那张参考图」重画，人还是她，只换场景；合照加 withPartner:true。'
