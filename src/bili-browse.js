@@ -27,7 +27,7 @@ export const BROWSE_DEFAULTS = {
   maxDuration: 1800,
   /** 这一轮要不要真看一个画面 */
   watchChance: 0.35,
-  watchMaxSeconds: 180,
+  watchMaxSeconds: 300,
   watchMaxFrames: 24
 };
 

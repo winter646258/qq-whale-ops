@@ -36,7 +36,7 @@ const STREAM_HEADERS = {
 
 export const WATCH_DEFAULTS = {
   /** 只抽前 N 秒。超长视频（2 小时 43 分那种）看开头就够判断「这是啥」了。 */
-  maxSeconds: 600,
+  maxSeconds: 300,
   /** 下载上限。低于这个值以上直接放弃，别为一个视频吃掉 500MB 可用内存。 */
   maxBytes: 64 * 1024 * 1024,
   /** 转发给 video-frames 的抽帧参数（不传就用它自己的默认） */

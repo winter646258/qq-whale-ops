@@ -7481,6 +7481,9 @@ async function biliBrowseTick() {
       biliOnline: () => biliOnline(),
       biliDirect: () => biliDirect(),
       watchVideo: (opts) => watchBiliVideo({ direct: biliDirect(), log: (m) => log(m), ...opts }),
+      // 主模型（deepseek）不接图：拼图必须在这里就转成文字，
+      // transcribeMediaImages 返回的项不带 data，上层就不会拼出 image block。
+      transcribeImages: (images) => transcribeMediaImages(images),
       describePhoneOffline,
       describeBiliResult,
     },

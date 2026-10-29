@@ -82,26 +82,38 @@ export default {
               sendJson({ ok: false, action, error: r.error, data: r.video ?? null }, 502);
               return;
             }
+            // 主模型（deepseek）不接图：把拼图 base64 塞回模型会直接报
+            // 「模型不支持看图」，整轮失败。所以必须在这里就交给视觉模型代看，
+            // 只把文字交出去（transcribeMediaImages 返回项不带 data）。
+            const tiles = r.tiles ?? [];
+            let visionText = '';
+            if (tiles.length && typeof h.transcribeImages === 'function') {
+              try {
+                const seen = await h.transcribeImages(
+                  tiles.map((t) => ({ data: t.buffer.toString('base64'), mimeType: t.mimeType }))
+                );
+                visionText = seen
+                  .map((x) => String(x?.text ?? '').trim())
+                  .filter(Boolean)
+                  .join('\n');
+              } catch (error) {
+                visionText = `（画面没能代看：${error?.message ?? error}）`;
+              }
+            }
             sendJson({
               ok: true,
               action,
-              text: r.summaryText,
+              text: [r.summaryText, visionText].filter(Boolean).join('\n\n'),
               data: {
                 video: r.video,
                 stream: r.stream,
                 bytes: r.bytes,
+                mode: r.mode,
                 frameCount: r.frameCount,
                 elapsedMs: r.elapsedMs,
-                // 图给上层自己转 image block；这里只保证 base64 和元数据都在
-                images: (r.tiles ?? []).map((t) => ({
-                  mimeType: t.mimeType,
-                  data: t.buffer.toString('base64'),
-                  index: t.index,
-                  total: t.total,
-                  label: t.label,
-                  rangeText: t.rangeText,
-                  frames: t.frames
-                }))
+                visionText,
+                // 空数组：上层看到没有 data 就不拼 image block
+                images: []
               }
             });
             return;

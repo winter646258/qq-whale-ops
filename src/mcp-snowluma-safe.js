@@ -1860,7 +1860,7 @@ server.tool(
     aid: z.number().optional().describe('action=comments 时必填，视频 aid（用 video 能查到）'),
     keyword: z.string().optional().describe('action=search 时必填，搜索词'),
     limit: z.number().optional().describe('要几条，默认推荐 10 条 / 评论 10 条 / 搜索 10 条'),
-    maxSeconds: z.number().optional().describe('action=watch 时可选：最多看前多少秒，默认 180'),
+    maxSeconds: z.number().optional().describe('action=watch 时可选：最多看前多少秒，默认 300'),
     maxFrames: z.number().optional().describe('action=watch 时可选：最多抽几帧，默认 24')
   },
   async ({ key, token, action, bvid, aid, keyword, limit, maxSeconds, maxFrames }) => {
@@ -1871,7 +1871,16 @@ server.tool(
         // watch 要下载 + 抽帧，十几秒起步，给足余量；只读查询仍然 60 秒。
         timeoutMs: isWatch ? 180000 : 60000,
         headers: { 'x-agent-token': token },
-        body: JSON.stringify({ key, action, bvid, aid, keyword, limit, maxSeconds, maxFrames })
+        body: JSON.stringify({
+          key,
+          action,
+          bvid,
+          aid,
+          keyword,
+          limit,
+          maxSeconds: maxSeconds ?? (isWatch ? 300 : undefined),
+          maxFrames
+        })
       });
       if (!isWatch) {
         return { content: [{ type: 'text', text: data?.text || '没有拿到内容。' }] };
