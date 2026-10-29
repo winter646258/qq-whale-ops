@@ -37,7 +37,8 @@ t('有 describeMediaByRef，且按消息取图', () => {
   ok(bridge.includes('fetchOneBotImage(media)'));
 });
 t('看过一次就写回原文（后面轮次都能看见）', () => {
-  ok(bridge.includes('media.desc = clean.slice(0, 400)'));
+  // 2026-10-29 改成 truncateText：裸 slice 会把 emoji 切一半，留下孤立代理码元。
+  ok(bridge.includes('media.desc = truncateText(clean, 400)'));
   ok(bridge.includes('saveSocialV2State()'));
 });
 t('命过缓存的不重复花钱', () => {

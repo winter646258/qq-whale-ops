@@ -1536,7 +1536,13 @@ async function segmentsToText(segments, options = {}) {
       default: out.push(`[${seg?.type ?? '未知'}]`); break;
     }
   }
-  return out.join('').trim();
+  // MARKER: surrogate-ingest —— 入站文本统一修一遍孤立代理。
+  // 毒从哪来：QQ 侧一条消息里的 emoji 被截成半个，粘进 `[引用 …]` 之后一路带下去。
+  // 为什么放在这里：这是所有入站文本的唯一出口（正文 / 引用 / 表情摘要 / 卡片都从这里过），
+  // 堵在这一层，social-v2 的 unread、recentMessages、提示词都不会带毒。
+  // 之前只在 api.sessions.prompt 出口修，修不了已经落进 DSH 会话历史的那份 ——
+  // 2026-10-29 09:52 起的 15 次上游拒绝就是历史回放造成的。
+  return repairSurrogates(out.join('').trim());
 }
 
 // 从 OneBot 消息段中提取图片/表情元数据（不下载字节，仅记录定位信息）。
@@ -3095,11 +3101,11 @@ async function main() {
     });
     const clean = String(text ?? '').trim();
     if (!clean) return { ok: false, why: '视觉模型返回空' };
-    media.desc = clean.slice(0, 400);
+    media.desc = truncateText(clean, 400);
     // 写回原文，让后面所有轮次都能看见（不是只这一次）
     try {
       if (msg) {
-        const label = `[图片] ${String(media.desc).slice(0, 80)}`;
+        const label = `[图片] ${truncateText(media.desc, 80)}`;
         if (/^\[图片\]$/.test(String(msg.plain ?? ''))) msg.plain = label;
         if (/^\[图片\]$/.test(String(msg.text ?? ''))) msg.text = label;
         saveSocialV2State();
@@ -3121,7 +3127,7 @@ async function main() {
     const k = String(key ?? '');
     const st = socialV2.conversations.get(k);
     if (!st) return false;
-    const text = `[我发了张图] ${String(desc ?? '').slice(0, 200)}`;
+    const text = `[我发了张图] ${truncateText(desc, 200)}`;
     const item = {
       sender: '我',
       text,
@@ -10460,7 +10466,9 @@ async function main() {
       let fixed = args;
       try {
         fixed = fixValue(args);
-        if (fixed !== args && JSON.stringify(fixed).length !== JSON.stringify(args).length) {
+        // 判据用「序列化字符串不等」而不是「长度不等」：把 \ud83d 换成 \uFFFD
+        // 长度一模一样，按长度判就永远打不出日志（2026-10-29 之前就是这样，grep 到 0 次）。
+        if (JSON.stringify(fixed) !== JSON.stringify(args)) {
           log('[prompt] 修掉了文本里的孤立代理码元（半个 emoji）');
         }
       } catch { /* 修不动就原样发 */ }
