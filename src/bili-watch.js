@@ -2,7 +2,11 @@
  * 看一个 B 站视频 —— bili-watch.js
  *
  * 把「刷到一条视频」变成「真的看见画面」：
- *   详情（拿 cid）→ playurl 选档 → 下载 → video-frames 抽帧拼图 → 清理临时文件
+ *   详情（拿 cid）→ playurl 选档 → 直读 URL 抽帧（失败才整片下载）
+ *
+ * 为什么直读：ffmpeg 能直接吃 http URL 并发 Range 请求，配 `-t 45` 只拉前 45 秒。
+ * 实测 2033 秒的片子看前 45 秒 —— ffprobe 354ms + 抽帧 1110ms；要是先整片下载，
+ * 503kbps × 2033s ≈ 128MB，光下载就几十秒。所以下载只是兜底路径。
  *
  * 为什么不直接把它塞给模型：
  *   deepseek 不吃视频，dots-studio 只吃图，服务器 1736MB 内存也扛不住原片。
@@ -21,8 +25,14 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 import { normalizeVideoForModel } from './video-frames.js';
-import { pickVideoStream, describeStream } from './bili-direct.js';
+import { pickVideoStream, describeStream, DIRECT_UA } from './bili-direct.js';
 import { fmtDuration, fmtCount } from './site-bili.js';
+
+/** 直读 CDN 必须带的头，少一个就 403。 */
+const STREAM_HEADERS = {
+  Referer: 'https://www.bilibili.com/',
+  'User-Agent': DIRECT_UA
+};
 
 export const WATCH_DEFAULTS = {
   /** 只抽前 N 秒。超长视频（2 小时 43 分那种）看开头就够判断「这是啥」了。 */
@@ -113,24 +123,43 @@ export async function watchBiliVideo(opts = {}) {
     }
     log(`[bili-watch] 选中 ${describeStream(stream)}`);
 
-    // 3) 下载
-    const buf = await direct.download(stream.url, { maxBytes });
-    log(`[bili-watch] 下载 ${(buf.length / 1048576).toFixed(1)}MB / ${Date.now() - t0}ms`);
-
-    // 4) 落临时文件（ffmpeg 要文件路径，不吃 buffer）
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bili-watch-'));
-    tmpFile = path.join(dir, `${crypto.randomUUID()}.mp4`);
-    await fs.writeFile(tmpFile, buf);
-
-    // 5) 抽帧拼图
+    // 3) 抽帧：默认直读 URL，ffmpeg 自己发 Range 请求、配 -t 只拉前 N 秒。
+    //    直读失败（CDN 不给 Range、moov 在尾部的变体、网络抖动）才退回整片下载。
     const cutOpts = { maxSeconds };
     if (opts.maxFrames) cutOpts.maxFrames = Number(opts.maxFrames);
     if (opts.framesPerTile) cutOpts.framesPerTile = Number(opts.framesPerTile);
-    const cut = await normalizeVideoForModel(tmpFile, cutOpts);
-    if (!cut.ok) {
-      return { ok: false, error: `抽帧失败：${cut.error}`, video: meta, stream };
+
+    let cut = null;
+    let mode = 'stream';
+    let buf = null;
+    if (opts.stream !== false) {
+      const r = await normalizeVideoForModel(stream.url, {
+        ...cutOpts,
+        remote: true,
+        headers: STREAM_HEADERS
+      });
+      if (r.ok) {
+        cut = r;
+        log(`[bili-watch] 直读抽帧 ${cut.frameCount} 帧 / ${cut.tiles.length} 张 / ${Date.now() - t0}ms`);
+      } else {
+        log(`[bili-watch] 直读失败（${r.error}），退回整片下载`);
+      }
     }
-    log(`[bili-watch] 抽帧 ${cut.frameCount} 帧 / ${cut.tiles.length} 张 / ${Date.now() - t0}ms`);
+
+    // 4) 兜底：整片下载到临时文件再抽
+    if (!cut) {
+      mode = 'download';
+      buf = await direct.download(stream.url, { maxBytes });
+      log(`[bili-watch] 下载 ${(buf.length / 1048576).toFixed(1)}MB / ${Date.now() - t0}ms`);
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bili-watch-'));
+      tmpFile = path.join(dir, `${crypto.randomUUID()}.mp4`);
+      await fs.writeFile(tmpFile, buf);
+      cut = await normalizeVideoForModel(tmpFile, cutOpts);
+      if (!cut.ok) {
+        return { ok: false, error: `抽帧失败：${cut.error}`, video: meta, stream };
+      }
+      log(`[bili-watch] 抽帧 ${cut.frameCount} 帧 / ${cut.tiles.length} 张 / ${Date.now() - t0}ms`);
+    }
 
     // 6) 清理
     try {
@@ -140,16 +169,18 @@ export async function watchBiliVideo(opts = {}) {
       // 清不掉也无所谓，/tmp 有系统回收
     }
 
+    const coveredTo = cut.tiles.length ? cut.tiles[cut.tiles.length - 1].toSec : 0;
     const covered = cut.tiles.length
-      ? `${Math.round(cut.tiles[0].fromSec)}–${Math.round(cut.tiles[cut.tiles.length - 1].toSec)} 秒`
+      ? `${Math.round(cut.tiles[0].fromSec)}–${Math.round(coveredTo)} 秒`
       : '';
-    const truncated = cut.info?.durationSec && cut.info.durationSec < meta.durationSec - 1;
+    // 直读时 ffprobe 报的是全片时长（-t 只作用于抽帧），所以按「实际覆盖到哪」判断。
+    const truncated = coveredTo > 0 && coveredTo < meta.durationSec - 2;
 
     const summaryText = [
       `「${meta.title}」`,
       `up：${meta.author} · ${fmtCount(meta.view)}播放 · ${fmtDuration(meta.durationSec)}`,
       meta.desc ? `简介：${meta.desc.slice(0, 160)}` : '',
-      `画面 ${cut.tiles.length} 张 / ${cut.frameCount} 帧${covered ? `，覆盖 ${covered}` : ''}${truncated ? `（只看了前 ${Math.round(cut.info.durationSec)} 秒）` : ''}`
+      `画面 ${cut.tiles.length} 张 / ${cut.frameCount} 帧${covered ? `，覆盖 ${covered}` : ''}${truncated ? `（只看了前 ${Math.round(coveredTo)} 秒）` : ''}`
     ].filter(Boolean).join('\n');
 
     return {
@@ -161,7 +192,8 @@ export async function watchBiliVideo(opts = {}) {
         codec: stream.codec,
         bandwidth: stream.bandwidth
       },
-      bytes: buf.length,
+      mode,
+      bytes: buf ? buf.length : null,
       videoInfo: cut.info,
       frameCount: cut.frameCount,
       tiles: cut.tiles,

@@ -160,6 +160,21 @@ function run(cmd, args, { timeoutMs }) {
   });
 }
 
+/**
+ * 把 { Referer, 'User-Agent' } 变成 ffmpeg / ffprobe 的 -headers 参数。
+ *
+ * 远程 URL（B 站 CDN 之类）不带 referer 一律 403；ffmpeg 要求每行以 CRLF
+ * 结尾、最后一行也要，写成 \n 会被当成畸形头静默丢掉。
+ */
+function headerArgs(headers) {
+  if (!headers || typeof headers !== 'object') return [];
+  const lines = Object.entries(headers)
+    .filter(([, v]) => v != null && String(v).length)
+    .map(([k, v]) => `${k}: ${v}`);
+  if (!lines.length) return [];
+  return ['-headers', lines.join('\r\n') + '\r\n'];
+}
+
 /** 读视频的基本信息。读不出来就返回 {ok:false}，让调用方决定怎么说。 */
 export async function probeVideo(file, opts = {}) {
   const ffprobe = resolveTool(opts.ffprobePath, 'ffprobe');
@@ -168,6 +183,7 @@ export async function probeVideo(file, opts = {}) {
     '-print_format', 'json',
     '-show_format',
     '-show_streams',
+    ...headerArgs(opts.headers),
     String(file)
   ];
   const r = await run(ffprobe, args, { timeoutMs: opts.probeTimeoutMs ?? VIDEO_DEFAULTS.probeTimeoutMs });
@@ -207,6 +223,7 @@ export async function extractTiles(file, plan, opts = {}) {
     ].join(',');
     const extractArgs = [
       '-hide_banner', '-nostdin', '-loglevel', 'error', '-y',
+      ...headerArgs(opts.headers),
       '-t', String(Math.max(1, Math.ceil(plan.effectiveSec))),
       '-i', String(file),
       '-vf', vf,
@@ -232,6 +249,7 @@ export async function extractTiles(file, plan, opts = {}) {
       const fps = Math.min(1, minSceneFrames / Math.max(1, plan.effectiveSec));
       const evenArgs = [
         '-hide_banner', '-nostdin', '-loglevel', 'error', '-y',
+        ...headerArgs(opts.headers),
         '-t', String(Math.max(1, Math.ceil(plan.effectiveSec))),
         '-i', String(file),
         '-vf', `fps=${fps.toFixed(6)},scale=${Number(plan.tileWidth) || 320}:-2`,
@@ -314,12 +332,18 @@ export async function extractTiles(file, plan, opts = {}) {
  */
 export async function normalizeVideoForModel(file, opts = {}) {
   const st = { ok: false };
-  try {
-    const s = await fsp.stat(file);
-    if (!s.isFile()) return { ...st, error: '不是文件' };
-    if (!s.size) return { ...st, error: '空文件' };
-  } catch (error) {
-    return { ...st, error: `读不到视频文件：${error?.message ?? error}` };
+  // 远程 URL（http/https）不做本地 stat：ffmpeg / ffprobe 自己发请求，
+  // 配合 -t 只拉需要的那几十秒 —— 34 分钟的片子看前 45 秒只要 1.1 秒，
+  // 而「先整片下载」要 128MB。文件路径仍走原来的检查。
+  const remote = opts.remote === true || /^https?:\/\//i.test(String(file));
+  if (!remote) {
+    try {
+      const s = await fsp.stat(file);
+      if (!s.isFile()) return { ...st, error: '不是文件' };
+      if (!s.size) return { ...st, error: '空文件' };
+    } catch (error) {
+      return { ...st, error: `读不到视频文件：${error?.message ?? error}` };
+    }
   }
   const probe = await probeVideo(file, opts);
   if (!probe.ok) return { ...st, error: probe.error };
