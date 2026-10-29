@@ -93,3 +93,6 @@ backup-systemd-*
 
 # 内部交接文档（含服务器信息，不进公开仓库）
 /docs/交接文档-*.md
+
+# API keys (DASHSCOPE_API_KEY)
+.env

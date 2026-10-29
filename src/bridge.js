@@ -35,6 +35,7 @@ import { createBiliDirect } from './bili-direct.js';
 import { watchBiliVideo } from './bili-watch.js';
 import { browseRound, browsePromptLine, readBrowse, writeBrowse } from './bili-browse.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
+import { TTS_DEFAULTS as TTS_DEF, readEnvValue as readTtsEnvValue, splitSpeechText as splitTtsText, synthesize as ttsSynthesize, downloadTtsAudio as ttsDownload } from './tts.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
@@ -244,6 +245,10 @@ import { initSightings, recordSightings } from './sticker-sightings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
+// TTS 的 key 放在仓库根的 .env（600，不入 git），代码自己读，不依赖 systemd。
+const TTS_ENV_PATH = path.resolve('.env');
+let ttsEnvText = '';
+try { if (fs.existsSync(TTS_ENV_PATH)) ttsEnvText = fs.readFileSync(TTS_ENV_PATH, 'utf8'); } catch { ttsEnvText = ''; }
 const STATE_DIR = path.join(ROOT, 'state');
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
 const ROLE_STATE_FILE = path.join(STATE_DIR, 'current-role.json');
@@ -2138,7 +2143,19 @@ async function main() {
       defaultVolume: Number(v.defaultVolume) > 0 ? Number(v.defaultVolume) : 1,
       loudness: v.loudness || 'normal',
       ffmpegPath: process.env.FFMPEG_PATH || v.ffmpegPath || null,
-      autoReadback: v.autoReadback !== false
+      autoReadback: v.autoReadback !== false,
+      // TTS：文字 → 语音。这里也要逐项列出来，否则 voiceCfg() 会把它丢掉。
+      // key 优先走 .env 的 DASHSCOPE_API_KEY（代码里读），apiKey 只作临时覆盖。
+      tts: {
+        enabled: v.tts?.enabled !== false,
+        model: v.tts?.model || 'qwen3-tts-flash',
+        voice: v.tts?.voice || 'Cherry',
+        languageType: v.tts?.languageType || 'Chinese',
+        maxChars: Number(v.tts?.maxChars) > 0 ? Number(v.tts.maxChars) : 600,
+        timeoutMs: Number(v.tts?.timeoutMs) > 0 ? Number(v.tts.timeoutMs) : 30000,
+        downloadTimeoutMs: Number(v.tts?.downloadTimeoutMs) > 0 ? Number(v.tts.downloadTimeoutMs) : 30000,
+        apiKey: String(v.tts?.apiKey ?? '')
+      }
     };
   }
 
@@ -2156,6 +2173,8 @@ async function main() {
       modeAllowed: (key, kind, id, cfgArg, modeArg) => modeAllowed(key, kind, id, cfgArg, modeArg),
       currentMode: () => currentMode,
       resolveVoicePathForOperator: (input) => resolveVoicePathForOperator(input),
+      // TTS：文字 → 库内 wav。发送仍走 sendVoiceForV2，别在这里发。
+      ttsSpeak: (text, opts) => ttsSpeakV2(text, opts),
       voiceBudgetCheck: (scopeKey, cfgV) => voiceBudgetCheck(scopeKey, cfgV),
       voiceBudgetCommit: (scopeKey, at) => voiceBudgetCommit(scopeKey, at),
       sendVoiceV2: (key, filePath, opts) => sendVoiceV2(key, filePath, opts),
@@ -2348,7 +2367,16 @@ async function main() {
 
     const assertSendAllowed = guard ? captureSendGuard(key) : null;
     const [kind, id] = key.split(':');
-    const recordSegment = { type: 'record', data: { file: sendPath } };
+    // SnowLuma 在容器里，宿主机的绝对路径它 stat 不到（会报 ENOENT），只能内联字节。
+    // 20MB 的库内上限 base64 后约 27MB，对本地 HTTP 和 SILK 转码都太重了，设一道闸。
+    const voiceSize = fs.statSync(sendPath).size;
+    if (voiceSize > 8 * 1024 * 1024) {
+      throw new Error(`语音文件过大（${(voiceSize / 1048576).toFixed(1)}MB），base64 内联上限 8MB`);
+    }
+    const recordSegment = {
+      type: 'record',
+      data: { file: `base64://${fs.readFileSync(sendPath).toString('base64')}` }
+    };
     let resolveSend;
     let rejectSend;
     const sendPromise = new Promise((resolve, reject) => { resolveSend = resolve; rejectSend = reject; });
@@ -2468,6 +2496,62 @@ async function main() {
    * AI 通道入口：解析引用 → 限流 → 发送 → 记账 → 回读校验。
    * 返回 { messageId, detail, verified, readback }。
    */
+  // ── TTS：把一个句子变成语音库里的一条 wav ────────────────────────────────
+  //
+  // 只做「文字 → 库内文件」。发送、限流、审计、落地校验全部交给
+  // sendVoiceForV2 → 所以这里失败的最坏结果是「这条没发成」，绝不会带崩整轮。
+  //
+  // 文本超过 maxChars（接口硬限 600）时**只取第一段**：一条语音已经 2~3 分钟，
+  // 连发好几条语音比这一条长语音更吵，剩下的内容本来就该用文字说。
+  async function ttsSpeakV2(text, opts = {}) {
+    const vc = voiceCfg();
+    const t = vc.tts ?? {};
+    const apiKey = String(t.apiKey || process.env.DASHSCOPE_API_KEY || readTtsEnvValue(ttsEnvText, 'DASHSCOPE_API_KEY') || '').trim();
+    if (!apiKey) return { ok: false, error: 'TTS 未配置 key（.env 里没有 DASHSCOPE_API_KEY）' };
+    const maxChars = Number(t.maxChars) || TTS_DEF.maxChars;
+    const segs = splitTtsText(text, maxChars);
+    if (!segs.length) return { ok: false, error: '要合成的文本为空' };
+    const spoken = segs[0];
+    const syn = await ttsSynthesize(spoken, {
+      apiKey,
+      voice: t.voice || TTS_DEF.voice,
+      model: t.model || TTS_DEF.model,
+      languageType: t.languageType || TTS_DEF.languageType,
+      maxChars,
+      timeoutMs: Number(t.timeoutMs) || TTS_DEF.timeoutMs,
+    });
+    if (!syn.ok) { log(`[tts] 合成失败：${syn.error}`); return syn; }
+    const dl = await ttsDownload(syn.url, {
+      maxBytes: Number(vc.maxBytes) || TTS_DEF.downloadMaxBytes,
+      timeoutMs: Number(t.downloadTimeoutMs) || TTS_DEF.downloadTimeoutMs,
+    });
+    if (!dl.ok) { log(`[tts] 下载失败：${dl.error}`); return dl; }
+    const dir = path.join(vc.dir, 'tts');
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (error) {
+      return { ok: false, error: `建 TTS 目录失败：${error?.message ?? error}` };
+    }
+    const name = `tts-${Date.now()}-${crypto.randomBytes(3).toString('hex')}.wav`;
+    const absPath = path.join(dir, name);
+    try {
+      fs.writeFileSync(absPath, dl.buffer);
+    } catch (error) {
+      return { ok: false, error: `写 TTS 文件失败：${error?.message ?? error}` };
+    }
+    log(`[tts] 合成完成 ${name}（${spoken.length} 字 / ${dl.bytes} 字节${segs.length > 1 ? '，原文更长只念了第一段' : ''}）`);
+    return {
+      ok: true,
+      file: `tts/${name}`,
+      absPath,
+      bytes: dl.bytes,
+      characters: syn.characters || spoken.length,
+      text: spoken,
+      truncated: segs.length > 1,
+      totalSegments: segs.length,
+    };
+  }
+
   async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null } = {}) {
     const vc = voiceCfg();
     if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
@@ -8814,8 +8898,28 @@ async function biliBrowseTick() {
           }
           // 只要名字（解析）不要内容（预览）：dry-run 也必须经过与真发相同的解析与校验。
           let resolved;
+          // 放在 try 外面：块内的 let 出了 try 就看不见（wantVoiceRef 给 sendVoiceForV2，
+          // ttsMeta 给下面的回包），踩过两次同样的坑。
+          let wantVoiceRef = '';
+          let ttsMeta = null;
           try {
-            resolved = resolveVoicePathForV2(body.voice ?? body.file ?? '');
+            // 只给 text 就现场合成（TTS）；给了 voice/file 就走语音库，两者互斥。
+            wantVoiceRef = body.voice ?? body.file ?? '';
+            if (!wantVoiceRef && typeof body.text === 'string' && body.text.trim()) {
+              const made = await ttsSpeakV2(body.text, {});
+              if (!made.ok) { sendJson({ ok: false, error: made.error }, 400); return; }
+              wantVoiceRef = made.file;
+              ttsMeta = { text: made.text, characters: made.characters, truncated: made.truncated, segments: made.totalSegments };
+              if (body.dryRun === true) {
+                // 顺序要紧：先探测，再删 —— 反过来会对着一个已经删掉的文件 inspect。
+                const probe2 = await inspectAudio(made.absPath, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds }).catch(() => null);
+                try { fs.unlinkSync(made.absPath); } catch {}
+                sendJson({ ok: true, dryRun: true, key, tts: ttsMeta, detail: probe2 ? describeAudio(probe2) : null, probeOk: probe2?.ok === true });
+                return;
+              }
+            }
+            if (!wantVoiceRef) { sendJson({ ok: false, error: '缺少音频：给 voice（语音库文件名）或 text（现场合成）' }, 400); return; }
+            resolved = resolveVoicePathForV2(wantVoiceRef);
           } catch (error) {
             sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
             return;
@@ -8828,7 +8932,7 @@ async function biliBrowseTick() {
               sendJson({ ok: true, dryRun: true, key, file: resolved.path, detail: describeAudio(probe) });
               return;
             }
-            const sent = await sendVoiceForV2(key, body.voice ?? body.file, {
+            const sent = await sendVoiceForV2(key, wantVoiceRef, {
               label: body.label ? String(body.label).slice(0, 100) : '',
               verify: body.verify,
               readback: body.readback === true,
@@ -8847,7 +8951,8 @@ async function biliBrowseTick() {
               // verified=true 表示已用 get_msg 回读到这条消息的 record 段（"真的发出去了"的硬证据）
               verified: sent.verification?.confirmed === true,
               readback: sent.readback,
-              warnings: sent.warnings
+              warnings: sent.warnings,
+              ...(ttsMeta ? { tts: ttsMeta } : {})
             });
           } catch (error) {
             // 额度只在真正发出后才记账（voiceBudgetCommit），所以失败路径无需回滚。

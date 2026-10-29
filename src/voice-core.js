@@ -159,20 +159,29 @@ export async function probeAudio(file, { ffprobePath = 'ffprobe', timeoutMs = 10
   const outFile = path.join(dir, `p-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
   const run = () => new Promise((resolve) => {
     let child;
+    let fd = null;
+    // ffprobe 没有 -o（那是 ffmpeg 的）：只能把 stdout 落盘。
+    // 这里把 fd 直接绑给子进程，绕开 pipe（受限沙箱下 pipe 会 EPERM）。
     try {
+      fd = fs.openSync(outFile, 'w');
       child = spawn(ffprobePath, [
         '-v', 'error',
         '-show_entries', 'format=duration,format_name',
         '-show_entries', 'stream=codec_name,codec_type,sample_rate,channels',
-        '-of', 'json', '-o', outFile, file
-      ], { windowsHide: true, stdio: 'ignore' });
+        '-of', 'json', file
+      ], { windowsHide: true, stdio: ['ignore', fd, 'ignore'] });
     } catch (error) {
+      if (fd !== null) { try { fs.closeSync(fd); } catch {} }
       resolve({ code: -1, error: `ffprobe 启动失败：${error?.message ?? error}` });
       return;
     }
-    const timer = setTimeout(() => { try { child.kill(); } catch {} resolve({ code: -2, error: 'ffprobe 超时' }); }, timeoutMs);
-    child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, error: `ffprobe 不可用：${e.message}` }); });
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code }); });
+    const done = (result) => {
+      if (fd !== null) { try { fs.closeSync(fd); } catch {} fd = null; }
+      resolve(result);
+    };
+    const timer = setTimeout(() => { try { child.kill(); } catch {} done({ code: -2, error: 'ffprobe 超时' }); }, timeoutMs);
+    child.on('error', (e) => { clearTimeout(timer); done({ code: -1, error: `ffprobe 不可用：${e.message}` }); });
+    child.on('close', (code) => { clearTimeout(timer); done({ code }); });
   });
 
   try {
