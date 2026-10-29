@@ -1840,14 +1840,15 @@ server.tool(
 //
 // 为什么单独一个工具而不是塞进 web_search：搜索要签名（WBI），要能翻评论，
 // 还要认 BV 号；而且它**只能**在主人电脑上的扩展在线时用。
-const BILI_ACTIONS = ['recommend', 'video', 'comments', 'search'];
+const BILI_ACTIONS = ['recommend', 'video', 'comments', 'search', 'watch'];
 
 server.tool(
   'qq_bili',
-  '去 B 站看一眼（只读）：首页推荐、某个视频的详情、热门评论、按关键词搜视频。'
-    + '这台服务器的 IP 被 B 站拉黑了，所以请求是绕道主人电脑上的浏览器扩展发出去的——'
-    + '扩展没开就会报「浏览器桥不在线」，那种情况直接跟主人说一声，别反复重试。'
+  '去 B 站看一眼（只读）：首页推荐、某个视频的详情、热门评论、按关键词搜视频；'
+    + 'watch 则是真去看一个视频的画面——下载后抽帧拼成几张图，你能直接看见内容。'
+    + '服务器直连 B 站是通的（自备 buvid3 与 WBI 签名），不用等浏览器扩展在线。'
     + '视频用 BV 号指定（像 BV1GJ411x7h7）；评论需要先用 video 查到 aid。'
+    + 'watch 要十几秒，一个视频看一次就够，别反复看同一个；听不见声音，只有画面。'
     + '这个工具拿不到登录态：只能看公开内容，不能点赞投币收藏。',
   {
     key: z.string().describe('当前会话 key（group:群号 或 private:QQ号），用来校验你这次的令牌'),
@@ -1858,17 +1859,43 @@ server.tool(
     bvid: z.string().optional().describe('action=video/comments 时必填，BV 号'),
     aid: z.number().optional().describe('action=comments 时必填，视频 aid（用 video 能查到）'),
     keyword: z.string().optional().describe('action=search 时必填，搜索词'),
-    limit: z.number().optional().describe('要几条，默认推荐 10 条 / 评论 10 条 / 搜索 10 条')
+    limit: z.number().optional().describe('要几条，默认推荐 10 条 / 评论 10 条 / 搜索 10 条'),
+    maxSeconds: z.number().optional().describe('action=watch 时可选：最多看前多少秒，默认 180'),
+    maxFrames: z.number().optional().describe('action=watch 时可选：最多抽几帧，默认 24')
   },
-  async ({ key, token, action, bvid, aid, keyword, limit }) => {
+  async ({ key, token, action, bvid, aid, keyword, limit, maxSeconds, maxFrames }) => {
     try {
+      const isWatch = action === 'watch';
       const data = await agentApi('/api/socialV2/bili', {
         method: 'POST',
-        timeoutMs: 60000,
+        // watch 要下载 + 抽帧，十几秒起步，给足余量；只读查询仍然 60 秒。
+        timeoutMs: isWatch ? 180000 : 60000,
         headers: { 'x-agent-token': token },
-        body: JSON.stringify({ key, action, bvid, aid, keyword, limit })
+        body: JSON.stringify({ key, action, bvid, aid, keyword, limit, maxSeconds, maxFrames })
       });
-      return { content: [{ type: 'text', text: data?.text || '没有拿到内容。' }] };
+      if (!isWatch) {
+        return { content: [{ type: 'text', text: data?.text || '没有拿到内容。' }] };
+      }
+      // watch：文字说明 + 真图片块，base64 只在这里转一次，模型直接看见画面。
+      const images = Array.isArray(data?.data?.images) ? data.data.images : [];
+      const content = [];
+      const parts = [];
+      for (const img of images) {
+        if (img?.data && img?.mimeType) {
+          parts.push(`[画面 ${img.index}/${img.total} ${img.rangeText}（${img.frames} 帧）]`);
+          content.push({ type: 'image', mimeType: img.mimeType, data: img.data });
+        } else {
+          parts.push(`[画面 ${img.index ?? ''} 没取到]`);
+        }
+      }
+      if (!content.length) {
+        return {
+          content: [{ type: 'text', text: `看视频失败：${data?.error || data?.text || '没有拿到画面'}` }],
+          isError: true
+        };
+      }
+      content.unshift({ type: 'text', text: `${data?.text || '看完了。'}\n\n${parts.join('\n')}` });
+      return { content };
     } catch (error) {
       return { content: [{ type: 'text', text: `去 B 站看一眼失败：${error?.message ?? error}` }], isError: true };
     }

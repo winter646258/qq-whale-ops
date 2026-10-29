@@ -323,7 +323,9 @@ export async function normalizeVideoForModel(file, opts = {}) {
   }
   const probe = await probeVideo(file, opts);
   if (!probe.ok) return { ...st, error: probe.error };
-  const plan = planVideoTiles(probe.info, opts.limits);
+  // 兼容两种调用：老调用方传 { limits: {...} }，新调用方（bili-watch / bridge）
+  // 直接把 maxSeconds 放在顶层。只认 limits 会静默用默认 600 秒，长视频不截断。
+  const plan = planVideoTiles(probe.info, opts.limits ?? opts);
   const cut = await extractTiles(file, plan, opts);
   if (!cut.ok) return { ...st, error: cut.error, info: probe.info, plan };
   return {

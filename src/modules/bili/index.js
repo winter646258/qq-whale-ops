@@ -5,14 +5,17 @@
 // 而 BiliClient 只依赖 phoneBridge（扩展转发）。
 //
 // 三个要点，改代码前先读：
-// 1. **参数校验必须排在「桥在不在线」之前**。扩展没开的时候，模型也能看出是
+// 1. **参数校验必须排在「出口通不通」之前**。出口不通的时候，模型也能看出是
 //    自己把 action / keyword 写错了，而不是一律收到「离线」。老代码这里特意
 //    留了注释，别在重构时把它们合并成一个提前 return。
-// 2. `describePhoneOffline()` 的文案里写着「服务器出口 IP 被 B 站拉黑」，
-//    这是**错的**（实测是缺 buvid3 与 WBI 签名风控，不是 IP 封禁），
-//    但在扩展真正上线前不改文案 —— 改了会让模型以为能直连。
+// 2. 出口判断已经从 `phoneOnline()` 换成 `biliOnline()`。2026-10-29 实测：
+//    服务器**直连 B 站是通的**（补一个 buvid3 cookie 即可，见 src/bili-direct.js），
+//    老文案里「服务器出口 IP 被拉黑」只对走浏览器桥成立。所以桥离线不再等于刷不了站。
 // 3. `biliClient()` 是懒建 + 复用，走访问器拿；不要在这个模块里自己 new 一个，
 //    那样每次请求都会新建一份 PhoneBridge 订阅。
+//
+// 2026-10-29 新增 action=`watch`：真的把视频下下来抽帧看画面（十几秒），
+// 图片以 base64 塞在 data.images 里，由 MCP 侧转成 image block。
 import { rejectAi } from '../core/shared.js';
 
 export default {
@@ -40,12 +43,12 @@ export default {
           }
 
           const action = String(body.action ?? '').trim();
-          if (!['recommend', 'video', 'comments', 'search'].includes(action)) {
-            sendJson({ ok: false, error: 'action 必须是 recommend / video / comments / search' }, 400);
+          if (!['recommend', 'video', 'comments', 'search', 'watch'].includes(action)) {
+            sendJson({ ok: false, error: 'action 必须是 recommend / video / comments / search / watch' }, 400);
             return;
           }
 
-          // 参数校验排在「桥在不在线」之前（见文件头第 1 条）。
+          // 参数校验排在「出口通不通」之前（见文件头第 1 条）。
           if (action === 'search' && !String(body.keyword ?? '').trim()) {
             sendJson({ ok: false, error: '搜索要带 keyword' }, 400);
             return;
@@ -54,10 +57,53 @@ export default {
             sendJson({ ok: false, error: action + ' 要带 bvid（评论也可以直接给 aid）' }, 400);
             return;
           }
+          if (action === 'watch' && !/^BV[0-9A-Za-z]{10}$/.test(String(body.bvid ?? '').trim())) {
+            sendJson({ ok: false, error: 'watch 要看哪个视频？给合法的 bvid（BV 开头 12 位）' }, 400);
+            return;
+          }
 
-          // 桥不在线就说清楚原因，别让模型以为 B 站挂了、然后反复重试。
-          if (!h.phoneOnline()) {
+          // 出口不通就说清楚原因，别让模型以为 B 站挂了、然后反复重试。
+          // 注意这里问的是 biliOnline() 而不是 phoneOnline()：直连现在才是主路，
+          // 浏览器桥离线不再等于「刷不了站」（2026-10-29 改）。
+          if (!h.biliOnline()) {
             sendJson({ ok: false, error: h.describePhoneOffline(), offline: true }, 503);
+            return;
+          }
+
+          // watch 单独走：它要下载 + 抽帧，耗时十几秒，别跟只读查询混在一起。
+          if (action === 'watch') {
+            const r = await h.watchVideo({
+              bvid: String(body.bvid ?? '').trim(),
+              maxSeconds: Number(body.maxSeconds) || undefined,
+              maxFrames: Number(body.maxFrames) || undefined,
+              framesPerTile: Number(body.framesPerTile) || undefined
+            });
+            if (!r.ok) {
+              sendJson({ ok: false, action, error: r.error, data: r.video ?? null }, 502);
+              return;
+            }
+            sendJson({
+              ok: true,
+              action,
+              text: r.summaryText,
+              data: {
+                video: r.video,
+                stream: r.stream,
+                bytes: r.bytes,
+                frameCount: r.frameCount,
+                elapsedMs: r.elapsedMs,
+                // 图给上层自己转 image block；这里只保证 base64 和元数据都在
+                images: (r.tiles ?? []).map((t) => ({
+                  mimeType: t.mimeType,
+                  data: t.buffer.toString('base64'),
+                  index: t.index,
+                  total: t.total,
+                  label: t.label,
+                  rangeText: t.rangeText,
+                  frames: t.frames
+                }))
+              }
+            });
             return;
           }
 

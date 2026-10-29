@@ -3,8 +3,13 @@
  *
  * 三件事：WBI 签名、调接口、把 JSON 整理成人能读的摘要。
  *
- * 它不直接面对网络 —— 所有请求都走 phoneBridge（浏览器桥），
- * 因为服务器 IP 已被 B 站风控（view 接口 -412）。
+ * 出口有两条，由 `egress()` 选：**直连优先，浏览器桥兜底**。
+ *
+ * 老版本只有桥一条路，理由是「服务器 IP 已被风控，view 接口 -412」。
+ * 2026-10-29 实测发现那个结论只对「走桥」成立：桥那边（主人浏览器所在网络）
+ * 打 view 一律 412，而**这台服务器直连 view 是 code 0**，推荐流、playurl 全通，
+ * 只要补一个 buvid3 cookie（见 bili-direct.js）。所以现在直连是首选，
+ * 桥留着是为了直连哪天被风控时还有条退路。
  *
  * 一期只做只读：推荐流、视频详情、评论、搜索。
  * 点赞/投币/发评论等写操作二期再说，且必须过安全闸门。
@@ -135,16 +140,36 @@ function md5Bytes(bytes) {
 export class BiliClient {
   /**
    * @param {object} opts
-   * @param {{request: Function}} opts.phone 浏览器桥
+   * @param {{request: Function}} [opts.phone] 浏览器桥（兜底出口）
+   * @param {{request: Function}} [opts.direct] 直连出口（首选，见 bili-direct.js）
    * @param {Function} [opts.log]
    * @param {Function} [opts.now]
    */
   constructor(opts = {}) {
     this.phone = opts.phone;
+    this.direct = opts.direct;
     this.log = opts.log ?? (() => {});
     this.now = opts.now ?? (() => Date.now());
     this.wbiKeys = null;
     this.wbiAt = 0;
+  }
+
+  /**
+   * 选出口。
+   *
+   * 直连优先是 2026-10-29 实测的结论：同一台机器上，直连能拿到 view 的 cid、
+   * 推荐流、playurl，而走桥连 view 都是 412。桥只在直连不可用时才顶上。
+   *
+   * @returns {null | {via: {request: Function}, kind: 'direct'|'bridge'}}
+   */
+  egress() {
+    if (this.direct && typeof this.direct.request === 'function') {
+      return { via: this.direct, kind: 'direct' };
+    }
+    if (this.phone && typeof this.phone.request === 'function') {
+      return { via: this.phone, kind: 'bridge' };
+    }
+    return null;
   }
 
   /**
@@ -174,17 +199,18 @@ export class BiliClient {
    *   「报了错但数据照样给」的接口），仍然对 412 / 非 JSON 报错。
    */
   async raw(path, params = {}, opts = {}) {
-    // 早报错：没有浏览器桥就等于没有出口，别等到 `.request of undefined` 这种
+    // 早报错：两条出口都没有就等于没有网络，别等到 `.request of undefined` 这种
     // 看不出所以然的错（2026-10-23 端到端验证时踩过）。
-    if (!this.phone || typeof this.phone.request !== 'function') {
-      throw new Error('没有可用的浏览器桥：服务器 IP 已被 B 站拉黑，必须靠扩展转发'
-        + '（访问 /api/phone/status 看 online 是否为 true）');
+    const gate = this.egress();
+    if (!gate) {
+      throw new Error('B 站请求发不出去：直连出口（bili-direct）和浏览器桥都没配。'
+        + '检查 createBiliDirect() 有没有注入，或者访问 /api/phone/status 看扩展在不在线。');
     }
     const url = new URL(path.startsWith('http') ? path : `https://api.bilibili.com${path}`);
     for (const [k, v] of Object.entries(params)) {
       if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
     }
-    const res = await this.phone.request({
+    const res = await gate.via.request({
       url: url.toString(),
       headers: {
         'accept': 'application/json, text/plain, */*',
@@ -240,17 +266,33 @@ export class BiliClient {
   /**
    * 视频详情。
    *
-   * **为什么不用 `/x/web-interface/view`**：2026-10-23 实测，那条路径即使带 WBI 签名、
-   * 即使是在「扩展所在的网络」里，B 站依然一律回 412（WBI 的三个变体
-   * `/x/web-interface/wbi/view`、`/wbi/view/detail`、`/view/detail` 同样 412）。
-   * 而按 BV 号去搜索是通的 —— 搜索结果是被人肉点过的，B 站不会拦。
-   * 于是这里改走搜索，取回来的是同一份标题/up/播放量，只是少了大盘统计（币/藏）。
+   * **直连时走真 `/x/web-interface/view`，走桥时退回搜索。**
    *
-   * `aid` 一定要拿到：评论接口只认 aid，而详情接口又拿不到，所以这一路是评论的前置。
+   * 历史：2026-10-23 实测，view 那条路径即使带 WBI 签名、即使是在「扩展所在的网络」里，
+   * B 站依然一律回 412（WBI 三个变体 `/x/web-interface/wbi/view`、`/wbi/view/detail`、
+   * `/view/detail` 同样 412），所以改走「按 BV 号搜索」绕路 —— 搜索结果是被人肉点过的，
+   * 不会被拦。代价是搜索结果**没有 cid**，也没有分P/币/藏。
+   *
+   * 2026-10-29 实测：这台服务器**直连 view 是 code 0**，aid/cid/duration/videos/desc 全给。
+   * cid 是 playurl 的前置（没 cid 取不到流），所以直连可用时必须走真详情。
+   *
+   * `aid` 一定要拿到：评论接口只认 aid。
    */
   async videoDetail(bvid) {
     const id = String(bvid ?? '').trim();
     if (!/^BV[0-9A-Za-z]{10}$/.test(id)) throw new Error(`不是合法的 BV 号：${id}`);
+
+    if (this.egress()?.kind === 'direct') {
+      try {
+        const json = await this.raw('/x/web-interface/view', { bvid: id });
+        const d = json?.data ?? {};
+        if (d.bvid) return normalizeDetail({ ...d, bvid: id });
+      } catch (error) {
+        // 直连突然被风控时别把整个详情功能带死，落回搜索那条老路
+        this.log(`[bili] 直连取详情失败，退回搜索：${error?.message ?? error}`);
+      }
+    }
+
     const list = await this.search(id, { ps: 10 });
     const hit = list.find((v) => v.bvid === id);
     if (!hit) throw new Error(`没搜到这个视频：${id}（可能是私密/已删除，或者标题里没出现 BV 号）`);
@@ -484,10 +526,15 @@ export function describeBiliResult(action, data) {
   return '不认识的查询类型。';
 }
 
-/** 浏览器桥离线时给模型看的话（别让它以为是 B 站挂了）。 */
+/**
+ * 两条出口都不通时给模型看的话（别让它以为是 B 站挂了）。
+ *
+ * 注意：老文案说「IP 被拉黑」是错的 —— 2026-10-29 实测直连 view/推荐流/playurl 全通，
+ * 缺的只有 buvid3。所以现在只有「直连也失败」才会走到这句。
+ */
 export function describePhoneOffline() {
-  return '浏览器桥现在不在线：这台服务器的出口 IP 被 B 站拉黑了（-412），'
-    + '所有 B 站请求必须从主人的浏览器里发出去。'
-    + '先跟主人说一句「我这边够不到 B 站，扩展好像没开」，别反复重试。';
+  return 'B 站现在两条路都不通：直连（buvid3 + WBI）和浏览器桥都没成功。'
+    + '先跟主人说一句「我这边现在够不到 B 站」，别反复重试。'
+    + '如果只是浏览器扩展没开，直连本来应该也能用 —— 那说明是 B 站风控或者这台机器的网络出了问题。';
 }
 

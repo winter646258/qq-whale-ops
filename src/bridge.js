@@ -31,6 +31,9 @@ import { normalizeImageForModel } from './media-normalize.js';
 // MARKER: video-seg
 // 视频抽帧拼图：把视频变成几张带时序的拼图，再走图片那条现成管线。
 import { normalizeVideoForModel } from './video-frames.js';
+import { createBiliDirect } from './bili-direct.js';
+import { watchBiliVideo } from './bili-watch.js';
+import { browseRound, browsePromptLine, readBrowse, writeBrowse } from './bili-browse.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
@@ -4305,6 +4308,8 @@ async function main() {
   try {
     clearInterval(topicsTimer);
     topicsTimer = setInterval(() => { void topicTick(); }, 10 * 60 * 1000);
+    // 自己刷 B 站：每 10 分钟问一次要不要刷，真正的间隔由 biliBrowseTick 里判
+    setInterval(() => { void biliBrowseTick(); }, 10 * 60 * 1000);
     topicsTimer.unref?.();
     setTimeout(() => { void topicTick(); }, 90 * 1000).unref?.();
     log('[谈资] 定时器已排上（10 点 / 16 点各一次）');
@@ -7375,10 +7380,75 @@ async function main() {
 
   /** B 站客户端工厂（复用同一个 phoneBridge）。 */
   let biliClientCache = null;
+  // MARKER: bili-browse
+// 她自己刷 B 站：后台不定期拉推荐流、点进去看几条、偶尔真看一个画面，
+// 结果落在 state/bili-browse.json，等她下一次被唤醒时当成「你刚刷到的」注入。
+// 一条记录只提一次（promptedAt），不然 8 小时里每轮都念同一段会很烦。
+const BILI_BROWSE_FILE = path.join(STATE_DIR, 'bili-browse.json');
+let biliBrowseBusy = false;
+function readBiliBrowse() {
+  return readBrowse(BILI_BROWSE_FILE);
+}
+function writeBiliBrowse(data) {
+  return writeBrowse(BILI_BROWSE_FILE, data);
+}
+async function biliBrowseTick() {
+  if (biliBrowseBusy) return;
+  const bc = cfg.socialV2?.biliBrowse ?? {};
+  if (bc.enabled === false) return;
+  const hour = new Date().getHours();
+  const fromHour = Number(bc.fromHour ?? 9);
+  const toHour = Number(bc.toHour ?? 23);
+  if (hour < fromHour || hour >= toHour) return;
+  const now = Date.now();
+  const prev = readBiliBrowse() || {};
+  const gapMs = Math.max(30, Number(bc.minGapMinutes ?? 180)) * 60000;
+  if (prev.at && now - prev.at < gapMs) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const dayCount = prev.day === today ? Number(prev.count || 0) : 0;
+  if (dayCount >= Number(bc.maxPerDay ?? 5)) return;
+  biliBrowseBusy = true;
+  try {
+    log('[bili-browse] 开始刷一轮…');
+    const r = await browseRound({
+      client: biliClient(),
+      watch: (args) => biliHelpers.watchVideo(args),
+      log,
+      cfg: bc
+    });
+    if (!r.ok) {
+      log(`[bili-browse] 这轮没刷成：${r.error}`);
+      return;
+    }
+    writeBiliBrowse({ ...r, day: today, count: dayCount + 1, promptedAt: 0 });
+    const watched = r.watched && !r.watched.error ? '，还看了一个画面' : '';
+    log(`[bili-browse] 刷到 ${r.items.length} 条${watched}`);
+  } catch (error) {
+    log(`[bili-browse] 抛错：${error?.message ?? error}`);
+  } finally {
+    biliBrowseBusy = false;
+  }
+}
+
+// MARKER: bili-direct
+  // 直连出口：不依赖浏览器桥，补一个 buvid3 就能打 B 站接口（2026-10-29 实测全通）。
+  // 桥留在 BiliClient.egress() 里当兜底，直连哪天被风控了还能退回去。
+  let biliDirectCache = null;
+  function biliDirect() {
+    if (!biliDirectCache) {
+      biliDirectCache = createBiliDirect({
+        stateFile: path.join(STATE_DIR, 'bili-cookie.json'),
+        log: (msg) => log(msg)
+      });
+    }
+    return biliDirectCache;
+  }
+
   function biliClient() {
     if (!biliClientCache) {
       biliClientCache = new BiliClient({
         phone: phoneBridge,
+        direct: biliDirect(),
         log: (msg) => log(msg)
       });
     }
@@ -7407,14 +7477,29 @@ async function main() {
     biliHelpers: {
       biliClient: () => biliClient(),
       phoneOnline: () => phoneOnline(),
+      // 刷站的主路已经是直连，桥离线不再等于「刷不了」（2026-10-29）
+      biliOnline: () => biliOnline(),
+      biliDirect: () => biliDirect(),
+      watchVideo: (opts) => watchBiliVideo({ direct: biliDirect(), log: (m) => log(m), ...opts }),
       describePhoneOffline,
       describeBiliResult,
     },
   });
 
-  /** 给别的模块用：现在能不能刷站（扩展在线吗）。 */
+  /** 给别的模块用：浏览器扩展现在在不在线。 */
   function phoneOnline() {
     return phoneBridge.isOnline();
+  }
+
+  /**
+   * 现在能不能刷站。
+   *
+   * 直连（bili-direct）没有任何前置状态要等 —— buvid3 是现拿的，桥在不在线都无所谓，
+   * 所以这里恒为 true。真的连不上时，请求里会抛出带原因的具体错误，比在这里猜准得多。
+   * 留着这个函数是为了：模块侧的 503 分支不用动，将来要加「连续失败就暂停」也有个地方挂。
+   */
+  function biliOnline() {
+    return true;
   }
 
 
@@ -13589,6 +13674,21 @@ async function generateImageNow({ prompt, size }) {
     } catch (error) {
       log(`[心情日历] 注入失败：${error?.message ?? error}`);
     }
+    // MARKER: bili-browse-inject
+    // 后台刷到的视频：只当谈资，一条只提一次；注入过就打 promptedAt，别每轮念。
+    let biliBrowseText = '';
+    try {
+      const bb = readBiliBrowse();
+      if (bb && !bb.promptedAt) {
+        biliBrowseText = browsePromptLine(bb, Date.now());
+        if (biliBrowseText) {
+          bb.promptedAt = Date.now();
+          writeBiliBrowse(bb);
+        }
+      }
+    } catch (error) {
+      log(`[bili-browse] 注入失败：${error?.message ?? error}`);
+    }
     // MARKER: world-b-inject
     // 还挂着的话 / 一起想做的事：都是**事实**，措辞留活口（想提就提）。
     // 主动开口（proactiveCheck / schedule）才允许她先问，并把问过的次数记账，防追着问。
@@ -13638,7 +13738,7 @@ async function generateImageNow({ prompt, size }) {
     const untrustedLine = String(key).startsWith('group:') ? GROUP_RULES : '';
     // MARKER: continuity-inject —— 换会话前的交接条，注入一次就作废。
     const continuityText = continuityHintFor(key);
-    const base = roleLine + untrustedLine + tokenLine + continuityText + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + topicsText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    const base = roleLine + untrustedLine + tokenLine + continuityText + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + topicsText + biliBrowseText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
