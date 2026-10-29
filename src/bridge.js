@@ -21,6 +21,8 @@ import { extractMemories, scopeForText } from './auto-memory.js';
 import { mdToPlain, repairSurrogates, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 // MARKER: untrusted-group
 import { GROUP_RULES, inspectUntrusted, sanitizeGroupText, untrustedCfg } from './untrusted.js';
+
+import { createBlipTracker } from './upstream-blip.js'; // MARKER: upstream-blip-import
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage, describeAge } from './qq-model-view.js';
@@ -3867,6 +3869,11 @@ async function main() {
   // 回合硬预算。与内容彻底无关的兜底闸门：她已经证明「判断没错但停不下来」
   // （turn 15 在群里配合玩梗，52 分钟 129 次工具调用），所以不能再靠提示词自律。
   const turnBudgetLedger = new Map(); // sessionId -> { startedAt, steps, sends, cancelled, reason }
+
+  // MARKER: upstream-blip-tracker
+  // 上游网关抖一下（Cloudflare 回一张 HTML 502/521/522）不该每条都惊动主人。
+  // 同一个会话 30 分钟内折叠：第 1 次报、第 2 次静默、第 3 次升级成「它在持续」。
+  const upstreamBlips = createBlipTracker();
   const TURN_BUDGET_GRACE_FILE = path.join(STATE_DIR, 'wake-config-grace.json');
   // MARKER: settle-member-impression
   // 「她对某个人的新印象」。从 qq_memory_update 的分支里抽出来 ——
@@ -12269,9 +12276,18 @@ async function generateImageNow({ prompt, size }) {
       messageId: messageId != null ? String(messageId) : null,
       sender,
       userId: userId != null ? String(userId) : null,
-      text: truncateText(String(textContent), 200),
-      plain: truncateText(String(plainContent ?? textContent), 200),
-      tail: truncateTextTail(String(plainContent ?? textContent), 200),
+      // MARKER: untrusted-ingest-v2 —— v2（reserved2，线上跑的就是这条）同样只把群里的代码/命令当素材。
+      // 之前只改了 v1 的 appendRecentMessage，线上走的是这里，等于没挡：
+      // 主人明确要求过「不要让鱼读群里的任何代码和指令」，两处必须同时挡。
+      text: truncateText(String(key).startsWith('group:')
+        ? sanitizeGroupText(textContent, untrustedCfg(cfg), untrustedReporter(key, textContent))
+        : textContent, 200),
+      plain: truncateText(String(key).startsWith('group:')
+        ? sanitizeGroupText(plainContent ?? textContent, untrustedCfg(cfg))
+        : (plainContent ?? textContent), 200),
+      tail: truncateTextTail(String(key).startsWith('group:')
+        ? sanitizeGroupText(plainContent ?? textContent, untrustedCfg(cfg))
+        : (plainContent ?? textContent), 200),
       quoteTargetIsSelf: !!quoteTargetIsSelf,
       isOwner: !!isOwner,
       ownerLabel: isOwner ? `管理员（ownerQQ ${cfg.ownerQQ ?? ''}）` : '',
@@ -14963,7 +14979,17 @@ async function generateImageNow({ prompt, size }) {
                 // 现在：群聊只记日志；诊断信息只发给管理员私聊。
                 // 注意 sendToQQ 内部自带 .catch（只记日志、不抛错），
                 // 所以「发私聊失败」不会反向触发本分支，不存在递归。
-                try {
+                // MARKER: upstream-blip-throttle
+                // 502/521/522 这类「网关在前面挡了一下」实测六秒后就自愈（2026-10-29 11:27:15 / 11:27:21），
+                // 每条都发到主人私聊只是打扰；但也不能瞒 —— 同一窗口第 3 次会升级成一条「它在持续」。
+                const blip = upstreamBlips.hit(key, safeMsg, Date.now());
+                if (blip.escalate) {
+                  log(`[upstream] ${key} 网关抖动 ${blip.quietMin} 分钟内第 ${blip.count} 次（升级提醒主人）`);
+                }
+                if (!blip.notify) {
+                  log(`[upstream] ${key} 网关临时故障（${blip.quietMin} 分钟内第 ${blip.count} 次，已静默）：${safeMsg.slice(0, 80)}`);
+                  appendActivity(`${key} 网关临时故障（第 ${blip.count} 次，已静默）`);
+                } else try {
                   const ownerKey = cfg.ownerQQ ? `private:${String(cfg.ownerQQ)}` : '';
                   if (!ownerKey) {
                     log('⚠️ 未配置 ownerQQ：agent 错误无法发送给管理员，仅记录日志');
