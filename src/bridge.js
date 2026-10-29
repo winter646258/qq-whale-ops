@@ -5372,7 +5372,13 @@ async function main() {
     }
     if (!news.length) {
       // 窗口里但没有可换的（都在忙/刚说话）：记一笔 attemptedAt，避免刷日志。
-      if (rs.days?.[today]?.attemptedAt) return;
+      // MARKER: rotate-retry —— 2026-10-29
+      // 原来只要 attemptedAt 存在就 return，于是一次「都在忙」就把整个 90 分钟窗口废掉：
+      // 实测 2026-10-29 04:18:05 记了一次（keys 空），到 05:40 窗口结束都没再试，
+      // 当天一个会话都没换新（每天换新是省钱主力，等于白丢一天）。
+      // 现在改成「距上次尝试不足 15 分钟才跳过」，窗口内会自然重试。
+      const lastTry = Number(rs.days?.[today]?.attemptedAt || 0);
+      if (lastTry && now - lastTry < 15 * 60 * 1000) return;
     }
     rotateRunning = true;
     try {
