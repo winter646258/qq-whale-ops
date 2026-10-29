@@ -57,7 +57,14 @@ BRIDGE_UNIT=qq-bridge.service
 FAIL_THRESHOLD="${FAIL_THRESHOLD:-3}"        # 窗口内达到这么多条才切
 INTERVAL="${INTERVAL:-60}"                   # 检查间隔（秒）
 WINDOW_SEC="${WINDOW_SEC:-600}"              # 滑动窗口长度（秒）
-RECOVER_PROBE_INTERVAL="${RECOVER_PROBE_INTERVAL:-300}"  # 兜底期间探测主渠道的间隔
+# 2026-10-29 P1-1：重启风暴。上游是秒级抖动（502/521 六秒就过去），
+# 旧参数下「降级 -> 300 秒后探通 -> 切回 -> 又抖 -> 再降级」成了死循环，
+# 一天把 qq-bridge 重启了 76 次，每次都可能掐断正在进行的回合。
+# 现在三刀：①降级后最短驻留，期间不探不切回；②基础探测周期拉长；
+# ③同一自然小时内切回次数越多，探测间隔指数退避（封顶 RECOVER_BACKOFF_MAX）。
+RECOVER_PROBE_INTERVAL="${RECOVER_PROBE_INTERVAL:-1200}" # 兜底期间探测主渠道的基础间隔
+MIN_FALLBACK_DWELL_SEC="${MIN_FALLBACK_DWELL_SEC:-900}"  # 降级后最短驻留（期间不探测、不切回）
+RECOVER_BACKOFF_MAX="${RECOVER_BACKOFF_MAX:-7200}"       # 退避后的探测间隔上限
 SWITCH_COOLDOWN_SEC="${SWITCH_COOLDOWN_SEC:-180}"        # 切换冷却，防抖动
 MAX_LOG_BYTES="${MAX_LOG_BYTES:-8388608}"    # 日志轮转大小
 
@@ -422,26 +429,67 @@ probe_primary() {
   probe_chain_at 0
 }
 
-should_probe() {
-  local last now
-  last=$(python3 -c "
-import json
-try: print(json.load(open('$STATE')).get('lastProbeAt') or 0)
-except Exception: print(0)
-" 2>/dev/null)
-  now=$(date +%s)
-  if [ $((now * 1000 - last)) -ge $((RECOVER_PROBE_INTERVAL * 1000)) ]; then
-    python3 - "$STATE" <<'PY'
+# 记一次「切回主渠道」到本小时计数，供 should_probe 做指数退避。
+bump_recover_count() {
+  python3 - "$STATE" <<'PY'
 import json, sys, time
 p = sys.argv[1]
-try: d = json.load(open(p))
-except Exception: d = {}
-d['lastProbeAt'] = int(time.time() * 1000)
-json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+now_ms = int(time.time() * 1000)
+cur_hour = now_ms // 3600000
+try:
+    d = json.load(open(p, encoding="utf-8"))
+except Exception:
+    d = {}
+if int(d.get("recoverHour") or 0) != cur_hour:
+    d["recoverHour"] = cur_hour
+    d["recoverCount"] = 0
+d["recoverCount"] = int(d.get("recoverCount") or 0) + 1
+json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 PY
-    return 0
-  fi
-  return 1
+}
+
+# 该不该现在去探主渠道。
+# 成功判定走 python 的退出码（0 = 去探，1 = 别探），原因写进 state.probeHold，
+# --status 能看见，日志不刷屏。
+should_probe() {
+  python3 - "$STATE" "$RECOVER_PROBE_INTERVAL" "$MIN_FALLBACK_DWELL_SEC" "$RECOVER_BACKOFF_MAX" <<'PY'
+import json, sys, time
+
+state_path = sys.argv[1]
+base, dwell, cap = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+now_ms = int(time.time() * 1000)
+cur_hour = now_ms // 3600000
+
+try:
+    d = json.load(open(state_path, encoding="utf-8"))
+except Exception:
+    d = {}
+
+last_probe = int(d.get("lastProbeAt") or 0)
+last_switch = int(d.get("lastSwitchAt") or 0)
+
+# 同一自然小时内的切回次数；跨小时自动归零
+if int(d.get("recoverHour") or 0) != cur_hour:
+    d["recoverHour"] = cur_hour
+    d["recoverCount"] = 0
+count = int(d.get("recoverCount") or 0)
+
+ok = False
+if last_switch and now_ms - last_switch < dwell * 1000:
+    d["probeHold"] = "dwell:%ds" % dwell          # 刚降级，先待够驻留时间
+else:
+    exp = max(0, min(3, count - 1)) if count >= 2 else 0
+    interval = min(base * (2 ** exp), cap)
+    if now_ms - last_probe >= interval * 1000:
+        d["lastProbeAt"] = now_ms
+        d["probeHold"] = "due:interval=%ds" % interval
+        ok = True
+    else:
+        d["probeHold"] = "wait:interval=%ds" % interval
+
+json.dump(d, open(state_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+sys.exit(0 if ok else 1)
+PY
 }
 
 # 切换冷却：刚切过就不要再切（防抖动）
@@ -492,6 +540,7 @@ check_once() {
         log "上游渠道 $(chain_provider_at "$up") 已恢复 -> 切回（退出第 ${idx} 级）"
         set_provider "$(chain_provider_at "$up")" "$(chain_model_at "$up")" "$(chain_effort_at "$up")" \
           && record_history "$cur" "$(chain_provider_at "$up")" 'recovered'
+        bump_recover_count
         reset_chain_signals
       fi
     fi
@@ -533,6 +582,9 @@ try: d = json.load(open(p))
 except Exception: d = {}
 d['lastProbeAt'] = 0
 d['lastSwitchAt'] = 0
+d['recoverCount'] = 0
+d['recoverHour'] = 0
+d['probeHold'] = ''
 json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 print('已重置探测与切换冷却')
 PY
@@ -574,6 +626,11 @@ except Exception: print(0)
     printf '检查间隔       = %ss\n' "$INTERVAL"
     printf '切换冷却       = %ss\n' "$SWITCH_COOLDOWN_SEC"
     printf '恢复探测间隔   = %ss（仅处于兜底时）\n' "$RECOVER_PROBE_INTERVAL"
+    printf '最短驻留       = %ss（降级后不探测、不切回）\n' "$MIN_FALLBACK_DWELL_SEC"
+    printf '退避上限       = %ss（同小时切回越多，间隔越大）\n' "$RECOVER_BACKOFF_MAX"
+    printf '本小时切回     = %s 次 / 探测挂起原因 = %s\n' \
+      "$(python3 -c "import json;print(json.load(open('$STATE')).get('recoverCount') or 0)" 2>/dev/null || echo 0)" \
+      "$(python3 -c "import json;print(json.load(open('$STATE')).get('probeHold') or '-')" 2>/dev/null || echo -)"
     printf '桥接 unit      = %s\n' "$(systemctl is-active "$BRIDGE_UNIT" 2>/dev/null || echo n/a)"
     exit 0 ;;
 esac
