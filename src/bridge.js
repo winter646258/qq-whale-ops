@@ -1043,16 +1043,6 @@ function loadConfig() {
         // 群聊专用唤醒上限（可选）。不配则回退到上面的全局值。
         // 群聊通常更热闹，需要更慢，但私聊不该被拖慢。
         maxWakePerHourInGroup: null,
-        // MARKER: willingness-default
-        // 意愿门：把「掷一次骰子」换成「攒分再说」。默认开，但只作用于群聊。
-        willingness: {
-          enabled: true,
-          auto: true,
-          tier: 'normal',
-          maxProbability: 0.92,
-          minGapAfterReply: 0,
-          ...((cfg.socialV2?.wake?.willingness) ?? {})
-        },
         // 高优先级唤醒（private / atMention / question）是否豁免频率上限。
         // 默认 true：额度只服务弱触发，用户明确叫她永远放行。
         exemptHighPriorityFromLimit: true,
@@ -1207,6 +1197,21 @@ function loadConfig() {
     ffmpegPath: '',
     autoReadback: true,
     ...(cfg.socialV2?.voice ?? {})
+  };
+
+  // MARKER: willingness-default
+  // 意愿门：把「掷一次骰子」换成「攒分再说」。默认开，但只作用于群聊。
+  // 深度合并而不是整块覆盖：旧 config.json 里没有这段时也要有默认值。
+  cfg.socialV2.wake = {
+    ...(cfg.socialV2.wake ?? {}),
+    willingness: {
+      enabled: true,
+      auto: true,
+      tier: 'normal',
+      maxProbability: 0.92,
+      minGapAfterReply: 0,
+      ...(cfg.socialV2?.wake?.willingness ?? {})
+    }
   };
 
   // socialV2.sticker.collect 也需要深度合并，避免旧配置缺失 collect 子项时丢默认值。
