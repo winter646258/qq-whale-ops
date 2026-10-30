@@ -578,6 +578,13 @@ export function lifeMomentLine(day, now = Date.now()) {
     const slot = slotAt(day, now);
     if (!slot) return '';
     const parts = [];
+    // 日型：她得知道今天算工作日还是周末，否则「今天想歇着」和「今天得干活」她分不出来。
+    // label 里可能的括号注释是写给我看的，先去括号再限长，免得截断截在括号中间。
+    // 两个字段任一缺失就整句不加 —— 不拼半截信息。
+    // MARKER: day-type
+    const dayLabel = str(day.regimeLabel || '', 40).replace(/[（(][^）)]*[）)]/g, '').trim().slice(0, 20);
+    const dayWeek = str(day.weekday || '', 6);
+    if (dayWeek && dayLabel) parts.push(`今天是${dayWeek}，${dayLabel}。`);
     const range = `${slot.from}–${slot.to}`;
     const whereNote = str(slot.where, 12);
     const note = str(slot.whereNote, 60);

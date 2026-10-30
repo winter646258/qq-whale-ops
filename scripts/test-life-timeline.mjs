@@ -129,6 +129,8 @@ const at10 = new Date(2026, 9, 30, 10, 0, 0).getTime();
 const line = lifeMomentLine(day, at10);
 ok('上午 10 点有文本', line.length > 30, `长度 ${line.length}`);
 ok('文本里有时段', /现在是 \d{2}:\d{2}–\d{2}:\d{2}/.test(line));
+ok('文本开头是日型', /^今天是周[一二三四五六日]，[^（(]{2,10}。/.test(line));
+ok('日型不带括号注释', line.indexOf('（') === -1 || line.indexOf('（') > line.indexOf('。'));
 ok('文本里有地点', line.includes('你'));
 ok('结尾有「别把整段念出来」', line.includes('别把整段念出来'));
 ok('长度在 120~320 之间（别太长）', line.length >= 120 && line.length <= 320, `实得 ${line.length}`);
