@@ -11759,6 +11759,7 @@ async function generateImageNow({ prompt, size }) {
         agentToken: crypto.randomBytes(16).toString('hex'),
         bootstrapSent: false,
         wakeTimes: [],
+        exemptWakeTimes: [],
         sendTimes: [],
         stickerCollectTimes: [],
         pendingWakeTimer: null,
@@ -11833,6 +11834,7 @@ async function generateImageNow({ prompt, size }) {
             agentToken,
             bootstrapSent: !!val.bootstrapSent,
             wakeTimes: Array.isArray(val.wakeTimes) ? val.wakeTimes : [],
+            exemptWakeTimes: Array.isArray(val.exemptWakeTimes) ? val.exemptWakeTimes : [],
             sendTimes: Array.isArray(val.sendTimes) ? val.sendTimes : [],
             stickerCollectTimes: Array.isArray(val.stickerCollectTimes) ? val.stickerCollectTimes : [],
             pendingWakeTimer: null,
@@ -11947,6 +11949,7 @@ async function generateImageNow({ prompt, size }) {
           agentToken: st.agentToken,
           bootstrapSent: st.bootstrapSent,
           wakeTimes: st.wakeTimes.slice(-200),
+          exemptWakeTimes: Array.isArray(st.exemptWakeTimes) ? st.exemptWakeTimes.slice(-200) : [],
           sendTimes: st.sendTimes.slice(-500),
           stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
           lastIncomingAt: st.lastIncomingAt || 0,
@@ -14559,6 +14562,15 @@ async function generateImageNow({ prompt, size }) {
     // probability 是「猜她可能想说」，叫名字 / 拍一拍是「明确在叫她」，属确定性信号。
     const HIGH_PRIORITY = new Set(['private', 'atMention', 'nameMention', 'poke']);
     const isExplicit = exemptHigh && HIGH_PRIORITY.has(reasonBase);
+    // MARKER: wake-bucket —— 豁免唤醒与普通唤醒分开记账，豁免不再占普通额度。
+    // 起因（2026-10-30 实测）：group:906710082 一小时被叫 7 次（nameMention×4 + atMention×3）
+    // 就把 maxWakePerHour:5 填满，此后 willingness 想说话 8 次全被判「唤醒频率超限」，
+    // 等于豁免机制把普通额度废掉了。豁免本身仍不受限（保持「叫了不理」的修复初衷），
+    // 只是不再从普通桶里扣。桶引用只在这里定一次，push / 日志 / 回滚共用同一个。
+    // 注意：旧 wakeTimes 里混着无法分类的历史记录，不回填也不清空，让它们自然过期。
+    const wakeBucket = isExplicit
+      ? (st.exemptWakeTimes || (st.exemptWakeTimes = []))
+      : (st.wakeTimes || (st.wakeTimes = []));
     if (!isExplicit) {
       // MARKER: per-group-override
       const maxPerMinute = __wlim.maxWakePerMinute || (Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0);
@@ -14569,9 +14581,9 @@ async function generateImageNow({ prompt, size }) {
         log(`[reserved2] 唤醒频率超限，跳过 ${key}（${reason}）`);
         return;
       }
-    } else if ((st.wakeTimes || []).filter((t) => now - t < 3600000).length >= (__wlim.maxWakePerHour || 12)) {
-      // 只打日志，不拦：便于观察高优先级唤醒的占比
-      log(`[reserved2] 高优先级唤醒放行（${reason}），本小时已唤醒 ${(st.wakeTimes || []).filter((t) => now - t < 3600000).length} 次`);
+    } else if (wakeBucket.filter((t) => now - t < 3600000).length >= (__wlim.maxWakePerHour || 12)) {
+      // 只打日志，不拦：便于观察高优先级唤醒的占比（豁免桶独立，不吃普通额度）
+      log(`[reserved2] 高优先级唤醒放行（${reason}），本小时豁免唤醒 ${wakeBucket.filter((t) => now - t < 3600000).length} 次`);
     }
     // Only a real new wake resets observation; skipped/busy candidates must
     // preserve the current turn's progress through its required wait window.
@@ -14580,8 +14592,8 @@ async function generateImageNow({ prompt, size }) {
     st.preSleepWaitAccumMs = 0;
     cancelReplyCheckV2(key); // 本次唤醒已接管，清理仍在排队的回复检查
     const wakeTime = now;
-    st.wakeTimes.push(wakeTime);
-    if (st.wakeTimes.length > 200) st.wakeTimes = st.wakeTimes.slice(-200);
+    wakeBucket.push(wakeTime);
+    if (wakeBucket.length > 200) wakeBucket.splice(0, wakeBucket.length - 200);
     // 无论提前唤醒还是超时唤醒，都清理有限潜水定时器与 sleepUntil，避免状态残留/重复唤醒
     const prevSleepUntil = st.wakeConfig.sleepUntil;
     const hadFiniteSleep = !st.wakeConfig.infinite && !!prevSleepUntil && Number.isFinite(Date.parse(prevSleepUntil));
@@ -14596,9 +14608,16 @@ async function generateImageNow({ prompt, size }) {
     saveSocialV2State();
     const promptText = buildWakePromptV2(key, reason);
     log(`[reserved2] 唤醒 ${key}（${reason}）`);
+    let wakeRolledBack = false;
     const rollbackWakeTime = () => {
-      const idx = st.wakeTimes.lastIndexOf(wakeTime);
-      if (idx >= 0) st.wakeTimes.splice(idx, 1);
+      // 幂等：两个调用点（投递被拒 / catch 异常）理论上互斥，但若 restoreFiniteSleep
+      // 在第一次回滚之后抛错，catch 会再回滚一次，把另一条同毫秒记录也删掉。
+      if (wakeRolledBack) return;
+      wakeRolledBack = true;
+      // 用 push 时捕获的同一个桶，不重新分类；已知限制：靠毫秒时间戳配对，
+      // 同一毫秒内两次唤醒会删错记录，属既有隐患，这次不改数据形状。
+      const idx = wakeBucket.lastIndexOf(wakeTime);
+      if (idx >= 0) wakeBucket.splice(idx, 1);
       saveSocialV2State();
     };
     try {
