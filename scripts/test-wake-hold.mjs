@@ -286,5 +286,37 @@ ok('源码里有 hold-soft-only 的判定集合', () => {
   assert(src.includes('const holdApplies = HOLD_SOFT.has(reasonBase)'), 'holdApplies 没找到');
 });
 
+console.log('\n[8] 15 分钟短窗口（别 8 分钟把整小时额度烧光）');
+const LIMQ = { maxWakePerHour: 99, maxWakePerMinute: 0, maxWakePerQuarterHour: 2 };
+ok('15 分钟内已有 2 条 → 拦，恢复点 = 最老那条 + 15 分钟', () => {
+  const st = mk([now - 10 * MIN, now - 5 * MIN], []);
+  const r = run(st, 'willingness', LIMQ);
+  eq(r.denied, true);
+  eq(st.wakeHold && st.wakeHold.until, now - 10 * MIN + 15 * MIN);
+});
+ok('15 分钟内只有 1 条 → 放行', () => {
+  const st = mk([now - 5 * MIN], []);
+  const r = run(st, 'willingness', LIMQ);
+  eq(r.out, 'passed');
+});
+ok('15 分钟和小时窗口同时满时取较早的恢复点', () => {
+  const st = mk([now - 14 * MIN, now - 12 * MIN, now - 10 * MIN, now - 8 * MIN, now - 6 * MIN], []);
+  run(st, 'willingness', { maxWakePerHour: 5, maxWakePerMinute: 0, maxWakePerQuarterHour: 2 });
+  eq(st.wakeHold && st.wakeHold.until, now - 8 * MIN + 15 * MIN, '应取 15 分钟窗口的恢复点');
+});
+ok('配 0 视为不限', () => {
+  const st = mk([now - 1 * MIN, now - 2 * MIN, now - 3 * MIN], []);
+  const r = run(st, 'willingness', { maxWakePerHour: 99, maxWakePerMinute: 0, maxWakePerQuarterHour: 0 });
+  eq(r.out, 'passed');
+});
+ok('日志写清是哪个窗口满', () => {
+  const st = mk([now - 10 * MIN, now - 5 * MIN], []);
+  const r = run(st, 'willingness', LIMQ);
+  assert(r.logs.some((l) => l.includes('15分')), '日志没写窗口: ' + r.logs.join(' | '));
+});
+ok('源码层有两个 wake-quarter 落点（解析层 + 限流段）', () => {
+  eq((src.match(/MARKER: wake-quarter/g) || []).length, 2);
+});
+
 console.log('\n结果：' + pass + ' 过 / ' + fail + ' 挂');
 if (fail > 0) process.exitCode = 1;

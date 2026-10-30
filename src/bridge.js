@@ -1054,6 +1054,8 @@ function loadConfig() {
         // 群聊专用唤醒上限（可选）。不配则回退到上面的全局值。
         // 群聊通常更热闹，需要更慢，但私聊不该被拖慢。
         maxWakePerHourInGroup: null,
+        maxWakePerQuarterHour: 0,          // 0 = 不限；默认关，只在群聊开
+        maxWakePerQuarterHourInGroup: 2,   // 15 分钟最多 2 条，别 8 分钟把整小时额度烧光
         // 高优先级唤醒（private / atMention / question）是否豁免频率上限。
         // 默认 true：额度只服务弱触发，用户明确叫她永远放行。
         exemptHighPriorityFromLimit: true,
@@ -6284,6 +6286,10 @@ async function main() {
       autoReplyCheckMs: pick(g.autoReplyCheckMs, g.autoReplyCheckMsInGroup, 30000),
       maxWakePerHour: pickOv(pick(w.maxWakePerHour, w.maxWakePerHourInGroup, 12), ov.maxWakePerHour),
       maxWakePerMinute: pickOv(Number(w.maxWakePerMinute) > 0 ? Number(w.maxWakePerMinute) : 0, ov.maxWakePerMinute),
+      // MARKER: wake-quarter —— 15 分钟短窗口。5 条/小时这套滑动窗口天生「爆发完就哑」：
+      // 实测 2026-10-30 19:15~19:26 八分钟连发 5 条把整小时额度用光，之后 52 分钟一句说不出。
+      // 总量不变，只是不许一口气花完。0 / 不配 = 不限。
+      maxWakePerQuarterHour: pickOv(pick(w.maxWakePerQuarterHour, w.maxWakePerQuarterHourInGroup, 0), ov.maxWakePerQuarterHour),
       turnMaxSends: pickOv(0, ov.turnMaxSends),
       isGroup,
     };
@@ -14625,11 +14631,15 @@ async function generateImageNow({ prompt, size }) {
       }
       const maxPerMinute = __wlim.maxWakePerMinute || (Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0);
       const maxPerHour = __wlim.maxWakePerHour;
+      // MARKER: wake-quarter —— 15 分钟短窗口。只算普通桶（豁免本来就不吃这个额度）。
+      const maxQuarter = __wlim.maxWakePerQuarterHour || 0;
       const recentMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).length;
       const recentHour = (st.wakeTimes || []).filter((t) => now - t < 3600000).length;
+      const recentQuarter = maxQuarter > 0 ? (st.wakeTimes || []).filter((t) => now - t < 900000).length : 0;
       const overMinute = maxPerMinute > 0 && recentMinute >= maxPerMinute;
       const overHour = maxPerHour > 0 && recentHour >= maxPerHour;
-      if (overMinute || overHour) {
+      const overQuarter = maxQuarter > 0 && recentQuarter >= maxQuarter;
+      if (overMinute || overHour || overQuarter) {
         // 算「额度什么时候真的有空位」：滑动窗口里最老那条滑出去的时刻。
         // count == max 时，最老一条过期必然让 count 降到 max-1 < max，所以那就是恢复点。
         let untilByHour = 0;
@@ -14646,10 +14656,18 @@ async function generateImageNow({ prompt, size }) {
             ? inMinute[inMinute.length - maxPerMinute] + 60000
             : now + 60000;
         }
-        const hits = [untilByHour, untilByMinute].filter((t) => t > now);
+        let untilByQuarter = 0;
+        if (overQuarter) {
+          const inQuarter = (st.wakeTimes || []).filter((t) => now - t < 900000).sort((a, b) => a - b);
+          untilByQuarter = inQuarter.length >= maxQuarter
+            ? inQuarter[inQuarter.length - maxQuarter] + 900000
+            : now + 60000;
+        }
+        const hits = [untilByHour, untilByMinute, untilByQuarter].filter((t) => t > now);
         const until = hits.length ? Math.min(...hits) : now + 60000;
+        const why = [overMinute ? '分钟' : '', overQuarter ? '15分' : '', overHour ? '小时' : ''].filter(Boolean).join('/');
         st.wakeHold = { until, at: now, reason: String(reason || '') };
-        log(`[reserved2] 唤醒频率超限，跳过 ${key}（${reason}），抑制到 ${Math.round((until - now) / 1000)}s 后`);
+        log(`[reserved2] 唤醒频率超限，跳过 ${key}（${reason}），${why}窗口满，抑制到 ${Math.round((until - now) / 1000)}s 后`);
         return;
       }
     } else if (wakeBucket.filter((t) => now - t < 3600000).length >= (__wlim.maxWakePerHour || 12)) {
