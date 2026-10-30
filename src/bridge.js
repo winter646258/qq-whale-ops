@@ -118,7 +118,7 @@ import { LEARNER_RETRY_NUDGE, learnerOutcome } from './learner-retry.js';
 import { readImageStream } from './image-stream.js';
 // 节奏层：什么时候叫醒她、回复后跳几次、主动间隔。纯逻辑在 pacing.js，带单测。
 // MARKER: pacing-import
-import { pacingCfg, skipDecision, urgeDelay } from './pacing.js';
+import { pacingCfg, rhythmOf, skipDecision, urgeDelay } from './pacing.js';
 import { prepareQzoneImages } from './qzone-image.js';
 // 结算层：回合收工之后另起一个安静的小回合，把情绪和印象写回库里。纯逻辑在 settle.js。
 // MARKER: settle-import
@@ -141,6 +141,15 @@ import { archivePath, clampDays, decodeLine, encodeRecord, formatRecall, history
 // 世界层只当数据库用，不进提示词的只有世界本身；进提示词的是「此刻那一格」。
 import { readWorld } from './world.js';
 import { attentionOf, ensureDay, lifeMomentLine, readTimeline } from './life-timeline.js';
+// MARKER: willingness-import
+import {
+  consumeWillingness,
+  describeWillingness,
+  evaluateWillingness,
+  isForcedReason,
+  resolveWillingness,
+  WILLINGNESS_DEFAULTS
+} from './willingness.js';
 import { moodDaysCfg, moodTrendLine, pruneMoodDays, recordMoodDay } from './mood-days.js';
 import { buildThreadsAsk, threadsCfg, threadsLine, summarizeThreads, addThreads, dueThreads, markAsked, pruneThreads, resolveThreads } from './threads.js';
 import { buildWishesAsk, wishesCfg, wishesLine, summarizeWishes, addWishes, completeWishes, pruneWishes } from './wishes.js';
@@ -1034,6 +1043,16 @@ function loadConfig() {
         // 群聊专用唤醒上限（可选）。不配则回退到上面的全局值。
         // 群聊通常更热闹，需要更慢，但私聊不该被拖慢。
         maxWakePerHourInGroup: null,
+        // MARKER: willingness-default
+        // 意愿门：把「掷一次骰子」换成「攒分再说」。默认开，但只作用于群聊。
+        willingness: {
+          enabled: true,
+          auto: true,
+          tier: 'normal',
+          maxProbability: 0.92,
+          minGapAfterReply: 0,
+          ...((cfg.socialV2?.wake?.willingness) ?? {})
+        },
         // 高优先级唤醒（private / atMention / question）是否豁免频率上限。
         // 默认 true：额度只服务弱触发，用户明确叫她永远放行。
         exemptHighPriorityFromLimit: true,
@@ -13356,6 +13375,154 @@ async function generateImageNow({ prompt, size }) {
     };
   }
 
+  // MARKER: willingness
+  // 意愿门：她「有多想插这句话」的连续量，替代「掷一次骰子决定要不要说话」。
+  //
+  // 为什么加这个：唤醒判定全是布尔开关，每一条都是「命中就醒」。这套东西能表达
+  // 「这句话是不是冲我来的」，但表达不了「我刚连说了三句，现在该歇会」。群里
+  // 安静十分钟她一句不吭、热闹起来一句接一句地插，就是这个原因。
+  //
+  // 三个来源：
+  //   forced  —— 明确在叫她（private / @ / 叫名字 / 拍一拍 / 提问），直通，不动分数
+  //   soft    —— 软触发（关键词 / 随机概率 / 任意消息 / 指定发言人），进评分
+  //   chance  —— 什么都没命中（st.wakeBlockedBy 为空），也进评分。
+  //              这是新增的主动发声通道 —— 原来的 probability:0.01 等于永远不主动，
+  //              现在「聊得够热」本身就能让她开口。
+  //
+  // 分数落在 state/willingness.json，不进 social-v2.json：那套序列化带 Set，
+  // 不值得为了一个浮点数去动它。
+  const WILLINGNESS_FILE = path.join(STATE_DIR, 'willingness.json');
+
+  function willingnessCfg() {
+    // 默认值挂在 socialV2.wake.willingness（跟着 wake 那套走，控制台改起来顺手），
+    // 但也认 socialV2.willingness 这个更短的写法 —— 两个都读，后者优先。
+    const w = { ...(cfg.socialV2?.wake?.willingness ?? {}), ...(cfg.socialV2?.willingness ?? {}) };
+    // 生活节奏现算：她这会儿在书房正经干活（occupied）还是窝着（available），
+    // 直接决定档位。拿不到就是空串，resolveTier 会回落默认档。
+    let rhythm = '';
+    try {
+      rhythm = rhythmOf({
+        lastIncomingAt: 0,
+        now: Date.now(),
+        hour: new Date().getHours(),
+        attention: lifeAttentionNow(Date.now()),
+        cfg: pacingCfg(cfg)
+      }).level;
+    } catch { /* 拿不到节奏就按默认档算，绝不让它挡住说话 */ }
+    return { ...w, rhythm };
+  }
+
+  // 这一批里积了几条消息。原想用 st.batchCount，但那个字段并不存在（恒为 1），
+  // 等于「一群人刷屏时她更容易开口」这层完全失效。改成现算：
+  // 过去一个 batchWindowMs 内收到的非本人消息条数。
+  function recentBurstCount(st) {
+    const win = Math.max(1000, Number(st?.wakeConfig?.batchWindowMs) || 8000);
+    const now = Date.now();
+    const list = Array.isArray(st?.recentMessages) ? st.recentMessages : [];
+    let n = 0;
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const t = Number(list[i]?.time) || 0;
+      if (!t || now - t > win) break;
+      if (!list[i]?.isSelf) n += 1;
+    }
+    return Math.max(1, Math.min(9, n));
+  }
+
+  function readWillingnessMap() {
+    try {
+      const raw = readJsonSafe(WILLINGNESS_FILE, null);
+      if (raw && typeof raw === 'object' && raw.keys && typeof raw.keys === 'object') return raw;
+    } catch { /* 坏文件当空地图，别因为一个分数读不出来就不说话 */ }
+    return { version: 1, keys: {} };
+  }
+
+  function writeWillingnessMap(map) {
+    try {
+      // 只留最近 60 个会话，防止私聊越开越多把文件撑大
+      const entries = Object.entries(map.keys || {});
+      if (entries.length > 60) {
+        entries.sort((a, b) => (Number(b[1]?.updatedAt) || 0) - (Number(a[1]?.updatedAt) || 0));
+        map.keys = Object.fromEntries(entries.slice(0, 60));
+      }
+      atomicWriteJson(WILLINGNESS_FILE, map);
+    } catch (error) {
+      log(`[willingness] 分数落盘失败：${error?.message ?? error}`);
+    }
+  }
+
+  function willingnessStateOf(key) {
+    const map = readWillingnessMap();
+    const st = map.keys[key];
+    return st && Number.isFinite(Number(st.score))
+      ? { score: Number(st.score), updatedAt: Number(st.updatedAt) || 0, skipCount: Math.max(0, Math.floor(Number(st.skipCount) || 0)), consumedReplyAt: Number(st.consumedReplyAt) || 0 }
+      : { score: 0, updatedAt: 0, skipCount: 0, consumedReplyAt: 0 };
+  }
+
+  function saveWillingnessState(key, state) {
+    const map = readWillingnessMap();
+    map.version = 1;
+    map.keys = map.keys || {};
+    map.keys[key] = state;
+    writeWillingnessMap(map);
+  }
+
+  // 她「刚说完话就该歇会」这条，靠 lastAiReplyAt 判断。
+  // 用惰性消费而不是挂在发送点上：发送路径有五处（文本/表情/工具/收尾…），
+  // 挂五处必然漏一处，而 lastAiReplyAt 是所有路径都会写的唯一信号。
+  function consumeIfReplied(key, state) {
+    const repliedAt = Number(getSocialV2State(key).lastAiReplyAt) || 0;
+    if (!repliedAt || repliedAt <= (Number(state.consumedReplyAt) || 0)) return state;
+    const next = consumeWillingness(
+      { score: state.score, updatedAt: state.updatedAt, skipCount: state.skipCount },
+      willingnessCfg(),
+      Date.now()
+    );
+    return { ...next, consumedReplyAt: repliedAt };
+  }
+
+  /**
+   * 过意愿门。返回最终要用的唤醒 reason（可能被挡成 null），
+   * 或者原本就是 null 时给出 'willingness'（她被「聊得够热」说动了）。
+   */
+  function applyWillingnessV2(key, st, reason, opts = {}) {
+    const wl = willingnessCfg();
+    if (wl.enabled === false) return reason;
+    // 私聊不设门：一对一本来就不存在「插话抢麦」，只会让她变迟钝。
+    if (String(key).startsWith('private:')) return reason;
+
+    const blocked = String(st.wakeBlockedBy || '');
+    // 明确不该说的（禁言/别的机器人/机器报错/@了别人）连分都不攒。
+    if (!reason && blocked) return null;
+
+    let state = consumeIfReplied(key, willingnessStateOf(key));
+    const decision = evaluateWillingness(state, wl, {
+      now: Date.now(),
+      messageCount: Math.max(1, Number(opts.messageCount) || 1),
+      content: String(opts.content ?? ''),
+      quotedBot: Boolean(opts.quotedBot),
+      reason: reason || '',
+      rhythm: wl.rhythm,
+      // 软触发已经过了一道判定，给它额外一点倾向：命中说明话题确实相关，
+      // 不该跟「纯路过」用同一把尺子。
+      random: Math.random
+    });
+    state = decision.state;
+    saveWillingnessState(key, state);
+
+    if (reason) {
+      if (isForcedReason(reason, wl)) return reason;
+      if (decision.shouldCall) return reason;
+      if (wl.log !== false) log(`[willingness] ${key} 压住 ${reason}（${describeWillingness(decision)}）`);
+      return null;
+    }
+    // 没有任何触发，但分数够了 —— 她自己想说话。
+    if (decision.shouldCall) {
+      log(`[willingness] ${key} 主动插话（${describeWillingness(decision)}）`);
+      return 'willingness';
+    }
+    return null;
+  }
+
   // MARKER: skip-jitter
   // 「刚说完话就先歇几次」的抖动闸。每条消息过一遍：
   //   1) 计数（本条算一次触发）
@@ -13380,13 +13547,17 @@ async function generateImageNow({ prompt, size }) {
   }
 
   function evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf) {
+    // MARKER: wake-blocked-by —— 记下「为什么不说」，供意愿门区分
+    // 「明确不该说」（禁言/别的机器人/机器报错/@了别人）与「只是这条没触发」。
+    // 前者绝不攒分，后者才是她可以主动插话的机会。
+    st.wakeBlockedBy = '';
     if (kind === 'private') return 'private';
     // MARKER: mute-aware-skip —— 禁言期间这个群发不出任何东西，唤醒只会白烧 token。
     if (kind === 'group') {
       const gid = key.slice(key.indexOf(':') + 1);
       const mutedUntil = mutedUntilByGroup.get(gid) || 0;
       if (mutedUntil) {
-        if (mutedUntil > Date.now()) return null;
+        if (mutedUntil > Date.now()) { st.wakeBlockedBy = 'mute'; return null; }
         mutedUntilByGroup.delete(gid);
         log(`[mute-aware] ${key} 禁言已到期，恢复唤醒`);
       }
@@ -13397,7 +13568,7 @@ async function generateImageNow({ prompt, size }) {
     if (kind === 'group') {
       const gid = key.slice(key.indexOf(':') + 1);
       refreshGroupBotIds(gid);
-      if (isKnownBot(gid, event?.user_id)) return null;
+      if (isKnownBot(gid, event?.user_id)) { st.wakeBlockedBy = 'bot'; return null; }
     }
     // MARKER: bot-noise-filter —— 按文本特征兜住「没被 QQ 标记成机器人、但其实是机器」的发信人。
     // 放在 anyMessage / atMention 之前：这类模板连「@了她」都不该叫醒她。
@@ -13413,6 +13584,7 @@ async function generateImageNow({ prompt, size }) {
           rec.n = 0;
         }
         botNoiseSeen.set(key, rec);
+        st.wakeBlockedBy = 'noise';
         return null;
       }
     }
@@ -13425,7 +13597,7 @@ async function generateImageNow({ prompt, size }) {
     // MARKER: at-others-suppress —— 这句话 @ 了别人（且没同时 @ 自己），那就是说给那个人的。
     // 关键词/名字/提问/随机概率四类软触发一律失效，否则群里「@大肥鱼」会把另一条鱼的话算到她头上。
     // 判定下沉到 isDirectedAtOthers：普通段、合并转发、引用原消息、all/陌生人 全扫一遍。
-    if (isDirectedAtOthers(event)) return null;
+    if (isDirectedAtOthers(event)) { st.wakeBlockedBy = 'others'; return null; }
     if (tr.nameMention && selfNickname) {
       // MARKER: name-mention-plain —— 两个修正，和 keywords 分支对齐：
       // 1) 用 plainContent 而不是 textContent。textContent 带着「[引用 谁：……]」前缀，
@@ -15009,9 +15181,16 @@ async function generateImageNow({ prompt, size }) {
         scheduleWakeV2(key, 'bootstrap');
       } else {
         const reason = evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
+        // MARKER: willingness-gate —— 意愿门。reason 为 null 时也可能被放行
+        // （她攒够了想主动插话），所以这一步也必须每条消息都过。
+        const willing = applyWillingnessV2(key, st, reason, {
+          messageCount: recentBurstCount(st),
+          content: plainContent,
+          quotedBot: Boolean(quoteTargetIsSelf)
+        });
         // MARKER: skip-jitter —— 每条消息都要过闸（既计数也判定），
         // 所以不能只在 reason 有值时才调。
-        const gated = applySkipJitterV2(key, st, reason);
+        const gated = applySkipJitterV2(key, st, willing);
         if (gated) {
           scheduleWakeV2(key, gated);
         }
