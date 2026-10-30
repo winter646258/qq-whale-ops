@@ -139,7 +139,7 @@ import { archivePath, clampDays, decodeLine, encodeRecord, formatRecall, history
 // MARKER: life-timeline-import
 // 世界层 §4 生活线：world.json（她的住处/作息/日程模式）+ life-timeline.js（今天每一格）。
 // 世界层只当数据库用，不进提示词的只有世界本身；进提示词的是「此刻那一格」。
-import { readWorld } from './world.js';
+import { homeBrief, readWorld } from './world.js';
 import { attentionOf, ensureDay, lifeMomentLine, readTimeline } from './life-timeline.js';
 // MARKER: world-events-import
 // 世界会自己往外冒事：按天物化一份事件账本，只给已经发生的。
@@ -4529,6 +4529,11 @@ async function main() {
   }
 
   function inWorldScope(key) {
+    // MARKER: world-scope-hard
+    // 群聊是硬边界：不管 scope 配成什么，群里一个字都不进。
+    // 之前 scope:'all' 直接 return true，等于把「群里不注入」变成一句默认值而不是约束。
+    const scopeKey = String(key || '');
+    if (scopeKey.startsWith('group:')) return false;
     if (worldScopeMode() === 'all') return true;
     const qq = String(cfg.ownerQQ ?? '').trim();
     if (!qq) return false;   // 没配 ownerQQ 就一个都不注入：别把私事漏给别人
@@ -5263,6 +5268,9 @@ async function main() {
   // MARKER: role-card-refresh —— 会话 -> 最近一次已注入的角色卡指纹。
   // 进程重启后为空，所以每个会话重启后第一次唤醒会重注入一次，属于预期行为。
   const roleCardInjectSeen = new Map();
+  // MARKER: world-home —— 会话 -> 最近一次已注入的住处块指纹。
+  // 与角色卡同一套判重：进程重启或会话换新后为空，于是重注入一次，属预期。
+  const worldHomeSeen = new Map();
   const toolCallNames = new Map(); // sessionId -> Map<callId, toolName>：用于结果日志关联工具名
   const pendingSendToolCalls = new Map(); // sessionId -> Set<callId>：等待 tool/result 的发送类调用
   // reserved2 防“忘记设置唤醒条件”：key -> 当前是否等待 AI 处理唤醒回合 / 本回合已更新唤醒配置 / 连续未设置次数
@@ -5746,6 +5754,7 @@ async function main() {
     sessionModels.delete(old);
     // 角色卡指纹要一起忘掉：新会话得重新注入一次，否则她会没有角色卡。
     roleCardInjectSeen.delete(key);
+    worldHomeSeen.delete(key);
     saveState();
     try { await api.stopSessionWork(old); } catch {}
     try { await api.workspace.archiveSession({ sessionId: old }); } catch {}
@@ -14148,6 +14157,29 @@ async function generateImageNow({ prompt, size }) {
     } catch (error) {
       log(`[role-card-refresh] 注入失败 ${key}: ${error?.message ?? error}`);
     }
+    // MARKER: world-home —— 稳定世界锚点，每会话一次。
+    // 为什么必须每会话给一遍而不是只在第一次给：DSH 会话不是永久上下文，会话换新
+    // （sessionRotate）之后历史就断了，靠「以前注入过」是记不住的。判重只为省掉
+    // 同一会话里每轮重复的这 350 字符，不是省掉「她得知道」这件事。
+    // 位置放在 roleLine 之后、所有规矩之前：这是「她是谁、住哪」级别的背景，
+    // 埋在长提示词中段会被忽略（lost in the middle）。
+    let worldHomeLine = '';
+    try {
+      if (inWorldScope(key)) {
+        const homeText = homeBrief(worldStore());
+        if (homeText) {
+          const homeHash = crypto.createHash('sha1').update(String(homeText)).digest('hex').slice(0, 12);
+          if (worldHomeSeen.get(key) !== homeHash) {
+            worldHomeSeen.set(key, homeHash);
+            worldHomeLine = homeText;
+            log(`[world-home] 注入住处 ${key} hash=${homeHash} ${String(homeText).length} 字`);
+          }
+        }
+      }
+    } catch (error) {
+      log(`[world-home] 注入失败 ${key}: ${error?.message ?? error}`);
+    }
+
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const memoryText = formatMemoryV2(st);
@@ -14436,7 +14468,7 @@ async function generateImageNow({ prompt, size }) {
     const untrustedLine = String(key).startsWith('group:') ? GROUP_RULES : '';
     // MARKER: continuity-inject —— 换会话前的交接条，注入一次就作废。
     const continuityText = continuityHintFor(key);
-    const base = roleLine + untrustedLine + tokenLine + continuityText + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + worldEventsText + moodTrendText + threadsText + wishesText + datesText + topicsText + biliBrowseText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    const base = roleLine + worldHomeLine + untrustedLine + tokenLine + continuityText + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + worldEventsText + moodTrendText + threadsText + wishesText + datesText + topicsText + biliBrowseText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;

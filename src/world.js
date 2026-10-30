@@ -540,6 +540,38 @@ export function worldBrief(world) {
  * 生成器用的硬边界：写进 prompt 让模型别越界，也供代码侧二次校验。
  * 这不是给她看的规矩，是给生成器看的约束。
  */
+/**
+ * 「家」的稳定锚点 —— 只留常年不变的空间事实。
+ * MARKER: home-brief
+ *
+ * 为什么单独开一个函数：worldBrief() 有 900 字符，其中身体 / 作息 / 爱好 / 营生
+ * 在角色卡和生活线里各有一份，每轮再注入一遍等于白花钱；而真正让她「有个家」的
+ * 那几样（一室一厅、大桌横在窗下、窗外直通堤坝、坐塌的旧木椅）反而一次都没进过
+ * 提示词 —— 她只知道此刻在客厅烧水，不知道家是什么样。
+ *
+ * 四条边界：
+ * 1) 不收 place.season。它混着「白天十八九度，夜里有潮气」这类易变信息，和当天的
+ *    env 会打架。当下现场（天气/光线/气味）以生活线为准，这里只给稳定的。
+ * 2) 不收 regimes 的段数。那是给排程器看的，对模型没有语义价值。
+ * 3) 不收 body / hobbies / livelihood。角色卡里已经写全，重复注入只会稀释注意力。
+ * 4) 目标 300~400 字符。超了先砍地点 note 里区分度低的，不砍户型 —— 户型是
+ *    「家」这个概念本身，地点只是门牌。
+ */
+export function homeBrief(world) {
+  const w = normalizeWorld(world && typeof world === 'object' ? world : DEFAULT_WORLD);
+  const h = w.place.home;
+  const places = w.place.places
+    .map((p) => (p.note ? `${p.name}（${p.note}）` : p.name))
+    .join('、');
+  const head = `【你的住处】${w.place.city}${w.place.scale ? `，${w.place.scale}` : ''}。`
+    + `住在 ${h.floor} 楼，${h.elevator ? '有' : '没有'}电梯，朝${h.facing}。${h.rooms}。`;
+  const tail = `窗外：${h.outside}。`
+    + `屋里留着：${h.keepsake}。`
+    + `附近可去：${places}。`
+    + '这是稳定背景，相关时自然提到就好，不用整段念；此刻的天气和你在做什么，以后面那条为准。\n\n';
+  return head + tail;
+}
+
 export function worldBounds(world) {
   const names = hobbyNames(world);
   const places = placesOf(world).map((p) => p.name);
