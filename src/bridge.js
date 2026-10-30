@@ -14596,6 +14596,8 @@ async function generateImageNow({ prompt, size }) {
     // 拍一拍被丢 2 次，用户体感就是「叫了不理」。这两个和 probability 不同类：
     // probability 是「猜她可能想说」，叫名字 / 拍一拍是「明确在叫她」，属确定性信号。
     const HIGH_PRIORITY = new Set(['private', 'atMention', 'nameMention', 'poke']);
+    // MARKER: hold-soft-only —— 抑制点只该压「猜她可能想说」的软触发。
+    const HOLD_SOFT = new Set(['willingness', 'probability', 'anyMessage', 'replyCheck']);
     const isExplicit = exemptHigh && HIGH_PRIORITY.has(reasonBase);
     // MARKER: wake-bucket —— 豁免唤醒与普通唤醒分开记账，豁免不再占普通额度。
     // 起因（2026-10-30 实测）：group:906710082 一小时被叫 7 次（nameMention×4 + atMention×3）
@@ -14611,9 +14613,16 @@ async function generateImageNow({ prompt, size }) {
     // 分数不消费所以一直挂在阈值上方（实测 19:19–19:40 稳定 8 秒一轮），日志刷屏且毫无意义。
     if (!isExplicit) {
       // MARKER: per-group-override
-      const holdUntil = Number((st.wakeHold && st.wakeHold.until) || 0);
-      if (holdUntil > now) return;
-      if (holdUntil > 0) st.wakeHold = null;   // 抑制期已过，清掉
+      // MARKER: hold-soft-only —— 抑制点只压软触发，不压 question / bootstrap。
+      // 详见 2026-10-30 20:08:31 实测：willingness 被拦后设了 394s 抑制点，
+      // 紧接着 8 秒后的 question 唤醒被这个抑制点静默吞掉（日志里连「超限」都没有）。
+      // 有人在问她的时候，宁可让它走完限流判定，哪怕额度满——至少日志看得见。
+      const holdApplies = HOLD_SOFT.has(reasonBase) || reasonBase === 'keyword' || reasonBase === 'speaker';
+      if (holdApplies) {
+        const holdUntil = Number((st.wakeHold && st.wakeHold.until) || 0);
+        if (holdUntil > now) return;
+        if (holdUntil > 0) st.wakeHold = null;   // 抑制期已过，清掉
+      }
       const maxPerMinute = __wlim.maxWakePerMinute || (Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0);
       const maxPerHour = __wlim.maxWakePerHour;
       const recentMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).length;

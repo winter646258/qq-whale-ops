@@ -243,5 +243,48 @@ ok('抑制点写入与作废成对出现', () => {
   assert(src.includes('st.wakeHold = null;   // 真的唤醒了'), '没找到作废点');
 });
 
+console.log('\n[7] 抑制点只压软触发（2026-10-30 20:08 线上事故回归）');
+// 事故：willingness 被拦后设了 394s 抑制点，8 秒后的 question 唤醒被静默吞掉，
+// 日志里连「超限」都没有 —— 表现就是「有人在问她，她一点反应都没有」。
+ok('抑制期内 question 放行（额度还够时直接过）', () => {
+  const st = mk([], []);
+  st.wakeHold = { until: now + 60 * 1000, at: now, reason: 'willingness' };
+  const r = run(st, 'question', { maxWakePerHour: 99, maxWakePerMinute: 0 });
+  eq(r.out, 'passed', 'question 被抑制点吞了');
+  eq(r.denied, false);
+});
+ok('抑制期内 question 额度真满时也要显式记日志，不能无声消失', () => {
+  const st = mk(fill(5, 10 * MIN, 1000), []);
+  st.wakeHold = { until: now + 60 * 1000, at: now, reason: 'willingness' };
+  const r = run(st, 'question');
+  assert(r.logs.length > 0, '既没放行也没日志，等于被静默吞掉');
+  eq(r.denied, true);
+});
+ok('抑制期内 bootstrap 也不被吞', () => {
+  const st = mk([], []);
+  st.wakeHold = { until: now + 60 * 1000, at: now, reason: 'willingness' };
+  const r = run(st, 'bootstrap', { maxWakePerHour: 99, maxWakePerMinute: 0 });
+  eq(r.out, 'passed');
+});
+ok('抑制期内 willingness 仍静默返回（这才是它该压的）', () => {
+  const st = mk([], []);
+  st.wakeHold = { until: now + 60 * 1000, at: now, reason: 'willingness' };
+  const r = run(st, 'willingness', { maxWakePerHour: 99, maxWakePerMinute: 0 });
+  eq(r.out, undefined, 'willingness 应被抑制点压住');
+  eq(r.logs.length, 0, '抑制期内不该刷日志');
+});
+ok('抑制期内 probability / keyword / speaker 同样被压', () => {
+  for (const rb of ['probability', 'keyword', 'speaker']) {
+    const st = mk([], []);
+    st.wakeHold = { until: now + 60 * 1000, at: now, reason: 'willingness' };
+    const r = run(st, rb, { maxWakePerHour: 99, maxWakePerMinute: 0 });
+    eq(r.out, undefined, rb + ' 没被压住');
+  }
+});
+ok('源码里有 hold-soft-only 的判定集合', () => {
+  assert(src.includes("const HOLD_SOFT = new Set(['willingness', 'probability', 'anyMessage', 'replyCheck']);"), 'HOLD_SOFT 没找到');
+  assert(src.includes('const holdApplies = HOLD_SOFT.has(reasonBase)'), 'holdApplies 没找到');
+});
+
 console.log('\n结果：' + pass + ' 过 / ' + fail + ' 挂');
 if (fail > 0) process.exitCode = 1;
