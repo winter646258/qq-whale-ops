@@ -4422,7 +4422,13 @@ async function main() {
         log('[谈资] 这轮没parse出 JSON，跳过');
         return false;
       }
-      const merged = addTopics(store, [topic], { now: Date.now(), cfg: tc, key });
+      // MARKER: topic-scope-fix —— 2026-10-30
+      // 这里原来写的是 `{ ..., key }`，但 generateTopic(slotInfo, tc) 没有 key 形参，
+      // 于是每轮都抛 `ReferenceError: key is not defined`，被 catch 吞成
+      // 「[谈资] 生成失败：key is not defined」—— 谈资从改 scoped-store 那天起就没生成过。
+      // 定时器生成的是「她自己的一天」，没有对应会话，所以挂到主人私聊这个 scope 上，
+      // 跟世界层一起只在主人的私聊里出现（群聊和别人的私聊看不见）。
+      const merged = addTopics(store, [topic], { now: Date.now(), cfg: tc, key: ownerScopeKey() });
       if (!merged.added) {
         log(`[谈资] 「${topic.title}」重复了，跳过`);
         return false;
@@ -4527,6 +4533,14 @@ async function main() {
     const qq = String(cfg.ownerQQ ?? '').trim();
     if (!qq) return false;   // 没配 ownerQQ 就一个都不注入：别把私事漏给别人
     return String(key || '') === `private:${qq}`;
+  }
+
+  // 她自己那部分「世界」产生的条目（谈资这类，没有具体会话）该挂到哪个 scope 上：
+  // 挂主人的私聊，跟着 inWorldScope 一起只在自己的私聊里出现；
+  // 没配 ownerQQ 就返回空串（空 = 全局可见，但那种情况本来也不会有世界层）。
+  function ownerScopeKey() {
+    const qq = String(cfg.ownerQQ ?? '').trim();
+    return qq ? `private:${qq}` : '';
   }
 
   function lifeTimelineFor(now = Date.now(), { force = false, dayKey = '' } = {}) {
@@ -14199,7 +14213,13 @@ async function generateImageNow({ prompt, size }) {
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8, { allowIds: stickerCfg.allowIds })}\n\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 90000);
-    const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
+    // MARKER: no-proactive-line —— 2026-10-30 减负
+    // 原文是 75 字「不要习惯性潜水，有话题就主动参与」。
+    // 删它的理由：这段只在「已经被唤醒、正在拼提示词」时出现 —— 也就是说
+    // 「要不要开口」在上游已经由 applyWillingnessV2 决定完了。此刻再叮嘱一句
+    // 「别潜水」，等于在她已经站起来之后再推一把，是纯噪音；而它每一轮都在花钱。
+    // 真要调参与度，调 socialV2.wake.willingness 的档位，不动提示词。
+    const proactiveLine = '';
     const replyTiming = replyTimingV2(st);
     const replyLine = `【首回复节奏】先处理已有消息，完整的问题及时回答。需要确认对方是否继续补充时，用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})；从最后来信计时，合批和读提示词的耗时也算，目前还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默。已安静够久可直接回，工具也会立即返回并补上思考期间的新消息。只有明确没说完、你确实要等下文时，才用普通 messages 长等待。\n\n`;
     // MARKER: pre-sleep-hint-follows-flag —— 这段提示必须和 preSleepWaitEnabled 保持一致。

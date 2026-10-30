@@ -327,11 +327,31 @@ export function buildSlangContext(entries, max = 8, key = '') {
   }
   const confirmedList = ordered.slice(0, limit);
   if (!confirmedList.length) return '';
+  // MARKER: slang-slim —— 2026-10-30 减负
+  // 实测 group:201188739 的黑话表 12 条要 1621 字符，最长一条（「大肥鱼」）223 字：
+  // 释义里连「同源叫法还有…，都是这群自己起的鱼系绰号」都写进去了。
+  // 黑话表是常驻块，一条 200 字等于吃掉两条语录的位置。
+  //
+  // 压缩策略（不删词、不删条数，只裁长）：
+  //   · 释义保留前 MEANING_MAX 字，超出用「…」收 —— 释义的第一句通常就是定义，后面是发挥；
+  //   · 用法保留前 USAGE_MAX 字；
+  //   · 例句只在整行还不到 LINE_MAX 时才加，否则丢掉（例句是三者里最可省的）。
+  // 为什么不做语义重写：state/slang.json 有 1200 条，逐条重写要过一遍模型，
+  // 而收益只有 200~400 字符，不划算。裁长是确定性的，可单测。
+  const MEANING_MAX = 64;
+  const USAGE_MAX = 28;
+  const LINE_MAX = 110;
+  const cut = (s, max) => {
+    const t = String(s ?? '');
+    return t.length <= max ? t : t.slice(0, max) + '…';
+  };
   const lines = confirmedList.map((e) => {
     const clean = (s) => escapeLearnerText(String(s ?? '').replace(/\[CQ:/gi, '[CQ：'));
-    let line = `- ${clean(e.content)}：${clean(e.meaning)}`;
-    if (e.usage) line += `（用法：${clean(e.usage)}）`;
-    if (e.example) line += `（例：${clean(e.example)}）`;
+    let line = `- ${clean(e.content)}：${cut(clean(e.meaning), MEANING_MAX)}`;
+    if (e.usage) line += `（用法：${cut(clean(e.usage), USAGE_MAX)}）`;
+    if (e.example && line.length + String(e.example).length + 4 <= LINE_MAX) {
+      line += `（例：${clean(e.example)}）`;
+    }
     return line;
   });
   return `【群聊黑话表】群里已确认/常用的网络用语和梗（按出现次数排序，知道即可，不要刻意堆砌）：\n${lines.join('\n')}`;
