@@ -280,5 +280,42 @@ const owlDays = ['2026-10-30', '2026-10-31', '2026-11-01', '2026-11-02', '2026-1
 ok('八天里确实有熬夜日', owlDays.length >= 1);
 ok('熬夜日带可观察后果', owlDays.every((d) => Boolean(d.owlTell)));
 
+console.log('【14】日程模式挑选（chance 不该被兜底吃掉）');
+const mk = (regimes) => normalizeWorld({ ...WORLD_V4, regimes });
+const BLK = [{ from: '06:00', to: '22:00', where: '书房', doing: '干活', body: '', interruptible: 0.6 }];
+const STEADY = mk([
+  { id: 'workday', label: '工作日', days: [1, 2, 3, 4, 5], blocks: BLK },
+  { id: 'weekend', label: '周末', days: [6, 0], blocks: [{ from: '08:00', to: '22:00', where: '客厅', doing: '闲着', body: '', interruptible: 0.9 }] }
+]);
+ok('周五选到 workday', pickRegime(STEADY, '2026-10-30')?.id === 'workday');
+ok('周六选到 weekend', pickRegime(STEADY, '2026-10-31')?.id === 'weekend');
+ok('周日选到 weekend', pickRegime(STEADY, '2026-11-01')?.id === 'weekend');
+ok('非法 dayKey 返回 null', pickRegime(STEADY, '不是日期') === null);
+const ONLY_SAT = mk([{ id: 'only-sat', label: '只在周六', days: [6], blocks: BLK }]);
+ok('没有匹配星期几的模式返回 null', pickRegime(ONLY_SAT, '2026-10-30') === null);
+const COND0 = mk([{ id: 'c0', label: '不可能', days: [5], chance: 0, blocks: BLK }]);
+ok('条件型 chance=0 永远不选（不再兜底选中）', pickRegime(COND0, '2026-10-30') === null);
+const COND1 = mk([{ id: 'c1', label: '必中', days: [5], chance: 1, blocks: BLK }]);
+ok('条件型 chance=1 一定选中', pickRegime(COND1, '2026-10-30')?.id === 'c1');
+const MIX = mk([
+  { id: 'steady', label: '常驻', days: [5], blocks: BLK },
+  { id: 'cond', label: '条件', days: [5], chance: 0, blocks: [{ from: '08:00', to: '22:00', where: '客厅', doing: 'y', body: '', interruptible: 0.9 }] }
+]);
+ok('常驻型优先于条件型', pickRegime(MIX, '2026-10-30')?.id === 'steady');
+
+// 删掉 market-day 之后，连算 14 天必须天天满骨架（没有只有一格的怪日子、也不能断缝）
+const bad = [];
+for (let i = 0; i < 14; i += 1) {
+  const dk = new Date(Date.UTC(2026, 9, 30 + i, 4, 0, 0)).toISOString().slice(0, 10);
+  const d = buildLocalDay(WORLD_V4, { dayKey: dk, plans: [] });
+  if (!d.regimeId) bad.push(dk + ' 没日型');
+  if (d.slots.length < 5) bad.push(dk + ' 只 ' + d.slots.length + ' 格');
+  for (let j = 1; j < d.slots.length; j += 1) {
+    if (d.slots[j].fromMin !== d.slots[j - 1].toMin) bad.push(dk + ' 第' + j + ' 格断缝');
+  }
+}
+ok('十四天骨架无空洞、无断缝、每天都有日型', bad.length === 0);
+if (bad.length) console.log('   → ' + bad.join('；'));
+
 console.log(`\n结果：${pass} 过 / ${fail} 挂`);
 process.exit(fail ? 1 : 0);

@@ -180,19 +180,33 @@ export function periodOf(hhmm) {
 
 /**
  * 今天用哪个日程模式。
- * 顺序：exceptions 指定的 > 星期几匹配的 > 兜底取第一个。
- * chance < 1 的模式（如买菜日）按日期种子掷一次，掷不中就当它不存在。
+ *
+ * 顺序：先按星期几筛候选；常驻型（chance >= 1）优先；
+ * 只有条件型时按日期种子掷一次，掷中才算数。
+ *
+ * MARKER: regime-chance —— 旧实现是
+ *   const usable = candidates.filter((r) => r.chance >= 1 || rnd() < r.chance);
+ *   const pool = usable.length ? usable : candidates;
+ * 兜底把「掷不中的条件型」又放回候选，而 pool[0] 永远取到排在前面的
+ * 常驻型 —— 等于把 chance 当摆设。实测「买菜日（chance 0.5）」连算 14 天一次没选中；
+ * 而且它 blocks 为空、只有一条 insert，真选中反而会得到「只有一格的一天」。
+ * 现在没有条件型模式了；以后真要加，必须同时给它一份完整 blocks。
  */
 export function pickRegime(world, dayKey, now = Date.now()) {
   const regimes = regimesOf(world);
   if (!regimes.length) return null;
-  const weekday = new Date(dayStartOf(dayKey) || now).getDay();
-  const rnd = rngOf(seedOf(dayKey, 'regime'));
+  const start = dayStartOf(dayKey);
+  // dayKey 非法就明确放弃，不偷偷用运行时日期去猜星期几（会不确定）。
+  if (!Number.isFinite(start)) return null;
+  const weekday = new Date(start).getDay();
   const candidates = regimes.filter((r) => r.days.includes(weekday));
-  const usable = candidates.filter((r) => r.chance >= 1 || rnd() < r.chance);
-  const pool = usable.length ? usable : candidates;
-  if (!pool.length) return regimes[0];
-  return pool[0];
+  // 没有匹配当天星期几的模式，就说没有 —— 不要乱选一个不适用的日型。
+  if (!candidates.length) return null;
+  const steady = candidates.filter((r) => num(r.chance, 1, { min: 0, max: 1 }) >= 1);
+  if (steady.length) return steady[0];
+  const rnd = rngOf(seedOf(dayKey, 'regime'));
+  const rolled = candidates.filter((r) => rnd() < num(r.chance, 0, { min: 0, max: 1 }));
+  return rolled.length ? rolled[0] : null;
 }
 
 /**
