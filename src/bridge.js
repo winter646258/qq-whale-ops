@@ -1301,6 +1301,33 @@ function loadConfig() {
     cfg.dsh.reasoningEffort = REASONING_EFFORT_DEFAULT;
   }
 
+  // MARKER: vision-cfg
+  // 视觉/转写的模型渠道必须独立于 dsh.provider。
+  // 2026-10-30 事故：config.json 里明明写了 vision.provider='our-free-model'，
+  // 但代码从来没有把这个块读进 cfg（全文件 0 处 `cfg.vision =`），
+  // ensureVisionSession 于是落到 `cfg.dsh.provider`。provider-switch 一降级到
+  // loomy/trae/raccoon，dots-studio / nvidia 那两个模型就不在该渠道里，
+  // selectModel 返回 session/model-unavailable，两条兜底模型同时挂，识图整条链死。
+  // 这里把 vision 正式并入 cfg，并把默认渠道钉死在 our-free-model。
+  // providerByModel 允许按模型单独指定渠道（模型名本身带斜杠，不能靠切分猜）。
+  cfg.vision = {
+    enabled: true,
+    provider: 'our-free-model',
+    providerByModel: {},
+    models: [
+      'dots-studio/dots-3-note-preview:free',
+      'nvidia/nemotron-3.5-super-vl:free'
+    ],
+    preset: '',
+    timeoutMs: 90000,
+    cacheTtlMs: 604800000,
+    maxImagesPerMessage: 3,
+    ...(file.vision ?? {})
+  };
+  if (!cfg.vision.providerByModel || typeof cfg.vision.providerByModel !== 'object') {
+    cfg.vision.providerByModel = {};
+  }
+
   // 人格卡注入上限（字符）。历史硬编码 6000，现在可配：每条约 4~6k token 的成本护栏。
   cfg.role = { maxInjectChars: ROLE_INJECT_MAX_CHARS_DEFAULT, ...(file.role ?? {}) };
   roleInjectMaxChars = applyRoleInjectLimit(cfg.role.maxInjectChars);
@@ -3125,6 +3152,22 @@ async function main() {
     }
   }
 
+  /**
+   * 视觉模型走哪个渠道。
+   *
+   * 绝不能回落到 cfg.dsh.provider —— 那个值会被 provider-switch 改来改去，
+   * 而视觉模型只挂在特定渠道上（dots-studio / nvidia 系在 our-free-model）。
+   * 回落就是 2026-10-30 那次「识图又崩了」的直接原因。
+   */
+  function visionProviderFor(model) {
+    const byModel = cfg.vision?.providerByModel ?? {};
+    const hit = byModel[String(model ?? '')];
+    if (typeof hit === 'string' && hit.trim()) return hit.trim();
+    const own = String(cfg.vision?.provider ?? '').trim();
+    if (own) return own;
+    return 'our-free-model';
+  }
+
   async function ensureVisionSession(model) {
     const known = visionSessionIds.get(model);
     if (known) {
@@ -3147,7 +3190,7 @@ async function main() {
     api.events.follow(sessionId);
     unwrap(await api.sessions.selectModel({
       sessionId,
-      provider: String(cfg.vision?.provider || cfg.dsh?.provider || 'our-free-model'),
+      provider: visionProviderFor(model),
       model
     }), 'vision selectModel');
     learnerSessions.add(sessionId);
