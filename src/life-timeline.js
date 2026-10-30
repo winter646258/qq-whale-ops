@@ -605,6 +605,28 @@ export function lifeMomentLine(day, now = Date.now()) {
   }
 }
 
+/**
+ * 此刻的注意力档位 —— 给 pacing 的 rhythm 用。
+ * MARKER: attention-of —— pacing.js 里五档 rhythm 一直有 occupied(0.7)，但从来没人写进去，
+ * 所以她「在书房正经干活」和「在客厅窝着」对主动频率的影响完全一样，这不合理。
+ * 这里把生活线声明翻成一个档位，桥那边当 override 传给 rhythmOf。
+ * 只覆盖白天：phoneFocused（有人刚说话）和 asleep（半夜）仍由时间戳决定，优先级更高。
+ */
+export function attentionOf(day, now = Date.now()) {
+  try {
+    const slot = slotAt(day, now);
+    if (!slot) return '';
+    const doing = str(slot.doing, 60);
+    const where = str(slot.where, 12);
+    if (/睡|赖着|午睡/.test(doing) && where === '里间') return 'asleep';
+    const it = num(slot.interruptible, 0.8, { min: 0, max: 1 });
+    if (it <= 0.45) return 'occupied';
+    if (it <= 0.65) return 'available';
+    return 'available';
+  } catch {
+    return '';
+  }
+}
 /** 给调试脚本看的一行摘要。 */
 export function summarizeDay(day) {
   if (!day) return '(空)';

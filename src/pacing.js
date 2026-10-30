@@ -143,7 +143,7 @@ export function densityOf(recentMessages, now = Date.now(), cfg = PACING_DEFAULT
  *   4. 其余               → available
  *   从没说过话（没有信号）→ resting × restMultiplier 兜底，绝不按 available 算。
  */
-export function rhythmOf({ lastIncomingAt = 0, now = Date.now(), hour, cfg = PACING_DEFAULTS } = {}) {
+export function rhythmOf({ lastIncomingAt = 0, now = Date.now(), hour, attention = '', cfg = PACING_DEFAULTS } = {}) {
   const table = cfg.rhythm ?? PACING_DEFAULTS.rhythm;
   const focusWin = Math.max(0, num(cfg.focusWindowMs, PACING_DEFAULTS.focusWindowMs));
   const ttl = Math.max(focusWin, num(cfg.rhythmTtlMs, PACING_DEFAULTS.rhythmTtlMs));
@@ -157,6 +157,14 @@ export function rhythmOf({ lastIncomingAt = 0, now = Date.now(), hour, cfg = PAC
     return { level: 'resting', multiplier: round3(mult), idleMs: null, stale: true };
   }
   if (idle <= focusWin) return { level: 'phoneFocused', multiplier: round3(num(table.phoneFocused, 1.4)), idleMs: idle, stale: false };
+  // MARKER: attention-override —— 生活线声明优先于纯时间戳推算。
+  // 她正在书房正经干活（interruptible<=0.45）就该按 occupied 走，而不是因为
+  // 两小时没人说话就被判成 resting；反过来「躺在床上没睡着」本来就和 asleep 同频。
+  // 只认 occupied/asleep 两档（其余交给下面按时间戳的判定），半夜睡着那条仍然最硬。
+  const att = String(attention || '');
+  if (att === 'occupied' && !(h >= 23 || h < 8)) {
+    return { level: 'occupied', multiplier: round3(num(table.occupied, 0.7)), idleMs: idle, stale: false, source: 'life' };
+  }
   if (h >= 23 || h < 8) return { level: 'asleep', multiplier: round3(num(table.asleep, 0.15)), idleMs: idle, stale: false };
   if (idle > ttl) return { level: 'resting', multiplier: round3(num(table.resting, 0.5)), idleMs: idle, stale: true };
   return { level: 'available', multiplier: round3(num(table.available, 1)), idleMs: idle, stale: false };
@@ -167,10 +175,10 @@ export function rhythmOf({ lastIncomingAt = 0, now = Date.now(), hour, cfg = PAC
  * 热闹时更勤、深夜/久无人语时更懒，但夹在 [minDelayMs, base × maxDelayStretch] 之间，
  * 避免一次算出「3 秒后叫她」或「明天早上」。
  */
-export function urgeDelay({ baseMs, recentMessages = [], lastIncomingAt = 0, now = Date.now(), hour, cfg = PACING_DEFAULTS } = {}) {
+export function urgeDelay({ baseMs, recentMessages = [], lastIncomingAt = 0, now = Date.now(), hour, attention = '', cfg = PACING_DEFAULTS } = {}) {
   const base = Math.max(1000, num(baseMs, 1000));
   const d = densityOf(recentMessages, now, cfg);
-  const r = rhythmOf({ lastIncomingAt, now, hour, cfg });
+  const r = rhythmOf({ lastIncomingAt, now, hour, attention, cfg });
   const factor = Math.max(0.15, d.factor * r.multiplier);
   const min = Math.max(1000, num(cfg.minDelayMs, PACING_DEFAULTS.minDelayMs));
   const stretch = Math.max(1, num(cfg.maxDelayStretch, PACING_DEFAULTS.maxDelayStretch));
@@ -231,12 +239,12 @@ export function rollSkip({ level = 'available', cfg = PACING_DEFAULTS, random = 
  * 关键点：只在「她确实又说过话」之后才重掷，所以被跳过的消息不会无限累积，
  * 她一回话计数就归零。
  */
-export function skipDecision({ st = {}, reason = null, now = Date.now(), hour, cfg = PACING_DEFAULTS, random = Math.random } = {}) {
+export function skipDecision({ st = {}, reason = null, now = Date.now(), hour, attention = '', cfg = PACING_DEFAULTS, random = Math.random } = {}) {
   const lastReply = Math.max(0, num(st.lastAiReplyAt, 0));
   let rolledAt = Math.max(0, num(st.skipRolledAt, 0));
   let target = Math.max(0, num(st.skipTarget, 0));
   let seen = Math.max(0, num(st.skipSeen, 0)) + 1;
-  const rhythm = rhythmOf({ lastIncomingAt: st.lastIncomingAt, now, hour, cfg });
+  const rhythm = rhythmOf({ lastIncomingAt: st.lastIncomingAt, now, hour, attention, cfg });
   let rolled = false;
   if (lastReply > rolledAt) {
     target = rollSkip({ level: rhythm.level, cfg, random });

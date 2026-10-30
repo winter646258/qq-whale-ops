@@ -140,7 +140,7 @@ import { archivePath, clampDays, decodeLine, encodeRecord, formatRecall, history
 // 世界层 §4 生活线：world.json（她的住处/作息/日程模式）+ life-timeline.js（今天每一格）。
 // 世界层只当数据库用，不进提示词的只有世界本身；进提示词的是「此刻那一格」。
 import { readWorld } from './world.js';
-import { ensureDay, lifeMomentLine, readTimeline } from './life-timeline.js';
+import { attentionOf, ensureDay, lifeMomentLine, readTimeline } from './life-timeline.js';
 import { moodDaysCfg, moodTrendLine, pruneMoodDays, recordMoodDay } from './mood-days.js';
 import { buildThreadsAsk, threadsCfg, threadsLine, summarizeThreads, addThreads, dueThreads, markAsked, pruneThreads, resolveThreads } from './threads.js';
 import { buildWishesAsk, wishesCfg, wishesLine, summarizeWishes, addWishes, completeWishes, pruneWishes } from './wishes.js';
@@ -4411,6 +4411,24 @@ async function main() {
       return null;
     }
   }
+  // 此刻的注意力档（occupied / asleep / ''）—— 只读，不写文件、不重排。
+  // 拿不到就返回空串，pacing 完全按原来的时间戳逻辑走。
+  function lifeAttentionNow(now = Date.now()) {
+    try {
+      const world = worldStore();
+      if (!world) return '';
+      const store = readTimeline(STATE_DIR);
+      const key = lifeCfg(cfg).switchHour != null
+        ? lifeDayFor(now, { switchHour: lifeCfg(cfg).switchHour }).today
+        : new Date(now).toISOString().slice(0, 10);
+      const day = store?.days?.[key];
+      if (!day) return '';
+      return attentionOf(day, now);
+    } catch {
+      return '';
+    }
+  }
+
   function lifeTimelineFor(now = Date.now(), { force = false, dayKey = '' } = {}) {
     const lc = lifeCfg(cfg);
     const world = worldStore();
@@ -13349,7 +13367,7 @@ async function generateImageNow({ prompt, size }) {
     const pc = pacingCfg(cfg);
     if (!pc.enabled || pc.skip?.enabled === false) return reason;
     const now = Date.now();
-    const d = skipDecision({ st, reason, now, hour: new Date(now).getHours(), cfg: pc, random: Math.random });
+    const d = skipDecision({ st, reason, now, hour: new Date(now).getHours(), attention: lifeAttentionNow(now), cfg: pc, random: Math.random });
     st.skipSeen = d.seen;
     st.skipTarget = d.target;
     st.skipRolledAt = d.rolledAt;
@@ -14652,6 +14670,7 @@ async function generateImageNow({ prompt, size }) {
         recentMessages: st.recentMessages,
         lastIncomingAt: st.lastIncomingAt,
         now: nowMs,
+        attention: lifeAttentionNow(nowMs),
         cfg: pacingCfg(cfg)
       });
       delay = urge.delay;

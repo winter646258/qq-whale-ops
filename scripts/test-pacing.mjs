@@ -175,4 +175,23 @@ ok('她再说话之后重新掷骰（rolledAt 追上）', () => {
   assert.equal(d.rolledAt, NOW);
 });
 
+
+// MARKER: attention-test - 生活线声明应当压过纯时间戳推算
+// ok(name, fn) 第二个参数必须是函数，所以每条都包成 () => assert...
+const T_DAY = Date.UTC(2026, 9, 30, 6, 0, 0);
+const ATTN = (att, hour, idleMs) => rhythmOf({
+  lastIncomingAt: idleMs === null ? 0 : T_DAY - idleMs,
+  now: T_DAY, hour, attention: att, cfg: PACING_DEFAULTS
+});
+ok('attention=occupied -> occupied 档', () => assert.equal(ATTN('occupied', 14, 3 * 3600 * 1000).level, 'occupied'));
+ok('occupied 倍率 0.7', () => assert.equal(ATTN('occupied', 14, 3 * 3600 * 1000).multiplier, 0.7));
+ok('没人说过话时仍是 resting（occupied 不越过 stale 判定）', () => assert.equal(ATTN('occupied', 14, null).level, 'resting'));
+ok('刚有人说话时 phoneFocused 优先', () => assert.equal(ATTN('occupied', 14, 60000).level, 'phoneFocused'));
+ok('半夜 asleep 优先于 occupied', () => assert.equal(ATTN('occupied', 2, 30 * 60 * 1000).level, 'asleep'));
+ok('不传 attention 时行为不变（resting）', () => assert.equal(ATTN('', 14, 3 * 3600 * 1000).level, 'resting'));
+ok('urgeDelay 认 attention', () => assert.equal(urgeDelay({
+  baseMs: 600000, recentMessages: [], lastIncomingAt: T_DAY - 3 * 3600 * 1000,
+  now: T_DAY, hour: 14, attention: 'occupied', cfg: PACING_DEFAULTS
+}).rhythm, 'occupied'));
+
 console.log(`\n${pass} 项通过${process.exitCode ? '（有失败）' : ''}`);
