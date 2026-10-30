@@ -32,7 +32,7 @@ import { normalizeImageForModel } from './media-normalize.js';
 // 视频抽帧拼图：把视频变成几张带时序的拼图，再走图片那条现成管线。
 import { normalizeVideoForModel } from './video-frames.js';
 import { createBiliDirect } from './bili-direct.js';
-import { watchBiliVideo } from './bili-watch.js';
+import { WATCH_DEFAULTS, watchBiliVideo } from './bili-watch.js';
 import { browseRound, browsePromptLine, readBrowse, writeBrowse } from './bili-browse.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { TTS_DEFAULTS as TTS_DEF, readEnvValue as readTtsEnvValue, splitSpeechText as splitTtsText, synthesize as ttsSynthesize, downloadTtsAudio as ttsDownload } from './tts.js';
@@ -7803,7 +7803,17 @@ async function biliBrowseTick() {
     log('[bili-browse] 开始刷一轮…');
     const r = await browseRound({
       client: biliClient(),
-      watch: (args) => biliHelpers.watchVideo(args),
+      // biliHelpers 只是下面 helpers 容器的键名，不是变量（原来写 biliHelpers.watchVideo
+      // 每次都在这里抛 ReferenceError: biliHelpers is not defined，线上 2026-10-30 12:14 实证）。
+      // 这里直接调导入的函数，与 biliHelpers.watchVideo 的实现保持同一份。
+      // 展开顺序很重要：依赖放在 args 之后，免得将来调用方多传一个 direct/log 把它们覆盖掉。
+      // maxBytes 显式给：不传就只有 bili-watch 的内部默认，调用方看不出来上限是多少。
+      watch: (args) => watchBiliVideo({
+        ...(args || {}),
+        direct: biliDirect(),
+        log: (m) => log(m),
+        maxBytes: Number(args && args.maxBytes) || WATCH_DEFAULTS.maxBytes
+      }),
       log,
       cfg: bc
     });
