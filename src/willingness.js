@@ -49,6 +49,14 @@ export const WILLINGNESS_DEFAULTS = Object.freeze({
   asleepProbabilityMultiplier: 0.2,
   /** 回复后要再观察到几条消息才重新参与评分。 */
   jitter: Object.freeze({ quiet: [1, 9], reserved: [1, 7], normal: [0, 6], active: [0, 4], eager: [0, 3] }),
+  /**
+   * 回复后最少要隔多少**秒**才重新参与评分。
+   *
+   * 只按「条数」抖是不够的：真实群聊是爆发式的（2026-10-30 实测某群半分钟涌进
+   * 20 条），这时候「再跳 6 条」等于没跳 —— 6 条在 30 秒内就过去了，她会连着插话。
+   * 时间维度才是人的感受：刚说完话，接下来的一两分钟就是不想开口。
+   */
+  cooldownSeconds: Object.freeze({ quiet: 240, reserved: 180, normal: 90, active: 60, eager: 30 }),
   /** 没配关键词时，replyCost 之后最少要隔几条消息。 */
   minGapAfterReply: 0,
   /**
@@ -128,7 +136,7 @@ export function resolveWillingness(cfg) {
 }
 
 export function emptyWillingnessState(now = 0) {
-  return { score: 0, updatedAt: Number(now) || 0, skipCount: 0 };
+  return { score: 0, updatedAt: Number(now) || 0, skipCount: 0, lastReplyAt: 0 };
 }
 
 /**
@@ -150,7 +158,8 @@ export function decayWillingness(previous, cfg, now) {
   return {
     score: decayed < 0.001 ? 0 : round4(decayed),
     updatedAt: t,
-    skipCount: Math.max(0, Math.floor(Number(prev?.skipCount) || 0))
+    skipCount: Math.max(0, Math.floor(Number(prev?.skipCount) || 0)),
+    lastReplyAt: Math.max(0, Number(prev?.lastReplyAt) || 0)
   };
 }
 
@@ -182,6 +191,21 @@ export function evaluateWillingness(previous, cfg, input = {}) {
   // 明确在叫她：直通。不清零 skipCount（一次 @ 不该重置整段抖动周期）。
   if (isForcedReason(wakeReason, cfg)) {
     return { ...base, shouldCall: true, probability: 1, reason: 'forced' };
+  }
+
+  // 回复后的时间冷却：刚说完话接下来一两分钟就是不想开口。
+  // 只看条数不够——群里半分钟能涌进 20 条，「再跳 6 条」根本挡不住。
+  const coolTable = cfg?.cooldownSeconds ?? WILLINGNESS_DEFAULTS.cooldownSeconds;
+  const cool = Math.max(0, Number(coolTable[conf.tier]) || 0) * 1000;
+  const lastReply = Math.max(0, Number(state.lastReplyAt) || 0);
+  if (cool > 0 && lastReply > 0 && now > 0 && now - lastReply < cool) {
+    return {
+      ...base,
+      shouldCall: false,
+      probability: 0,
+      reason: 'cooldown',
+      cooldownLeftMs: cool - (now - lastReply)
+    };
   }
 
   // 回复后的抖动：这几条只看不说话，把计数消耗完再重新参与评分。
@@ -243,7 +267,8 @@ export function consumeWillingness(previous, cfg, now, random = Math.random) {
   return {
     score: round4(Math.max(0, state.score - conf.replyCost)),
     updatedAt: Math.max(0, Number(now) || 0),
-    skipCount: Math.max(0, extra + Math.max(0, Math.floor(Number(cfg?.minGapAfterReply) || 0)))
+    skipCount: Math.max(0, extra + Math.max(0, Math.floor(Number(cfg?.minGapAfterReply) || 0))),
+    lastReplyAt: Math.max(0, Number(now) || 0)
   };
 }
 
@@ -255,6 +280,7 @@ export function describeWillingness(decision) {
   if (d.reason === 'disabled') return `${head} 未启用`;
   if (d.reason === 'forced') return `${head} 直通`;
   if (d.reason === 'skip') return `${head} 还要再看 ${d.state?.skipCount ?? 0} 条`;
+  if (d.reason === 'cooldown') return `${head} 刚说过话，冷却 ${Math.ceil((d.cooldownLeftMs ?? 0) / 1000)}s`;
   if (d.reason === 'below-threshold') return `${head} 差 ${d.gap ?? '?'}`;
   return `${head} 概率 ${d.probability} → ${d.shouldCall ? '说' : '不说'}`;
 }

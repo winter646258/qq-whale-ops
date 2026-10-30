@@ -77,16 +77,23 @@ ok('第一条消息不够，差得明明白白', () => {
   assert.ok(d.score > 0 && d.score < 0.62, `score=${d.score}`);
   assert.ok(String(describeWillingness(d)).includes('差'));
 });
-ok('第三条左右越过阈值', () => {
+ok('几条之内能越过阈值（不断言具体第几条，因为调档会改数）', () => {
+  const thr = resolveWillingness({ enabled: true }).threshold;
   let st = undefined;
   const scores = [];
-  for (let i = 0; i < 3; i += 1) {
+  let crossed = -1;
+  for (let i = 0; i < 12; i += 1) {
     const d = step(st);
     scores.push(d.score);
     st = d.state;
+    if (crossed < 0 && d.score > thr) crossed = i + 1;
   }
-  assert.ok(scores[0] < scores[1] && scores[1] < scores[2], `单调递增 ${scores}`);
-  assert.ok(scores[2] > 0.62, `第三条应过阈值，实得 ${scores[2]}`);
+  assert.ok(crossed > 1, `不该第一条就够，实际第 ${crossed} 条越过 ${thr}`);
+  assert.ok(crossed <= 10, `12 条内应攒够，实际第 ${crossed} 条越过 ${thr}`);
+  // 单调递增直到触及 maxScore
+  for (let i = 1; i < scores.length; i += 1) {
+    if (scores[i] < scores[i - 1] - 1e-9) assert.fail(`分数不该下降：${scores}`);
+  }
 });
 ok('边际递减：越接近满值涨得越慢', () => {
   const low = step(undefined);
@@ -96,9 +103,10 @@ ok('边际递减：越接近满值涨得越慢', () => {
   assert.ok(lowGain > highGain, `低分涨 ${lowGain} 应大于高分涨 ${highGain}`);
 });
 ok('不会超过 maxScore', () => {
-  let st = { score: 1.99, updatedAt: T0, skipCount: 0 };
-  for (let i = 0; i < 20; i += 1) st = step(st).state;
-  assert.ok(st.score <= 2 + 1e-9, `score=${st.score}`);
+  const cap = resolveWillingness({ enabled: true }).maxScore;
+  let st = { score: cap - 0.01, updatedAt: T0, skipCount: 0 };
+  for (let i = 0; i < 30; i += 1) st = step(st).state;
+  assert.ok(st.score <= cap + 1e-9, `score=${st.score} 应 <= ${cap}`);
 });
 
 console.log('\n【4】越过阈值后是概率放行，不是必然');
@@ -117,12 +125,14 @@ ok('概率封顶：攒满也不会变成必然开口', () => {
   assert.equal(d.shouldCall, false);
 });
 ok('概率随分数上升（到天花板为止）', () => {
+  const thr = resolveWillingness({ enabled: true }).threshold;
   const p = (score) => evaluateWillingness({ score, updatedAt: T0, skipCount: 0 }, { enabled: true }, {
     now: T0, messageCount: 1, reason: 'keyword:x', rhythm: 'available', random: fixed(0.99)
   }).probability;
-  assert.ok(p(0.65) < p(0.8), `${p(0.65)} 应小于 ${p(0.8)}`);
-  assert.ok(p(0.8) <= p(1.9), `${p(0.8)} 应不大于 ${p(1.9)}`);
-  assert.ok(p(1.9) <= 0.92 + 1e-9, `封顶 ${p(1.9)}`);
+  const lo = thr + 0.05;
+  const hi = thr + 0.5;
+  assert.ok(p(lo) < p(hi), `${p(lo)} 应小于 ${p(hi)}`);
+  assert.ok(p(hi) <= 0.92 + 1e-9, `封顶 ${p(hi)}`);
 });
 
 console.log('\n【5】衰减');
@@ -194,10 +204,12 @@ ok('半夜几乎不说话（档位+乘数双重收窄）', () => {
   assert.equal(night.tier, 'quiet');
 });
 ok('多个群在聊时（occupied）更收敛', () => {
-  const st = { score: 1.2, updatedAt: T0, skipCount: 0 };
+  const thr = resolveWillingness({ enabled: true }).threshold;
+  const st = { score: thr + 0.6, updatedAt: T0, skipCount: 0 };
   const free = evaluateWillingness(st, { enabled: true }, { now: T0, messageCount: 1, reason: 'keyword:x', rhythm: 'available', random: fixed(0.99) });
   const busy = evaluateWillingness(st, { enabled: true }, { now: T0, messageCount: 1, reason: 'keyword:x', rhythm: 'occupied', random: fixed(0.99) });
-  assert.ok(busy.probability < free.probability, `忙 ${busy.probability} < 闲 ${free.probability}`);
+  assert.ok(free.probability > 0, `闲时概率应大于 0，实得 ${free.probability}`);
+  assert.ok(busy.probability < free.probability, `忙 ${busy.probability} 应小于 闲 ${free.probability}`);
 });
 ok('显式数值覆盖仍然生效', () => {
   const conf = resolveWillingness({ enabled: true, threshold: 0.2, baseGain: 0.5, keywords: [' 米饭 ', '', null] });
@@ -248,4 +260,41 @@ ok('emptyWillingnessState 是零向量', () => {
   assert.equal(s.updatedAt, T0);
 });
 
+// ── 时间冷却：只按条数抖是不够的 ───────────────────────────────────────
+// 真实群聊是爆发式的，2026-10-30 实测某群半分钟涌进 20 条，
+// 「回复后再跳 6 条」在爆发场景里等于没跳，她会连着插话。
+ok('刚说完话后的时间窗口内一律不开口', () => {
+  const cfg = { enabled: true, rhythm: 'available', auto: false, tier: 'normal' };
+  const replied = consumeWillingness({ score: 3, updatedAt: 0, skipCount: 0 }, cfg, 5000000);
+  assert.ok(replied.lastReplyAt === 5000000, `lastReplyAt 应记下 ${replied.lastReplyAt}`);
+  // 同一秒内来了 20 条（爆发），一条都不许开口
+  let opens = 0;
+  for (let i = 0; i < 20; i += 1) {
+    const d = evaluateWillingness({ ...replied, skipCount: 0 }, cfg, {
+      now: 5000000 + 1000 + i * 300, messageCount: 1, reason: '', rhythm: 'available'
+    });
+    if (d.shouldCall) opens += 1;
+  }
+  assert.equal(opens, 0, '冷却期内不该开口，实得 ' + opens);
+});
+
+ok('冷却过了以后才重新参与评分', () => {
+  const cfg = { enabled: true, rhythm: 'available', auto: false, tier: 'normal' };
+  const cool = (WILLINGNESS_DEFAULTS.cooldownSeconds.normal) * 1000;
+  const replied = consumeWillingness({ score: 3, updatedAt: 0, skipCount: 0 }, cfg, 6000000);
+  // 把 skipCount 抹平，只看时间这一维
+  const d = evaluateWillingness({ ...replied, skipCount: 0 }, cfg, {
+    now: 6000000 + cool + 1000, messageCount: 1, reason: '', rhythm: 'available', random: fixed(0)
+  });
+  assert.notEqual(d.reason, 'cooldown', '过了冷却不该再是 cooldown');
+});
+
+ok('明确在叫她的不受冷却约束', () => {
+  const cfg = { enabled: true, rhythm: 'available', auto: false, tier: 'normal' };
+  const replied = consumeWillingness({ score: 3, updatedAt: 0, skipCount: 9 }, cfg, 7000000);
+  for (const r of ['private', 'atMention', 'nameMention']) {
+    const d = evaluateWillingness(replied, cfg, { now: 7000000 + 100, messageCount: 1, reason: r, rhythm: 'available' });
+    assert.equal(d.shouldCall, true, r + ' 在冷却期内也必须放行');
+  }
+});
 console.log(`\n结果：${pass} 过 / ${process.exitCode ? '有挂' : 0} 挂`);
