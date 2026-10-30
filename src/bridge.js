@@ -13554,7 +13554,13 @@ async function generateImageNow({ prompt, size }) {
       // 不该跟「纯路过」用同一把尺子。
       random: Math.random
     });
-    state = decision.state;
+    // 修（2026-10-30）：evaluateWillingness 返回的 state 来自 decayWillingness，
+    // 只带 score/updatedAt/skipCount/lastReplyAt，不含 consumedReplyAt。
+    // 直接落盘会让 consumedReplyAt 永远是 0，于是下一轮 consumeIfReplied 又判定
+    // 「她刚说过话」再扣一次 —— lastReplyAt 被刷成当前时刻，冷却永远剩满额，
+    // 结果是永久静音（线上三个群 score 恒为 0、skipCount 一直抖）。
+    // 这里把本次消费掉的 consumedReplyAt 显式带回去。
+    state = { ...decision.state, consumedReplyAt: Number(state.consumedReplyAt) || 0 };
     saveWillingnessState(key, state);
 
     if (reason) {
