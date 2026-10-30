@@ -136,6 +136,11 @@ import {
 import { ROTATE_DEFAULTS, kindOfKey, localDayOf as rotateDayOf, pruneRotateDays, rotateCfg, rotateLine, shouldRotate } from './session-rotate.js';
 import { buildContinuityAsk, composeContinuityText, continuityCfg, continuityLine, dayOf, markContinuityUsed, parseContinuityJSON, pickContinuityLines, pruneContinuity } from './continuity.js';
 import { archivePath, clampDays, decodeLine, encodeRecord, formatRecall, historyCfg, monthOf, queryArchive, toRecord } from './history-archive.js';
+// MARKER: life-timeline-import
+// 世界层 §4 生活线：world.json（她的住处/作息/日程模式）+ life-timeline.js（今天每一格）。
+// 世界层只当数据库用，不进提示词的只有世界本身；进提示词的是「此刻那一格」。
+import { readWorld } from './world.js';
+import { ensureDay, lifeMomentLine, readTimeline } from './life-timeline.js';
 import { moodDaysCfg, moodTrendLine, pruneMoodDays, recordMoodDay } from './mood-days.js';
 import { buildThreadsAsk, threadsCfg, threadsLine, summarizeThreads, addThreads, dueThreads, markAsked, pruneThreads, resolveThreads } from './threads.js';
 import { buildWishesAsk, wishesCfg, wishesLine, summarizeWishes, addWishes, completeWishes, pruneWishes } from './wishes.js';
@@ -4385,6 +4390,38 @@ async function main() {
     }
   }
 
+  // MARKER: life-timeline
+  // 生活线注入：世界层 + 今天那一格 → 一句「此刻她在哪、手上在干嘛、什么打断不了」。
+  //
+  // 为什么要这一层（2026-10-30 实测）：旧 lifeLineFor 只给「今天三条计划」，
+  // 于是上午十点和晚上十一点她说的日子一模一样，群里问「在干嘛」永远是那三条之一。
+  // 这一层给的是**此刻**，而且是确定的（同一天同一时刻问多少次都一样）。
+  //
+  // 安全网：任何异常都返回空串，由调用方回落 lifeLineFor —— 宁可少一句，
+  // 也不要让她说出自己没在干的事。
+  let lifeTimelineWarned = false;
+  function worldStore() {
+    try {
+      return readWorld(STATE_DIR, { log });
+    } catch (error) {
+      if (!lifeTimelineWarned) {
+        lifeTimelineWarned = true;
+        log(`[world] 读取失败，用默认世界：${error?.message ?? error}`);
+      }
+      return null;
+    }
+  }
+  function lifeTimelineFor(now = Date.now(), { force = false, dayKey = '' } = {}) {
+    const lc = lifeCfg(cfg);
+    const world = worldStore();
+    if (!world) return '';
+    // 默认「今天」按她的闹钟算（凌晨还没睡那种仍算前一天）；settle 重排明天时要显式传 dayKey。
+    const today = dayKey || lifeDayFor(now, { switchHour: lc.switchHour }).today;
+    const lifeStore = readLifeStore();
+    const plans = Array.isArray(lifeStore?.days?.[today]?.plans) ? lifeStore.days[today].plans : [];
+    const { day } = ensureDay(STATE_DIR, world, { dayKey: today, plans, now, log, force });
+    return lifeMomentLine(day, now);
+  }
   function readLifeStore() {
     const raw = readJsonSafe(LIFE_FILE, null);
     return raw && typeof raw === 'object' && raw.days && typeof raw.days === 'object'
@@ -4794,6 +4831,15 @@ async function main() {
             if (normalized) {
               saveLifeStore(setLifeDay(readLifeStore(), lifeTargetDay, normalized, { keepDays: lc.keepDays }));
               wroteLife = true;
+              // 计划刚写进来，那一天的排程要按新计划重排一次（否则她排的还是旧的空闲格）。
+              // force 只在这一刻用：平时绝不重排，避免同一个下午两次说法不一样。
+              try {
+                const plans = Array.isArray(normalized?.plans) ? normalized.plans : [];
+                lifeTimelineFor(Date.now(), { force: true, dayKey: lifeTargetDay });
+                log(`[life] 排程已按新计划重建：${lifeTargetDay}（${plans.length} 条）`);
+              } catch (error) {
+                log(`[life] 重建排程失败：${error?.message ?? error}`);
+              }
             }
           } catch (error) {
             log(`[life] 写入失败：${error?.message ?? error}`);
@@ -13941,7 +13987,10 @@ async function generateImageNow({ prompt, size }) {
     let lifeLineText = '';
     let moodTrendText = '';
     try {
-      if (lifeCfg(cfg).enabled) lifeLineText = lifeLineFor(readLifeStore(), Date.now());
+      if (lifeCfg(cfg).enabled) {
+        // 先试「此刻那一格」；拿不到（world 坏了/文件写不进去/还没到起床点）再回落旧的三条计划。
+        lifeLineText = lifeTimelineFor() || lifeLineFor(readLifeStore(), Date.now());
+      }
     } catch (error) {
       log(`[life] 注入失败：${error?.message ?? error}`);
     }

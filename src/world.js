@@ -12,50 +12,67 @@
 //
 // 与 state/life.json 的分工：life.json 是「今天想怎么过」（每天变），
 // world.json 是「她是个什么样的人」（常年不变）。混在一起她说话就变成播报设定。
+//
+// v2（2026-10-30）新增四块，本文件的归一化是白名单，不加进来就会被整块丢掉：
+//   regimes      日程模式（周一~周五 / 周末 / 隔两天的买菜日）
+//   exceptions   一次性例外（「楼下贴了停水通知」只改明天那一格）
+//   worldDomains 六切面世界事件种子（世界会自己往外冒事）
+//   env          现场质感池（天气 / 光线 / 气味 / 无聊池）
+//   meta / day.nightOwl / body.tail.tell / place.scale 一并接住。
 
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const WORLD_VERSION = 1;
+export const WORLD_VERSION = 2;
 export const WORLD_FILE = 'world.json';
+
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 // 文件缺失时的兜底。与 state/world.json 的初始内容一致 ——
 // 所以调用方不需要到处判空：readWorld 永远返回一个可用的对象。
 export const DEFAULT_WORLD = Object.freeze({
   version: WORLD_VERSION,
+  meta: {
+    name: '小鲸鱼的世界',
+    note: '虚构。地名、店、人都是编的。天气不走真实 API。',
+    fantasy: true,
+    weatherSource: 'derived'
+  },
   place: {
-    city: '南方潮湿小城',
-    season: '秋末，梅雨刚走，夜里凉',
+    city: '南方靠海的小城',
+    scale: '',
+    season: '秋末，雨刚停，白天十八九度，夜里有潮气',
     home: {
-      floor: 6,
+      floor: 5,
       elevator: false,
-      facing: '西',
+      facing: '东南',
       rooms: '一室一厅，大桌靠窗，床在里间，灶上只有一口小锅',
-      outside: '楼下梧桐，早餐铺的蒸汽，晚归的电动车声',
-      keepsake: '一把坐塌了的旧椅子'
+      outside: '楼下一条马路直通堤坝',
+      keepsake: '一把坐塌了的旧木椅'
     },
     places: [
-      { name: '书桌', note: '靠窗，下午晒得到太阳', noise: '楼下有人收废品' },
+      { name: '书房', note: '靠窗，关上门就是在忙', noise: '楼下有人收废品' },
       { name: '厨房', note: '一口小锅，抽油烟机有点响', noise: '水开了，锅盖在响' },
-      { name: '阳台', note: '朝西，晴天才晒被子', noise: '楼道里有脚步声' },
+      { name: '阳台', note: '朝东南，晴天才晒被子', noise: '海风把晾的东西吹得拍栏杆' },
       { name: '里间', note: '床和无靠背的凳子', noise: '冰箱压缩机启动' },
-      { name: '楼下', note: '梧桐树底，早餐铺门口', noise: '电动车从身边过去' }
+      { name: '楼下', note: '马路边，早餐铺门口', noise: '电动车从身边过去' }
     ]
   },
   body: {
     shape: '不高，圆一点',
-    tail: { length: '一米多', sleep: '侧着放，压久了会麻', cold: '怕冷不怕热' },
+    tail: { length: '一米出头', sleep: '侧着放，压久了会麻', cold: '怕冷不怕热', tell: '' },
     habits: ['怕静电', '被拎尾巴会炸', '洗完澡要擦很久']
   },
   day: {
-    wake: '08:00',
+    wake: '06:00',
     sleep: '00:30',
-    meals: { morning: '常省', noon: '认真做', evening: '随便' },
+    nightOwl: { probability: 0.2, latestSleep: '03:00', wakeShiftHours: 2, tell: '' },
+    meals: { morning: '认真吃', noon: '认真做', evening: '随便' },
     rituals: ['隔天买菜', '晴天才晒被子']
   },
   hobbies: [
     { name: '拼图', note: '一千片的那种，拼到一半就搁着', hours: '夜里' },
-    { name: '看比赛', note: '只看关键的，看不懂战术', hours: '' },
+    { name: '刷视频', note: '一刷就停不下来', hours: '夜里' },
     { name: '煎鱼', note: '一直没学会，总破皮', hours: '', aspiration: true }
   ],
   livelihood: '在家接零散的活，改图、写点东西，不富裕但够用',
@@ -63,7 +80,12 @@ export const DEFAULT_WORLD = Object.freeze({
     awareness: 'half',
     knows: ['自己是被造出来的', '主人是认识很久的人'],
     notCare: ['自己是什么型号', '参数多少']
-  }
+  },
+  regimes: [],
+  exceptions: [],
+  worldDomains: [],
+  worldEventRules: { fabricateRealPeople: false, blockedNames: [], channels: [], forbidden: [] },
+  env: { weatherPool: [], weatherBanned: [], lightByPeriod: {}, smellPool: [], boringPool: [] }
 });
 
 function str(value, max = 120) {
@@ -94,88 +116,258 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function obj(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function timeOr(value, fallback) {
+  const s = str(value, 5);
+  return HHMM.test(s) ? s : fallback;
+}
+
+/** 每分钟数，只用来比较顺序；非法返回 -1。 */
+export function minuteOf(hhmm) {
+  const s = str(hhmm, 5);
+  if (!HHMM.test(s)) return -1;
+  const [h, m] = s.split(':');
+  return Number(h) * 60 + Number(m);
+}
+
 /**
  * 把磁盘上的（或模型给的）任意形状洗成可用形状。
  * 原则：**宁可少一条，也不要一条坏的** —— 坏数据会直接变成她嘴里的假话。
  */
 export function normalizeWorld(raw) {
   const d = DEFAULT_WORLD;
-  const v = raw && typeof raw === 'object' ? raw : {};
-  const place = v.place && typeof v.place === 'object' ? v.place : {};
-  const home = place.home && typeof place.home === 'object' ? place.home : {};
-  const body = v.body && typeof v.body === 'object' ? v.body : {};
-  const tail = body.tail && typeof body.tail === 'object' ? body.tail : {};
-  const day = v.day && typeof v.day === 'object' ? v.day : {};
-  const meals = day.meals && typeof day.meals === 'object' ? day.meals : {};
-  const self = v.self && typeof v.self === 'object' ? v.self : {};
+  const v = obj(raw);
+  const meta = obj(v.meta);
+  const place = obj(v.place);
+  const home = obj(place.home);
+  const body = obj(v.body);
+  const tail = obj(body.tail);
+  const day = obj(v.day);
+  const nightOwl = obj(day.nightOwl);
+  const meals = obj(day.meals);
+  const self = obj(v.self);
 
   const places = [];
   for (const item of Array.isArray(place.places) ? place.places : d.place.places) {
-    const obj = item && typeof item === 'object' ? item : { name: item };
-    const name = str(obj.name, 12);
+    const o = item && typeof item === 'object' ? item : { name: item };
+    const name = str(o.name, 12);
     if (!name) continue;
     if (places.some((p) => p.name === name)) continue;
-    places.push({ name, note: str(obj.note, 40), noise: str(obj.noise, 40) });
-    if (places.length >= 8) break;
+    places.push({ name, note: str(o.note, 60), noise: str(o.noise, 60) });
+    if (places.length >= 12) break;
   }
+  const finalPlaces = places.length ? places : clone(d.place.places);
+  const placeNames = new Set(finalPlaces.map((p) => p.name));
 
   const hobbies = [];
   for (const item of Array.isArray(v.hobbies) ? v.hobbies : d.hobbies) {
-    const obj = item && typeof item === 'object' ? item : { name: item };
-    const name = str(obj.name, 12);
+    const o = item && typeof item === 'object' ? item : { name: item };
+    const name = str(o.name, 12);
     if (!name) continue;
     if (hobbies.some((h) => h.name === name)) continue;
     hobbies.push({
       name,
-      note: str(obj.note, 50),
-      hours: str(obj.hours, 8),
-      aspiration: obj.aspiration === true
+      note: str(o.note, 60),
+      hours: str(o.hours, 8),
+      aspiration: o.aspiration === true
     });
-    if (hobbies.length >= 12) break;
+    if (hobbies.length >= 16) break;
   }
 
   const awareness = str(self.awareness, 8);
 
+  // ---- regimes：日程模式。where 不在 places 里的整格丢掉（宁可少一格，也不让她去不存在的地方）
+  const regimes = [];
+  for (const item of Array.isArray(v.regimes) ? v.regimes : []) {
+    const r = obj(item);
+    const id = str(r.id, 24);
+    if (!id) continue;
+    if (regimes.some((x) => x.id === id)) continue;
+    const days = [];
+    for (const dv of Array.isArray(r.days) ? r.days : []) {
+      const n = Number(dv);
+      if (Number.isInteger(n) && n >= 0 && n <= 6 && !days.includes(n)) days.push(n);
+    }
+    const blocks = [];
+    for (const bv of Array.isArray(r.blocks) ? r.blocks : []) {
+      const b = obj(bv);
+      const from = timeOr(b.from, '');
+      const to = timeOr(b.to, '');
+      const where = str(b.where, 12);
+      if (!from || !to) continue;
+      if (!where || !placeNames.has(where)) continue;
+      blocks.push({
+        from,
+        to,
+        where,
+        doing: str(b.doing, 60),
+        body: str(b.body, 60),
+        interruptible: num(b.interruptible, 0.8, { min: 0, max: 1 })
+      });
+      if (blocks.length >= 24) break;
+    }
+    const insertIn = obj(r.insert);
+    const insert = timeOr(insertIn.from, '') && timeOr(insertIn.to, '') && placeNames.has(str(insertIn.where, 12))
+      ? {
+        from: timeOr(insertIn.from, ''),
+        to: timeOr(insertIn.to, ''),
+        where: str(insertIn.where, 12),
+        doing: str(insertIn.doing, 60),
+        body: str(insertIn.body, 60),
+        interruptible: num(insertIn.interruptible, 0.9, { min: 0, max: 1 })
+      }
+      : null;
+    regimes.push({
+      id,
+      label: str(r.label, 24),
+      days,
+      chance: num(r.chance, 1, { min: 0, max: 1 }),
+      blocks,
+      insert
+    });
+    if (regimes.length >= 8) break;
+  }
+
+  // ---- exceptions：一次性例外。形状留全，具体条目由世界事件或她自己的话生成
+  const exceptions = [];
+  for (const item of Array.isArray(v.exceptions) ? v.exceptions : []) {
+    const e = obj(item);
+    const id = str(e.id, 32);
+    const date = str(e.date, 10);
+    if (!id || !/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+    const patch = obj(e.patch);
+    const where = str(patch.where, 12);
+    exceptions.push({
+      id,
+      date,
+      kind: ['modify', 'skip', 'insert'].includes(str(e.kind, 8)) ? str(e.kind, 8) : 'modify',
+      target: str(e.target, 24),
+      note: str(e.note, 80),
+      reason: str(e.reason, 60),
+      patch: {
+        from: timeOr(patch.from, ''),
+        to: timeOr(patch.to, ''),
+        where: where && placeNames.has(where) ? where : '',
+        doing: str(patch.doing, 60),
+        body: str(patch.body, 60)
+      }
+    });
+    if (exceptions.length >= 60) break;
+  }
+
+  // ---- worldDomains：六切面种子
+  const worldDomains = [];
+  for (const item of Array.isArray(v.worldDomains) ? v.worldDomains : []) {
+    const dm = obj(item);
+    const key = str(dm.key, 24);
+    if (!key) continue;
+    if (worldDomains.some((x) => x.key === key)) continue;
+    worldDomains.push({
+      key,
+      label: str(dm.label, 16),
+      seeds: list(dm.seeds, 20)
+    });
+    if (worldDomains.length >= 10) break;
+  }
+
+  // ---- worldEventRules：硬边界。默认就禁止编真人，写错也翻不回来
+  const rules = obj(v.worldEventRules);
+  const worldEventRules = {
+    fabricateRealPeople: false,
+    note: str(rules.note, 120),
+    blockedNames: list(rules.blockedNames, 24),
+    channels: list(rules.channels, 12),
+    forbidden: list(rules.forbidden, 12)
+  };
+
+  // ---- env：现场质感池
+  const env = obj(v.env);
+  const weatherPool = [];
+  for (const item of Array.isArray(env.weatherPool) ? env.weatherPool : []) {
+    const w = obj(item);
+    const kind = str(w.kind, 8);
+    if (!kind) continue;
+    if (weatherPool.some((x) => x.kind === kind)) continue;
+    weatherPool.push({ kind, temp: str(w.temp, 12), note: str(w.note, 40) });
+    if (weatherPool.length >= 10) break;
+  }
+  const lightByPeriod = {};
+  for (const [k, val] of Object.entries(obj(env.lightByPeriod))) {
+    const key = str(k, 8);
+    const s = str(val, 60);
+    if (key && s) lightByPeriod[key] = s;
+  }
+
   return {
     version: WORLD_VERSION,
+    meta: {
+      name: str(meta.name, 24) || d.meta.name,
+      note: str(meta.note, 160) || d.meta.note,
+      fantasy: meta.fantasy === true,
+      weatherSource: ['derived', 'api', 'none'].includes(str(meta.weatherSource, 8))
+        ? str(meta.weatherSource, 8)
+        : 'derived'
+    },
     place: {
-      city: str(place.city, 20) || d.place.city,
+      city: str(place.city, 30) || d.place.city,
+      scale: str(place.scale, 40),
       season: str(place.season, 40) || d.place.season,
       home: {
         floor: Math.floor(num(home.floor, d.place.home.floor, { min: 1, max: 60 })),
         elevator: home.elevator === true,
         facing: str(home.facing, 6) || d.place.home.facing,
-        rooms: str(home.rooms, 80) || d.place.home.rooms,
-        outside: str(home.outside, 80) || d.place.home.outside,
+        rooms: str(home.rooms, 100) || d.place.home.rooms,
+        outside: str(home.outside, 100) || d.place.home.outside,
         keepsake: str(home.keepsake, 40) || d.place.home.keepsake
       },
-      places: places.length ? places : clone(d.place.places)
+      places: finalPlaces
     },
     body: {
       shape: str(body.shape, 20) || d.body.shape,
       tail: {
         length: str(tail.length, 12) || d.body.tail.length,
-        sleep: str(tail.sleep, 30) || d.body.tail.sleep,
-        cold: str(tail.cold, 20) || d.body.tail.cold
+        sleep: str(tail.sleep, 40) || d.body.tail.sleep,
+        cold: str(tail.cold, 20) || d.body.tail.cold,
+        tell: str(tail.tell, 40)
       },
       habits: list(body.habits, 8).length ? list(body.habits, 8) : clone(d.body.habits)
     },
     day: {
-      wake: str(day.wake, 5) || d.day.wake,
-      sleep: str(day.sleep, 5) || d.day.sleep,
+      wake: timeOr(day.wake, d.day.wake),
+      sleep: timeOr(day.sleep, d.day.sleep),
+      nightOwl: {
+        probability: num(nightOwl.probability, 0, { min: 0, max: 1 }),
+        latestSleep: timeOr(nightOwl.latestSleep, '03:00'),
+        wakeShiftHours: num(nightOwl.wakeShiftHours, 0, { min: 0, max: 6 }),
+        tell: str(nightOwl.tell, 60)
+      },
       meals: {
-        morning: str(meals.morning, 10) || d.day.meals.morning,
-        noon: str(meals.noon, 10) || d.day.meals.noon,
-        evening: str(meals.evening, 10) || d.day.meals.evening
+        morning: str(meals.morning, 16) || d.day.meals.morning,
+        noon: str(meals.noon, 16) || d.day.meals.noon,
+        evening: str(meals.evening, 16) || d.day.meals.evening
       },
       rituals: list(day.rituals, 8).length ? list(day.rituals, 8) : clone(d.day.rituals)
     },
     hobbies: hobbies.length ? hobbies : clone(d.hobbies),
-    livelihood: str(v.livelihood, 60) || d.livelihood,
+    livelihood: str(v.livelihood, 80) || d.livelihood,
     self: {
       awareness: ['none', 'half', 'full'].includes(awareness) ? awareness : d.self.awareness,
       knows: list(self.knows, 8).length ? list(self.knows, 8) : clone(d.self.knows),
       notCare: list(self.notCare, 8).length ? list(self.notCare, 8) : clone(d.self.notCare)
+    },
+    regimes,
+    exceptions,
+    worldDomains,
+    worldEventRules,
+    env: {
+      weatherPool,
+      weatherBanned: list(env.weatherBanned, 12),
+      lightByPeriod,
+      smellPool: list(env.smellPool, 12),
+      boringPool: list(env.boringPool, 40)
     }
   };
 }
@@ -241,7 +433,7 @@ export function placesOf(world) {
   const w = world && typeof world === 'object' ? world : DEFAULT_WORLD;
   const arr = Array.isArray(w?.place?.places) ? w.place.places : [];
   return arr
-    .map((p) => ({ name: str(p?.name, 12), note: str(p?.note, 40), noise: str(p?.noise, 40) }))
+    .map((p) => ({ name: str(p?.name, 12), note: str(p?.note, 60), noise: str(p?.noise, 60) }))
     .filter((p) => p.name);
 }
 
@@ -255,11 +447,62 @@ export function placeByName(world, name) {
 export function dayOf(world) {
   const w = world && typeof world === 'object' ? world : DEFAULT_WORLD;
   const day = w.day && typeof w.day === 'object' ? w.day : DEFAULT_WORLD.day;
+  const owl = day.nightOwl && typeof day.nightOwl === 'object' ? day.nightOwl : {};
   return {
     wake: str(day.wake, 5),
     sleep: str(day.sleep, 5),
+    nightOwl: {
+      probability: num(owl.probability, 0, { min: 0, max: 1 }),
+      latestSleep: timeOr(owl.latestSleep, '03:00'),
+      wakeShiftHours: num(owl.wakeShiftHours, 0, { min: 0, max: 6 }),
+      tell: str(owl.tell, 60)
+    },
     meals: { ...DEFAULT_WORLD.day.meals, ...(day.meals && typeof day.meals === 'object' ? day.meals : {}) },
     rituals: list(day.rituals, 8)
+  };
+}
+
+/** 日程模式（已归一化）。 */
+export function regimesOf(world) {
+  const w = world && typeof world === 'object' ? world : DEFAULT_WORLD;
+  return Array.isArray(w.regimes) ? w.regimes : [];
+}
+
+/** 一次性例外（已归一化）。 */
+export function exceptionsOf(world) {
+  const w = world && typeof world === 'object' ? world : DEFAULT_WORLD;
+  return Array.isArray(w.exceptions) ? w.exceptions : [];
+}
+
+/** 六切面世界事件种子。 */
+export function worldDomainsOf(world) {
+  const w = world && typeof world === 'object' ? world : DEFAULT_WORLD;
+  return Array.isArray(w.worldDomains) ? w.worldDomains : [];
+}
+
+/** 世界事件的硬边界（永远 fabricateRealPeople:false）。 */
+export function worldEventRulesOf(world) {
+  const w = world && typeof world === 'object' ? world : DEFAULT_WORLD;
+  const r = w.worldEventRules && typeof w.worldEventRules === 'object' ? w.worldEventRules : {};
+  return {
+    fabricateRealPeople: false,
+    note: str(r.note, 120),
+    blockedNames: Array.isArray(r.blockedNames) ? r.blockedNames : [],
+    channels: Array.isArray(r.channels) ? r.channels : [],
+    forbidden: Array.isArray(r.forbidden) ? r.forbidden : []
+  };
+}
+
+/** 现场质感池（天气 / 光线 / 气味 / 无聊）。 */
+export function envPools(world) {
+  const w = world && typeof world === 'object' ? world : DEFAULT_WORLD;
+  const e = w.env && typeof w.env === 'object' ? w.env : {};
+  return {
+    weatherPool: Array.isArray(e.weatherPool) ? e.weatherPool : [],
+    weatherBanned: Array.isArray(e.weatherBanned) ? e.weatherBanned : [],
+    lightByPeriod: e.lightByPeriod && typeof e.lightByPeriod === 'object' ? e.lightByPeriod : {},
+    smellPool: Array.isArray(e.smellPool) ? e.smellPool : [],
+    boringPool: Array.isArray(e.boringPool) ? e.boringPool : []
   };
 }
 
@@ -275,15 +518,22 @@ export function worldBrief(world) {
     .map((x) => (x.note ? `${x.name}——${x.note}` : x.name))
     .join('；');
   const d = w.day;
-  return [
-    `住处：${w.place.city}，${w.place.season}。${h.floor} 楼${h.elevator ? '有' : '没有'}电梯，朝${h.facing}。${h.rooms}。`,
+  const lines = [
+    `住处：${w.place.city}${w.place.scale ? `，${w.place.scale}` : ''}，${w.place.season}。${h.floor} 楼${h.elevator ? '有' : '没有'}电梯，朝${h.facing}。${h.rooms}。`,
     `窗外：${h.outside}。屋里留着：${h.keepsake}。`,
     `能去的地方：${places}。`,
     `身体：${w.body.shape}，尾巴${w.body.tail.length}（${w.body.tail.sleep}，${w.body.tail.cold}）。${w.body.habits.join('、')}。`,
-    `作息：${d.wake} 起，${d.sleep} 睡；早饭${d.meals.morning}，午饭${d.meals.noon}，晚饭${d.meals.evening}；${d.rituals.join('，')}。`,
+    `作息：${d.wake} 起，${d.sleep} 睡${d.nightOwl.probability > 0 ? `；五次里约有 ${Math.round(d.nightOwl.probability * 5)} 次会熬到 ${d.nightOwl.latestSleep}` : ''}；早饭${d.meals.morning}，午饭${d.meals.noon}，晚饭${d.meals.evening}；${d.rituals.join('，')}。`,
     `爱好：${hobbies}。`,
     `营生：${w.livelihood}。`
-  ].join('\n');
+  ];
+  if (w.regimes.length) {
+    lines.push(`日常模式：${w.regimes.map((r) => `${r.label || r.id}（${r.blocks.length} 段）`).join('；')}。`);
+  }
+  if (w.worldDomains.length) {
+    lines.push(`世界会冒事的方向：${w.worldDomains.map((x) => x.label || x.key).join('、')}。`);
+  }
+  return lines.join('\n');
 }
 
 /**
