@@ -141,6 +141,17 @@ import { archivePath, clampDays, decodeLine, encodeRecord, formatRecall, history
 // 世界层只当数据库用，不进提示词的只有世界本身；进提示词的是「此刻那一格」。
 import { readWorld } from './world.js';
 import { attentionOf, ensureDay, lifeMomentLine, readTimeline } from './life-timeline.js';
+// MARKER: world-events-import
+// 世界会自己往外冒事：按天物化一份事件账本，只给已经发生的。
+// 默认 inject:false（影子模式）—— 只生成、只记日志，一个字都不进提示词。
+import {
+  buildDay as buildWorldEventsDay,
+  describeForLog as describeWorldEvents,
+  ensureDay as ensureWorldEventsDay,
+  eventsCfg as worldEventsCfg,
+  eventsLine as worldEventsLine,
+  readEvents
+} from './world-events.js';
 // MARKER: willingness-import
 import {
   consumeWillingness,
@@ -4496,6 +4507,28 @@ async function main() {
     }
   }
 
+  // MARKER: world-scope
+  // 世界层（此刻生活线 + 世界自己冒出来的事）只注入「范围」内。
+  //
+  // 为什么要有这道闸（2026-10-30 主人明确要求）：
+  //   「群聊不要注入世界，只有管理员私聊注入世界」
+  // 群里一注入「现在是 17:00，你在堤坝上走」，她就会把自己的私事当谈资讲出来，
+  // 既串味又出戏；群里她该只对聊天本身反应。
+  //
+  // 想去掉这道闸（让所有会话都注入）：config.json 加
+  //   "socialV2": { "world": { "scope": "all" } }
+  function worldScopeMode() {
+    const raw = String((cfg.socialV2 && cfg.socialV2.world && cfg.socialV2.world.scope) || 'owner').trim();
+    return raw === 'all' ? 'all' : 'owner';
+  }
+
+  function inWorldScope(key) {
+    if (worldScopeMode() === 'all') return true;
+    const qq = String(cfg.ownerQQ ?? '').trim();
+    if (!qq) return false;   // 没配 ownerQQ 就一个都不注入：别把私事漏给别人
+    return String(key || '') === `private:${qq}`;
+  }
+
   function lifeTimelineFor(now = Date.now(), { force = false, dayKey = '' } = {}) {
     const lc = lifeCfg(cfg);
     const world = worldStore();
@@ -4507,6 +4540,69 @@ async function main() {
     const { day } = ensureDay(STATE_DIR, world, { dayKey: today, plans, now, log, force });
     return lifeMomentLine(day, now);
   }
+  // MARKER: world-events
+  // 为什么单开一层，而不是塞进 life-timeline 的 env：
+  //   时间线每晚被 settle 以 force:true 重排整天，事件塞进去就会跟着被重抽 ——
+  //   「白天发生过什么」不能变。所以事件独立成账本，按天物化、只读不重抽。
+  //
+  // 三条纪律：
+  //   1) 幂等：当天已有账本就原样复用，绝不重抽。
+  //   2) 只给已经发生的：eventsSoFar 按 atMin 过滤，未来的事一个字都不给模型看。
+  //   3) inject 默认关：先影子跑，确认不播报、不冲突，再手动打开。
+  let worldEventsWarned = false;
+  function worldEventsSettings() {
+    const sv = cfg.socialV2 ?? {};
+    return worldEventsCfg(sv.worldEvents ?? sv.events ?? {});
+  }
+
+  // 物化今天那一份（幂等）。返回 {day, created} 或 null。
+  // 依赖时间线：事件要落在具体某格上（where / slotFrom / slotTo 都来自那格）。
+  function worldEventsFor(now = Date.now(), { force = false } = {}) {
+    try {
+      const we = worldEventsSettings();
+      if (!we.enabled) return null;
+      const world = worldStore();
+      if (!world) return null;
+      const lc = lifeCfg(cfg);
+      const dayKey = lifeDayFor(now, { switchHour: lc.switchHour }).today;
+      const lifeStore = readLifeStore();
+      const plans = Array.isArray(lifeStore?.days?.[dayKey]?.plans) ? lifeStore.days[dayKey].plans : [];
+      // 先确保那天的时间线在（幂等；没有就排一份），再物化事件。
+      const tl = ensureDay(STATE_DIR, world, { dayKey, plans, now, log, force });
+      if (!tl?.day) return null;
+      const got = ensureWorldEventsDay(STATE_DIR, world, { dayKey, day: tl.day, cfg: we, now, log, force });
+      if (got?.created) log(describeWorldEvents(got.day));
+      return got?.day ?? null;
+    } catch (error) {
+      if (!worldEventsWarned) {
+        worldEventsWarned = true;
+        log(`[world-events] 物化失败，这轮不注入：${error?.message ?? error}`);
+      }
+      return null;
+    }
+  }
+
+  // 注入用：只读今天已物化那份，不新建。inject 关着就返回空串。
+  function worldEventsNow(now = Date.now()) {
+    try {
+      const we = worldEventsSettings();
+      if (!we.enabled || !we.inject) return '';
+      const lc = lifeCfg(cfg);
+      const dayKey = lifeDayFor(now, { switchHour: lc.switchHour }).today;
+      const store = readEvents(STATE_DIR);
+      const rec = store?.days?.[dayKey];
+      if (!rec) return '';
+      return worldEventsLine(rec, now, we);
+    } catch {
+      return '';
+    }
+  }
+
+  // 十分钟一次的幂等检查：只补今天这一份，不重抽历史。
+  async function worldEventsTick() {
+    worldEventsFor(Date.now());
+  }
+
   function readLifeStore() {
     const raw = readJsonSafe(LIFE_FILE, null);
     return raw && typeof raw === 'object' && raw.days && typeof raw.days === 'object'
@@ -4563,6 +4659,10 @@ async function main() {
     setInterval(() => { void biliBrowseTick(); }, 10 * 60 * 1000);
     // 自己学表情：同一个节奏，配额和冷却由 stickerLearnTick 里判
     setInterval(() => { void stickerLearnTick(); }, 10 * 60 * 1000);
+    // MARKER: world-events-boot
+    // 世界自己冒的事：同一个节奏，幂等（当天有账本就不动），启动 40 秒后先补一次。
+    setInterval(() => { void worldEventsTick(); }, 10 * 60 * 1000).unref?.();
+    setTimeout(() => { void worldEventsTick(); }, 40 * 1000).unref?.();
     topicsTimer.unref?.();
     setTimeout(() => { void topicTick(); }, 90 * 1000).unref?.();
     log('[谈资] 定时器已排上（10 点 / 16 点各一次）');
@@ -14229,11 +14329,16 @@ async function generateImageNow({ prompt, size }) {
     // 注入的是事实，不是指令：只摆她上次自己写下的日子与这几天的心情走向，
     // 爆不爆由她决定（这条既是一致性要求，也是对成本的控制）。
     let lifeLineText = '';
+    let worldEventsText = '';
     let moodTrendText = '';
     try {
-      if (lifeCfg(cfg).enabled) {
+      if (lifeCfg(cfg).enabled && inWorldScope(key)) {
         // 先试「此刻那一格」；拿不到（world 坏了/文件写不进去/还没到起床点）再回落旧的三条计划。
+        // 注：连旧的【今天】三条计划也一起挡在范围外 —— 那也是「她的日子」，不是群里该说的。
         lifeLineText = lifeTimelineFor() || lifeLineFor(readLifeStore(), Date.now());
+        // 世界自己冒的事：紧跟在生活线之后，作为背景补一句。
+        // 只给已经发生的；inject 关着就是空串（影子模式）。
+        worldEventsText = worldEventsNow();
       }
     } catch (error) {
       log(`[life] 注入失败：${error?.message ?? error}`);
@@ -14308,7 +14413,7 @@ async function generateImageNow({ prompt, size }) {
     const untrustedLine = String(key).startsWith('group:') ? GROUP_RULES : '';
     // MARKER: continuity-inject —— 换会话前的交接条，注入一次就作废。
     const continuityText = continuityHintFor(key);
-    const base = roleLine + untrustedLine + tokenLine + continuityText + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + moodTrendText + threadsText + wishesText + datesText + topicsText + biliBrowseText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    const base = roleLine + untrustedLine + tokenLine + continuityText + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + worldEventsText + moodTrendText + threadsText + wishesText + datesText + topicsText + biliBrowseText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
