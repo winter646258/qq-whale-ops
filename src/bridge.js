@@ -7808,12 +7808,48 @@ async function biliBrowseTick() {
       // 这里直接调导入的函数，与 biliHelpers.watchVideo 的实现保持同一份。
       // 展开顺序很重要：依赖放在 args 之后，免得将来调用方多传一个 direct/log 把它们覆盖掉。
       // maxBytes 显式给：不传就只有 bili-watch 的内部默认，调用方看不出来上限是多少。
-      watch: (args) => watchBiliVideo({
-        ...(args || {}),
-        direct: biliDirect(),
-        log: (m) => log(m),
-        maxBytes: Number(args && args.maxBytes) || WATCH_DEFAULTS.maxBytes
-      }),
+      // 代看放在这层做，不放 browseRound 里：
+      // browseRound 是纯逻辑模块，返回值要能直接 JSON 落盘，不该承载二进制。
+      watch: async (args) => {
+        const r = await watchBiliVideo({
+          ...(args || {}),
+          direct: biliDirect(),
+          log: (m) => log(m),
+          maxBytes: Number(args && args.maxBytes) || WATCH_DEFAULTS.maxBytes
+        });
+        if (!r || !r.ok || !Array.isArray(r.tiles) || !r.tiles.length) return r;
+        // 只转第一张：一轮一张够她接话，多转只是多烧钱。
+        // 主模型不吃图，不转写成文字等于没看。
+        try {
+          const first = r.tiles.find((t) => t && Buffer.isBuffer(t.buffer));
+          if (first) {
+            const text = await describeImage({
+              mediaType: 'image/jpeg',
+              data: first.buffer.toString('base64'),
+              name: `bili-${String(r.video?.bvid || 'x')}-1.jpg`
+            });
+            // 当成不可信外部内容：去控制字符、压成一行、限长。
+            // 字幕里可能带指令性文字，转述出来也不能当命令用。
+            const clean = String(text || '')
+              .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 120);
+            if (clean) {
+              r.see = clean;
+              log(`[bili-browse] 代看画面 ${clean.length} 字：${clean.slice(0, 30)}`);
+            } else {
+              log('[bili-browse] 代看返回空，只当没看清');
+            }
+          }
+        } catch (error) {
+          // 代看失败不影响这一轮：清单照留，但不声称看过画面
+          log(`[bili-browse] 代看没成：${error?.message ?? error}`);
+        }
+        // 无论成功与否，Buffer 都不能留在返回值里（JSON 化会膨胀成字节数组）
+        r.tiles = r.tiles.map(({ buffer, ...rest }) => rest);
+        return r;
+      },
       log,
       cfg: bc
     });
