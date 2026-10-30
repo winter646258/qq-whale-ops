@@ -13667,6 +13667,9 @@ async function generateImageNow({ prompt, size }) {
     const blocked = String(st.wakeBlockedBy || '');
     // 明确不该说的（禁言/别的机器人/机器报错/@了别人）连分都不攒。
     if (!reason && blocked) return null;
+    // MARKER: wake-hold — 额度还满着就别每 8 秒重掷一次骰子，静默等抑制期过去。
+    // 只拦「没人叫她自己想说」这条路；明确叫她（reason 非空）照旧交给限流层判。
+    if (!reason && Number((st.wakeHold && st.wakeHold.until) || 0) > Date.now()) return null;
 
     let state = consumeIfReplied(key, willingnessStateOf(key));
     const decision = evaluateWillingness(state, wl, {
@@ -14603,14 +14606,41 @@ async function generateImageNow({ prompt, size }) {
     const wakeBucket = isExplicit
       ? (st.exemptWakeTimes || (st.exemptWakeTimes = []))
       : (st.wakeTimes || (st.wakeTimes = []));
+    // MARKER: wake-hold — 额度满时记一个「抑制到有空位」的时间点，
+    // 抑制期内静默跳过。否则被拦下的软触发会每 8 秒重走一遍意愿门、重新掷骰，
+    // 分数不消费所以一直挂在阈值上方（实测 19:19–19:40 稳定 8 秒一轮），日志刷屏且毫无意义。
     if (!isExplicit) {
       // MARKER: per-group-override
+      const holdUntil = Number((st.wakeHold && st.wakeHold.until) || 0);
+      if (holdUntil > now) return;
+      if (holdUntil > 0) st.wakeHold = null;   // 抑制期已过，清掉
       const maxPerMinute = __wlim.maxWakePerMinute || (Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0);
       const maxPerHour = __wlim.maxWakePerHour;
       const recentMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).length;
       const recentHour = (st.wakeTimes || []).filter((t) => now - t < 3600000).length;
-      if ((maxPerMinute > 0 && recentMinute >= maxPerMinute) || (maxPerHour > 0 && recentHour >= maxPerHour)) {
-        log(`[reserved2] 唤醒频率超限，跳过 ${key}（${reason}）`);
+      const overMinute = maxPerMinute > 0 && recentMinute >= maxPerMinute;
+      const overHour = maxPerHour > 0 && recentHour >= maxPerHour;
+      if (overMinute || overHour) {
+        // 算「额度什么时候真的有空位」：滑动窗口里最老那条滑出去的时刻。
+        // count == max 时，最老一条过期必然让 count 降到 max-1 < max，所以那就是恢复点。
+        let untilByHour = 0;
+        if (overHour) {
+          const inWindow = (st.wakeTimes || []).filter((t) => now - t < 3600000).sort((a, b) => a - b);
+          untilByHour = inWindow.length >= maxPerHour
+            ? inWindow[inWindow.length - maxPerHour] + 3600000
+            : now + 60000;
+        }
+        let untilByMinute = 0;
+        if (overMinute) {
+          const inMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).sort((a, b) => a - b);
+          untilByMinute = inMinute.length >= maxPerMinute
+            ? inMinute[inMinute.length - maxPerMinute] + 60000
+            : now + 60000;
+        }
+        const hits = [untilByHour, untilByMinute].filter((t) => t > now);
+        const until = hits.length ? Math.min(...hits) : now + 60000;
+        st.wakeHold = { until, at: now, reason: String(reason || '') };
+        log(`[reserved2] 唤醒频率超限，跳过 ${key}（${reason}），抑制到 ${Math.round((until - now) / 1000)}s 后`);
         return;
       }
     } else if (wakeBucket.filter((t) => now - t < 3600000).length >= (__wlim.maxWakePerHour || 12)) {
@@ -14626,6 +14656,7 @@ async function generateImageNow({ prompt, size }) {
     const wakeTime = now;
     wakeBucket.push(wakeTime);
     if (wakeBucket.length > 200) wakeBucket.splice(0, wakeBucket.length - 200);
+    st.wakeHold = null;   // 真的唤醒了，抑制点作废（MARKER: wake-hold）
     // 无论提前唤醒还是超时唤醒，都清理有限潜水定时器与 sleepUntil，避免状态残留/重复唤醒
     const prevSleepUntil = st.wakeConfig.sleepUntil;
     const hadFiniteSleep = !st.wakeConfig.infinite && !!prevSleepUntil && Number.isFinite(Date.parse(prevSleepUntil));
