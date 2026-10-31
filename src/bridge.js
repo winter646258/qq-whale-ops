@@ -5183,7 +5183,19 @@ async function main() {
     if (keyStr.startsWith('private:') && keyStr !== ownerKey) {
       maxSends = Math.max(maxSends, pick(b.privateMaxSends, maxSends));
     }
-    return { maxSteps: pick(b.maxSteps, 40), maxMs, maxSends };
+    // MARKER: step-turn-budget —— 步数同样分主人 / 好友私聊。
+    // 起因（2026-10-31 实测）：11 次「步数 13 > 12」全部发生在私聊（主人 9 次、好友 2 次），
+    // 群里 0 次；每次都是真跑到第 13 步才被掐，有的回合已经发了 10~12 条 —— 是长回合
+    // 需要更多步，不是空转。而 maxSteps 之前只有 pick(b.maxSteps, 40)，config 把全局
+    // 压到 12 之后主人私聊跟着吃 12，与 maxSends/maxMs 的「主人至少这么多」语义不一致。
+    // 方向同 owner-turn-budget：只升不降（Math.max），队里收紧靠改 ownerMaxSteps / privateMaxSteps。
+    let maxSteps = pick(b.maxSteps, 40);
+    if (ownerKey && keyStr === ownerKey) {
+      maxSteps = Math.max(maxSteps, pick(b.ownerMaxSteps, Math.max(maxSteps, 40)));
+    } else if (keyStr.startsWith('private:')) {
+      maxSteps = Math.max(maxSteps, pick(b.privateMaxSteps, Math.max(maxSteps, 30)));
+    }
+    return { maxSteps, maxMs, maxSends };
   }
   function turnBudgetFor(sessionId) {
     let entry = turnBudgetLedger.get(sessionId);
