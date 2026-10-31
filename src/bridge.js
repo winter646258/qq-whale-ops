@@ -3106,6 +3106,12 @@ async function main() {
     }
   } catch {}
   const visionSessionIds = new Map(); // model -> sessionId（进程内）
+  // 一个视觉会话最多代看几张图。视觉会话是常驻会话，历史只增不减：
+  // 2026-10-31 实测一天 223 次代看，末尾每次 input 已经 63k（几乎全是历史里之前那些图和描述），
+  // 全天平均 24.7k/次 —— 而单张 320 宽的拼图本身只要 1~2k。
+  // 所以攒够就换新会话，把每次的代看成本拉回 1~2k。
+  const visionSessionUses = new Map(); // model -> 当前会话已代看次数（进程内）
+  const VISION_SESSION_MAX_USES = Math.max(1, Number(cfg.vision?.sessionMaxUses ?? 6));
 
   function isVisionSession(sessionId) {
     for (const id of visionSessionIds.values()) {
@@ -3185,9 +3191,17 @@ async function main() {
   async function ensureVisionSession(model) {
     const known = visionSessionIds.get(model);
     if (known) {
-      learnerSessions.add(known);
-      api.events.follow(known);
-      return known;
+      const used = Number(visionSessionUses.get(model) ?? 0);
+      if (used < VISION_SESSION_MAX_USES) {
+        visionSessionUses.set(model, used + 1);
+        learnerSessions.add(known);
+        api.events.follow(known);
+        return known;
+      }
+      // 已经用满，历史太长。旧会话留在 DSH 里不再使用，下次重新建一个干净的。
+      visionSessionIds.delete(model);
+      visionSessionUses.delete(model);
+      log(`[vision] 视觉会话用满 ${used} 次，换新会话（避免历史一直累积）`);
     }
     const preset = resolvePresetName(cfg.vision?.preset || cfg.agentPreset, { strict: true });
     if (!preset) throw new Error('视觉会话缺少已验证的安全 preset，拒绝创建');
@@ -3209,6 +3223,7 @@ async function main() {
     }), 'vision selectModel');
     learnerSessions.add(sessionId);
     visionSessionIds.set(model, sessionId);
+    visionSessionUses.set(model, 1);
     try {
       atomicWriteJson(VISION_SESSION_FILE, { __workspaceId: workspaceId, __updatedAt: Date.now() });
     } catch {}
@@ -3261,6 +3276,7 @@ async function main() {
         const why = `${accepted.result.error.code}: ${accepted.result.error.message}`;
         if (attempt === 1 && /not[- ]?found|unavailable|不存在/i.test(why)) {
           visionSessionIds.delete(model);
+          visionSessionUses.delete(model);
           sessionId = await ensureVisionSession(model);
           continue;
         }

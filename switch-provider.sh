@@ -85,9 +85,16 @@ FAIL_PATTERN="unauthorized|quota|insufficient|balance|rate.?limit|额度不足|�
 # 2026-10-28：把 our-free-model 提到链首。
 # 原链首是 loomy，而本部署的日常渠道是 our-free-model ⇒ role 结构性地永远 fallback，
 # 黑话研究与结算都被它连累。改序后 chain[0] 就是日常渠道，role 才会是 main。
-CHAIN_PROVIDERS=(our-free-model loomy trae raccoon)
-CHAIN_MODELS=(deepseek/deepseek-v4.1-flash DeepSeek-V4.1-Flash deepseek-v4.1-flash sn-deepseek-v4-1-flash)
-CHAIN_EFFORTS=(light low light on)
+# 2026-10-31：raccoon 与 trae 换位。理由是账本实测（channel-pack/token-ledger.json）：
+#   trae    累计 4926 次请求 / 新输入 12.69 亿 tokens / cacheRead 恒 0 / 均 257.5k 新输入每次
+#   raccoon 累计 2585 次请求 / 新输入 1716 万   / 缓存率 96.8%   / 均 6.6k 新输入每次
+# 也就是同样干活，trae 每次要重发 25 万 token 的完整上下文，raccoon 走缓存只要 6.6k。
+# trae 唯一的优势是快（~2.2s vs ~29s），但降级期间它是被连续用上几小时的
+# （10-30 那天 412 次 trae 请求 × 105k = 4329 万新输入，额度就是那天打光的）。
+# 所以「快」不值这个价：raccoon 提前，trae 退到链尾只做最后兜底。
+CHAIN_PROVIDERS=(our-free-model loomy raccoon trae)
+CHAIN_MODELS=(deepseek/deepseek-v4.1-flash DeepSeek-V4.1-Flash sn-deepseek-v4-1-flash deepseek-v4.1-flash)
+CHAIN_EFFORTS=(light low on light)
 
 # A_/B_ 是链首与次级的别名 —— 脚本里还有一批地方按这两个名字取「主渠道」，
 # 保留它们可以让 record_history 的 role 判定、--status 输出等无需改动。
