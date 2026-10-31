@@ -140,6 +140,7 @@ import { archivePath, clampDays, decodeLine, encodeRecord, formatRecall, history
 // 世界层 §4 生活线：world.json（她的住处/作息/日程模式）+ life-timeline.js（今天每一格）。
 // 世界层只当数据库用，不进提示词的只有世界本身；进提示词的是「此刻那一格」。
 import { homeBrief, readWorld } from './world.js';
+import { riceEchoLine } from './speech-habit.js';
 import { attentionOf, ensureDay, lifeMomentLine, readTimeline } from './life-timeline.js';
 // MARKER: world-events-import
 // 世界会自己往外冒事：按天物化一份事件账本，只给已经发生的。
@@ -14236,6 +14237,11 @@ async function generateImageNow({ prompt, size }) {
     }
 
     const st = getSocialV2State(key);
+    // MARKER: rice-echo —— 她最近几条自己说的话里提过饭/碗/饭团，就递一句「这次换别的说」。
+    // 为什么不能只靠角色卡：角色卡写的是设定（「别老提某某」），模型照样连着三轮提；
+    // 「你刚已经说过了」是当下事实，才管用。没命中时返回空串，零成本。
+    const riceEcho = riceEchoLine(st.recentMessages);
+    if (riceEcho) log(`[rice-echo] ${key} 提醒 ${riceEcho.length} 字`);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const memoryText = formatMemoryV2(st);
     // 印象会累积（memberImpression 追加是合并 traits，上限 10 条），久了就变味。
@@ -14523,7 +14529,7 @@ async function generateImageNow({ prompt, size }) {
     const untrustedLine = String(key).startsWith('group:') ? GROUP_RULES : '';
     // MARKER: continuity-inject —— 换会话前的交接条，注入一次就作废。
     const continuityText = continuityHintFor(key);
-    const base = roleLine + worldHomeLine + untrustedLine + tokenLine + continuityText + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + worldEventsText + moodTrendText + threadsText + wishesText + datesText + topicsText + biliBrowseText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + styleLine + timeSenseLine;
+    const base = roleLine + worldHomeLine + untrustedLine + tokenLine + continuityText + graceLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + moodLine + lifeLineText + worldEventsText + moodTrendText + threadsText + wishesText + datesText + topicsText + biliBrowseText + imageLine + wakeLine + memoryLine + sharedMemoryLine + affinityLine + groupDigestLine + sleepReviewLine + diaryDailyLine + diaryDraftHint + scheduleLine + scheduleReviewLine + portraitLine + participationLine + preSleepLine + riceEcho + styleLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
