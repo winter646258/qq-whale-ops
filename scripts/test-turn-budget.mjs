@@ -78,9 +78,9 @@ ok('配了 ownerMaxSteps: 60 → 60', () => {
   const fn = factory(cfgWith({ maxSteps: 12, ownerMaxSteps: 60 }));
   assert.equal(fn(OWNER).maxSteps, 60);
 });
-ok('没配 ownerMaxSteps → 回落到 40（代码默认，不再吃全局 12）', () => {
+ok('没配 ownerMaxSteps → 保持全局 12（fail-closed，不自动放宽）', () => {
   const fn = factory(cfgWith({ maxSteps: 12 }));
-  assert.equal(fn(OWNER).maxSteps, 40);
+  assert.equal(fn(OWNER).maxSteps, 12);
 });
 ok('ownerMaxSteps 配得比全局小 → 只升不降，仍是 12', () => {
   const fn = factory(cfgWith({ maxSteps: 12, ownerMaxSteps: 3 }));
@@ -98,9 +98,9 @@ ok('配了 privateMaxSteps: 30 → 30', () => {
   const fn = factory(cfgWith({ maxSteps: 12, privateMaxSteps: 30 }));
   assert.equal(fn(FRIEND).maxSteps, 30);
 });
-ok('没配 privateMaxSteps → 回落 30', () => {
+ok('没配 privateMaxSteps → 保持全局 12（fail-closed）', () => {
   const fn = factory(cfgWith({ maxSteps: 12 }));
-  assert.equal(fn(FRIEND).maxSteps, 30);
+  assert.equal(fn(FRIEND).maxSteps, 12);
 });
 ok('好友拿不到主人的 60', () => {
   const fn = factory(cfgWith({ maxSteps: 12, ownerMaxSteps: 60, privateMaxSteps: 30 }));
@@ -139,6 +139,18 @@ ok('turnBudget 整个缺失也不抛错', () => {
 ok('key 是空值不抛错', () => {
   const fn = factory(cfgWith({ maxSteps: 12 }));
   for (const k of ['', null, undefined]) assert.ok(Number.isFinite(fn(k).maxSteps));
+});
+
+ok('ownerMaxSteps 是 0 / 负数 / NaN / 乱写 → 一律保持全局 12', () => {
+  for (const bad of [0, -9, NaN, 'x', null, undefined]) {
+    const fn = factory(cfgWith({ maxSteps: 12, ownerMaxSteps: bad, privateMaxSteps: bad }));
+    assert.equal(fn(OWNER).maxSteps, 12, String(bad));
+    assert.equal(fn(FRIEND).maxSteps, 12, String(bad));
+  }
+});
+ok('小数按 floor 取整', () => {
+  const fn = factory(cfgWith({ maxSteps: 12, ownerMaxSteps: 60.9 }));
+  assert.equal(fn(OWNER).maxSteps, 60);
 });
 
 console.log(`\n结果：${pass} 过 / ${fail} 挂`);

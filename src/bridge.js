@@ -5189,11 +5189,13 @@ async function main() {
     // 需要更多步，不是空转。而 maxSteps 之前只有 pick(b.maxSteps, 40)，config 把全局
     // 压到 12 之后主人私聊跟着吃 12，与 maxSends/maxMs 的「主人至少这么多」语义不一致。
     // 方向同 owner-turn-budget：只升不降（Math.max），队里收紧靠改 ownerMaxSteps / privateMaxSteps。
+    // 缺省 / 非法值一律保持全局值（fail-closed），不自动放宽 —— 否则部署了新代码但忘了同步
+    // 配置，所有私聊会突然从 12 步变成 40/30 步，成本变化没人下过决定。
     let maxSteps = pick(b.maxSteps, 40);
     if (ownerKey && keyStr === ownerKey) {
-      maxSteps = Math.max(maxSteps, pick(b.ownerMaxSteps, Math.max(maxSteps, 40)));
+      maxSteps = Math.max(maxSteps, pick(b.ownerMaxSteps, maxSteps));
     } else if (keyStr.startsWith('private:')) {
-      maxSteps = Math.max(maxSteps, pick(b.privateMaxSteps, Math.max(maxSteps, 30)));
+      maxSteps = Math.max(maxSteps, pick(b.privateMaxSteps, maxSteps));
     }
     return { maxSteps, maxMs, maxSends };
   }
