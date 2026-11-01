@@ -145,7 +145,18 @@ import { decideRearm, planBatchWindow, resolveBatchPolicy } from './batch-window
 // MARKER: tts-gc-import —— audio/tts/ 过期清理（纯函数 + fs 壳）
 import { gcTtsDir, planTtsGc } from './tts-gc.js';
 import { riceEchoLine } from './speech-habit.js';
-import { attentionOf, ensureDay, lifeMomentLine, readTimeline } from './life-timeline.js';
+import { attentionOf, attentionSnapshot, ensureDay, lifeMomentLine, readTimeline } from './life-timeline.js';
+// MARKER: attention-shadow-import —— 三态注意力的影子观测层。只记样本，不做任何调度决策。
+import {
+  SHADOW_VERSION,
+  classifyAttention,
+  fillLatency,
+  newDayBucket,
+  normalizeShadowCfg,
+  noteSelfSpeak,
+  pushEvent,
+  shadowReport,
+} from './attention-shadow.js';
 // MARKER: world-events-import
 // 世界会自己往外冒事：按天物化一份事件账本，只给已经发生的。
 // 默认 inject:false（影子模式）—— 只生成、只记日志，一个字都不进提示词。
@@ -2243,6 +2254,14 @@ async function main() {
       describeAudio: (info) => describeAudio(info),
     },
   });
+  // MARKER: attention-shadow-config —— shadow 的配置。默认开着，因为它是只读观测：
+  // 不开就一直拿不到「如果开 focused 门会怎样」的样本，判据永远算不出来。
+  function attentionShadowCfg() {
+    const sv = cfg.socialV2 ?? {};
+    const raw = sv.attentionShadow ?? sv.attention?.shadow ?? {};
+    return normalizeShadowCfg(raw);
+  }
+
   function voiceCfg() {
     const v = cfg.socialV2?.voice ?? {};
     return {
@@ -4684,6 +4703,138 @@ async function main() {
     const { day } = ensureDay(STATE_DIR, world, { dayKey: today, plans, now, log, force });
     return lifeMomentLine(day, now);
   }
+  // MARKER: attention-shadow-core
+  // 影子文件：一天一桶，只留当天（判据只看三天窗口，留多了纯占内存）。
+  const ATTENTION_SHADOW_FILE = path.join(STATE_DIR, 'attention-shadow.json');
+  const ATTENTION_SHADOW_KEEP_DAYS = 5;
+  let attentionShadowStore = null;
+  let attentionShadowBusy = false;
+
+  function attentionShadowDay(now = Date.now()) {
+    const t = new Date(now);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())}`;
+  }
+
+  function readAttentionShadow() {
+    if (attentionShadowStore) return attentionShadowStore;
+    const raw = readJsonSafe(ATTENTION_SHADOW_FILE, null);
+    attentionShadowStore = raw && typeof raw === 'object' && raw.days && typeof raw.days === 'object'
+      ? raw
+      : { version: SHADOW_VERSION, updatedAt: 0, days: {} };
+    return attentionShadowStore;
+  }
+
+  function writeAttentionShadow(store) {
+    if (!store) return;
+    store.version = SHADOW_VERSION;
+    store.updatedAt = Date.now();
+    // 有界：只留最近 N 天，判据窗口只要 3 天。
+    const keys = Object.keys(store.days || {}).sort();
+    while (keys.length > ATTENTION_SHADOW_KEEP_DAYS) {
+      delete store.days[keys.shift()];
+    }
+    try {
+      atomicWriteJson(ATTENTION_SHADOW_FILE, store);
+    } catch (error) {
+      log(`[attention-shadow] 落盘失败：${error?.message ?? error}`);
+    }
+  }
+
+  function shadowBucket(now = Date.now()) {
+    const store = readAttentionShadow();
+    const day = attentionShadowDay(now);
+    if (!store.days[day] || typeof store.days[day] !== 'object') {
+      store.days[day] = newDayBucket(day);
+    }
+    const b = store.days[day];
+    if (!Array.isArray(b.events)) b.events = [];
+    if (!Array.isArray(b.selfTimes)) b.selfTimes = [];
+    if (!b.counters || typeof b.counters !== 'object') b.counters = newDayBucket(day).counters;
+    return { store, bucket: b, day };
+  }
+
+  // 记一条入站事件。**只读当前 attention，不写回去、不改任何状态机字段。**
+  function shadowIncoming(key, reason, now = Date.now()) {
+    const sc = attentionShadowCfg();
+    if (!sc.enabled) return;
+    try {
+      const snap = attentionSnapshotOfNow(now);
+      const side = String(key).startsWith('private:') ? 'private' : 'group';
+      const cls = classifyAttention({ band: snap.band, reason, side });
+      const st = getSocialV2State(key);
+      const { store, bucket } = shadowBucket(now);
+      pushEvent(bucket, {
+        at: now,
+        key,
+        side,
+        reason: reason || '',
+        band: snap.band || '',
+        source: snap.source || '',
+        intent: cls.intent,
+        group: cls.group,
+        unreadAtArrival: Array.isArray(st.unread) ? st.unread.length : 0,
+        latencyMs: -1
+      }, { cfg: sc });
+      writeAttentionShadow(store);
+    } catch (error) {
+      log(`[attention-shadow] 记录失败：${error?.message ?? error}`);
+    }
+  }
+
+  // 她自己说话了：回填该会话的延迟，并记一次发言时刻（回合间隔统计用）。
+  function shadowSelfSpoke(key, now = Date.now()) {
+    const sc = attentionShadowCfg();
+    if (!sc.enabled) return;
+    try {
+      const { store, bucket } = shadowBucket(now);
+      const filled = fillLatency(bucket, key, now, { cfg: sc });
+      noteSelfSpeak(bucket, now, { cfg: sc });
+      writeAttentionShadow(store);
+      if (filled > 0) log(`[attention-shadow] ${key} 回填 ${filled} 条延迟`);
+    } catch (error) {
+      log(`[attention-shadow] 回填失败：${error?.message ?? error}`);
+    }
+  }
+
+  // 只取 band/source，绝不 touch 时间线文件（attentionSnapshot 是纯读）。
+  function attentionSnapshotOfNow(now = Date.now()) {
+    try {
+      const world = worldStore();
+      if (!world) return { band: '', source: 'none' };
+      const store = readTimeline(STATE_DIR);
+      const lc = lifeCfg(cfg);
+      const key = lc.switchHour != null
+        ? lifeDayFor(now, { switchHour: lc.switchHour }).today
+        : attentionShadowDay(now);
+      const day = store?.days?.[key];
+      if (!day) return { band: '', source: 'none' };
+      const snap = attentionSnapshot(day, now);
+      return { band: String(snap?.band ?? ''), source: String(snap?.source ?? 'none') };
+    } catch {
+      return { band: '', source: 'none' };
+    }
+  }
+
+  // 报告：判据在纯函数里算，这里只负责取数据 + 打日志。
+  function attentionShadowReport({ days = 3, log_it = true } = {}) {
+    const sc = attentionShadowCfg();
+    const store = readAttentionShadow();
+    const keys = Object.keys(store.days || {}).sort().slice(-Math.max(1, Number(days) || 3));
+    const picked = {};
+    for (const k of keys) picked[k] = store.days[k];
+    const rep = shadowReport(picked, { cfg: sc });
+    if (log_it) {
+      log(`[attention-shadow] 窗口 ${rep.days.length} 天 | 事件 ${rep.events}（丢弃 ${rep.dropped}）| B=${rep.bN} A=${rep.aN} | 抑制候选 ${rep.suppress} | 判据 ${rep.verdict}`);
+      const p = rep.pending;
+      log(`[attention-shadow] 假想 pending ${p.count} 条 / 摘要 ${p.chars} 字 / sender ${p.senders.length} / 丢弃 ${p.dropped}`);
+      log(`[attention-shadow] 回合间隔 n=${rep.turnGap.n} p50=${Math.round(rep.turnGap.p50 / 1000)}s <1s ${rep.turnGap.under1s} <5s ${rep.turnGap.under5s} <120s ${rep.turnGap.under120s}`);
+      const b = rep.bootstrap;
+      log(`[attention-shadow] Δp90=${Math.round(b.point)}ms 95%[${Math.round(b.lo)},${Math.round(b.hi)}] 迭代 ${b.iterations}${rep.insufficient ? '（样本不足，未跑）' : ''}`);
+    }
+    return rep;
+  }
+
   // MARKER: world-events
   // 为什么单开一层，而不是塞进 life-timeline 的 env：
   //   时间线每晚被 settle 以 force:true 重排整天，事件塞进去就会跟着被重抽 ——
@@ -4813,6 +4964,13 @@ async function main() {
       setInterval(() => { void ttsGcTick(); }, gcIv).unref?.();
       setTimeout(() => { void ttsGcTick(); }, 3 * 60 * 1000).unref?.();
       log(`[tts-gc] 定时器已排上（每 ${Math.round(gcIv / 60000)} 分钟）`);
+    }
+    // MARKER: attention-shadow-boot —— 启动 2 分钟后先算一次报告（确认判据在真数据上跑得动），
+    // 之后每 6 小时一次。频率低是因为判据窗口是 3 天，跑太勤没有新信息。
+    {
+      setTimeout(() => { try { attentionShadowReport({ days: 3 }); } catch (e) { log(`[attention-shadow] 报告失败：${e?.message ?? e}`); } }, 2 * 60 * 1000).unref?.();
+      setInterval(() => { try { attentionShadowReport({ days: 3 }); } catch (e) { log(`[attention-shadow] 报告失败：${e?.message ?? e}`); } }, 6 * 3600 * 1000).unref?.();
+      log('[attention-shadow] 已排上（启动 2 分钟后首报，之后每 6 小时）');
     }
     topicsTimer.unref?.();
     setTimeout(() => { void topicTick(); }, 90 * 1000).unref?.();
@@ -13533,6 +13691,9 @@ async function generateImageNow({ prompt, size }) {
   function recordSentMessagesV2(key, messages) {
     const st = getSocialV2State(key);
     const now = Date.now();
+    // MARKER: attention-shadow-self —— 她真发了消息才算「回应」，
+    // 只建了定时器不算：那样会把没回应的样本也标成有延迟。
+    try { shadowSelfSpoke(key, now); } catch {}
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const list = Array.isArray(messages) ? messages : [];
     for (let i = 0; i < list.length; i++) {
@@ -15734,6 +15895,9 @@ async function generateImageNow({ prompt, size }) {
         scheduleWakeV2(key, 'bootstrap');
       } else {
         const reason = evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
+        // MARKER: attention-shadow-incoming —— 影子观测。放在意愿门之前，
+        // 这样记到的是「原始触发」，不会被意愿门/跳过抖动的改动污染。
+        shadowIncoming(key, reason, Date.now());
         // MARKER: willingness-gate —— 意愿门。reason 为 null 时也可能被放行
         // （她攒够了想主动插话），所以这一步也必须每条消息都过。
         const willing = applyWillingnessV2(key, st, reason, {
