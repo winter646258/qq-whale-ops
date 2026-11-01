@@ -140,6 +140,10 @@ import { archivePath, clampDays, decodeLine, encodeRecord, formatRecall, history
 // 世界层 §4 生活线：world.json（她的住处/作息/日程模式）+ life-timeline.js（今天每一格）。
 // 世界层只当数据库用，不进提示词的只有世界本身；进提示词的是「此刻那一格」。
 import { homeBrief, readWorld } from './world.js';
+// MARKER: batch-window-import —— 合并窗口的滑动策略（纯函数）
+import { decideRearm, planBatchWindow, resolveBatchPolicy } from './batch-window.js';
+// MARKER: tts-gc-import —— audio/tts/ 过期清理（纯函数 + fs 壳）
+import { gcTtsDir, planTtsGc } from './tts-gc.js';
 import { riceEchoLine } from './speech-habit.js';
 import { attentionOf, ensureDay, lifeMomentLine, readTimeline } from './life-timeline.js';
 // MARKER: world-events-import
@@ -2252,6 +2256,15 @@ async function main() {
         defaultTone: String(v.tts?.defaultTone ?? ''),
         // breeze 挂了要不要退回 dashscope。默认退，因为语音是「能发就行」的小事。
         fallbackDashscope: v.tts?.fallbackDashscope !== false,
+      // MARKER: tts-gc-config —— 临时音频清理。这个目录只增不减，几天不动就上 MB。
+      gc: {
+        enabled: v.tts?.gc?.enabled !== false,
+        keepDays: Math.max(0, Number(v.tts?.gc?.keepDays) || 7),
+        keepMax: Math.max(0, Number(v.tts?.gc?.keepMax) || 200),
+        keepRecent: Math.max(0, Number(v.tts?.gc?.keepRecent) || 10),
+        minAgeMs: Math.max(0, Number(v.tts?.gc?.minAgeMs) || 10 * 60 * 1000),
+        intervalMs: Math.max(60 * 1000, Number(v.tts?.gc?.intervalMs) || 6 * 3600 * 1000)
+      },
         maxChars: Number(v.tts?.maxChars) > 0 ? Number(v.tts.maxChars) : 600,
         timeoutMs: Number(v.tts?.timeoutMs) > 0 ? Number(v.tts.timeoutMs) : 60000,
         downloadTimeoutMs: Number(v.tts?.downloadTimeoutMs) > 0 ? Number(v.tts.downloadTimeoutMs) : 30000,
@@ -2544,10 +2557,17 @@ async function main() {
       isOwner: true,
       ownerLabel: '我',
       isSelf: true,
-      at: Date.now()
+      at: Date.now(),
+      // MARKER: voice-history-time —— 存档层读的是 time 不是 at，
+      // 不补这一行，语音在长期记录里就没有正确时间（会退化成写盘时刻）
+      time: Date.now()
     };
     st.recentMessages.push(entry);
     if (st.recentMessages.length > 200) st.recentMessages = st.recentMessages.slice(-200);
+    // MARKER: voice-history —— 语音也要进长期存档。
+    // 原来只 push 内存的 recentMessages，于是 704 条发言里标 [语音] 的 0 条，
+    // 按「她说过什么」做行为统计时语音完全隐形。
+    appendArchive(key, entry);
     st.lastAiReplyAt = entry.at;
     st.lastActionAt = entry.at;
     st.wakeConfig.noActionCount = 0;
@@ -4765,6 +4785,13 @@ async function main() {
     // 世界自己冒的事：同一个节奏，幂等（当天有账本就不动），启动 40 秒后先补一次。
     setInterval(() => { void worldEventsTick(); }, 10 * 60 * 1000).unref?.();
     setTimeout(() => { void worldEventsTick(); }, 40 * 1000).unref?.();
+    // MARKER: tts-gc-boot —— 临时音频清理，启动 3 分钟后先扫一次，之后按配置间隔。
+    {
+      const gcIv = Math.max(60 * 1000, Number(voiceCfg().gc?.intervalMs) || 6 * 3600 * 1000);
+      setInterval(() => { void ttsGcTick(); }, gcIv).unref?.();
+      setTimeout(() => { void ttsGcTick(); }, 3 * 60 * 1000).unref?.();
+      log(`[tts-gc] 定时器已排上（每 ${Math.round(gcIv / 60000)} 分钟）`);
+    }
     topicsTimer.unref?.();
     setTimeout(() => { void topicTick(); }, 90 * 1000).unref?.();
     log('[谈资] 定时器已排上（10 点 / 16 点各一次）');
@@ -11228,6 +11255,8 @@ async function stickerLearnTick() {
         probability: Math.min(1, Math.max(0, Number(w.recommendedProbability) || 0))
       },
       batchWindowMs: Math.max(1000, Number(w.batchWindowMs) || 8000),
+      // MARKER: batch-max-window —— 合并窗口的最长拖尾，防刷屏把她永远拖着不开口
+      maxBatchWindowMs: Math.max(0, Number(w.maxBatchWindowMs) || 30000),
       lastWakeAt: 0,
       wakeCount: 0,
       noActionCount: 0,
@@ -11919,6 +11948,9 @@ async function generateImageNow({ prompt, size }) {
         sendTimes: [],
         stickerCollectTimes: [],
         pendingWakeTimer: null,
+        // MARKER: batch-state —— 合并窗口的首条时间与截止时刻，滑动窗口要靠这两个
+        batchFirstAt: 0,
+        batchDeadline: 0,
         sleepTimer: null,
         replyCheckTimer: null,
         proactiveTimer: null,
@@ -11994,6 +12026,8 @@ async function generateImageNow({ prompt, size }) {
             sendTimes: Array.isArray(val.sendTimes) ? val.sendTimes : [],
             stickerCollectTimes: Array.isArray(val.stickerCollectTimes) ? val.stickerCollectTimes : [],
             pendingWakeTimer: null,
+            batchFirstAt: 0,
+            batchDeadline: 0,
             sleepTimer: null,
             replyCheckTimer: null,
             proactiveTimer: null,
@@ -15110,12 +15144,50 @@ async function generateImageNow({ prompt, size }) {
       return;
     }
     const st = getSocialV2State(key);
+    const batchPolicy = resolveBatchPolicy({
+      baseMs: st.wakeConfig?.batchWindowMs,
+      maxMs: st.wakeConfig?.maxBatchWindowMs,
+      extendOnNewMessage: st.wakeConfig?.extendBatchOnNewMessage
+    });
+    // MARKER: batch-rearm-fn —— 建/重排合并窗口统一走这里，firstAt 语义只在这里决定
+    const armBatchTimer = (fireDelay, batchFirstAt) => {
+      st.pendingWakeTimer = setTimeout(() => {
+        st.pendingWakeTimer = null;
+        st.batchFirstAt = 0;
+        st.batchDeadline = 0;
+        const finalReason = st.pendingWakeReason || reason;
+        st.pendingWakeReason = null;
+        void sendWakePromptV2(key, finalReason)
+          .catch((error) => log(`[reserved2] 计划唤醒异常 ${key}:`, error?.message ?? error))
+          .finally(() => { wakeTriggerSeq.delete(key); });
+      }, Math.max(1, fireDelay));
+      // 与其它 per-conversation 定时器保持一致：别让一个待唤醒定时器把进程钉住不退出。
+      st.pendingWakeTimer.unref?.();
+      st.batchFirstAt = batchFirstAt;
+    };
     if (st.pendingWakeTimer) {
       // 合并窗口内已有待发送唤醒：按优先级升级最终原因，避免先概率后 @ 却仍按概率唤醒。
       const cur = st.pendingWakeReason || reason;
       if (wakePriorityV2(reason) > wakePriorityV2(cur)) {
         st.pendingWakeReason = reason;
         log(`[reserved2] 合并窗口内升级唤醒原因 ${key}: ${cur} -> ${reason}`);
+      }
+      // 滑动窗口：新消息把发送时刻往后推（封顶 first+maxMs），
+      // 让她看到完整的一段话而不是 8 秒前的半句。
+      const nowMs = Date.now();
+      const firstAt = st.batchFirstAt || nowMs;
+      const decision = decideRearm({
+        currentDeadline: st.batchDeadline || 0,
+        firstAt,
+        lastAt: nowMs,
+        now: nowMs,
+        policy: batchPolicy
+      });
+      if (decision.rearm) {
+        clearTimeout(st.pendingWakeTimer);
+        armBatchTimer(decision.delayMs, firstAt);
+        st.batchDeadline = decision.deadline;
+        log(`[reserved2] 合并窗口延后 ${key}（${decision.reason}），${Math.round(decision.delayMs / 1000)}s 后发送`);
       }
       return;
     }
@@ -15143,18 +15215,43 @@ async function generateImageNow({ prompt, size }) {
       const seqNow = Number(st.lastUnreadSeq);
       if (Number.isSafeInteger(seqNow) && seqNow > 0) wakeTriggerSeq.set(key, seqNow);
     }
-    const batchMs = Math.max(1000, Number(st.wakeConfig?.batchWindowMs) || 8000);
-    st.pendingWakeTimer = setTimeout(() => {
-      st.pendingWakeTimer = null;
-      const finalReason = st.pendingWakeReason || reason;
-      st.pendingWakeReason = null;
-      void sendWakePromptV2(key, finalReason)
-        .catch((error) => log(`[reserved2] 计划唤醒异常 ${key}:`, error?.message ?? error))
-        .finally(() => { wakeTriggerSeq.delete(key); });
-    }, batchMs);
-    // 与其它 per-conversation 定时器保持一致：别让一个待唤醒定时器把进程钉住不退出。
-    st.pendingWakeTimer.unref?.();
-    log(`[reserved2] 计划唤醒 ${key}（${reason}），${Math.round(batchMs / 1000)}s 后发送`);
+    const firstAt = Date.now();
+    const plan = planBatchWindow({ firstAt, lastAt: firstAt, now: firstAt, policy: batchPolicy });
+    armBatchTimer(plan.delayMs, firstAt);
+    st.batchDeadline = plan.deadline;
+    log(`[reserved2] 计划唤醒 ${key}（${reason}），${Math.round(plan.delayMs / 1000)}s 后发送`);
+  }
+
+  // MARKER: tts-gc-tick —— 清 audio/tts/ 下的过期临时音频。
+  // 只扫 tts 子目录，绝不碰 audio/ 根下的语音库（那是资产，不是缓存）。
+  let ttsGcBusy = false;
+  async function ttsGcTick() {
+    if (ttsGcBusy) return;
+    const vc = voiceCfg();
+    const gc = vc.gc || {};
+    if (gc.enabled === false) return;
+    ttsGcBusy = true;
+    try {
+      const dir = path.join(vc.dir, 'tts');
+      const r = gcTtsDir(dir, {
+        fs,
+        now: Date.now(),
+        keepDays: gc.keepDays,
+        keepMax: gc.keepMax,
+        keepRecent: gc.keepRecent,
+        minAgeMs: gc.minAgeMs,
+        log
+      });
+      if (!r.ok) {
+        log(`[tts-gc] 清理失败：${r.error}`);
+      } else if (r.removed > 0) {
+        log(`[tts-gc] 清理 ${r.removed} 个过期音频（${(r.bytes / 1024).toFixed(1)} KB），保留 ${r.kept} 个 / 共扫 ${r.scanned} 个`);
+      }
+    } catch (error) {
+      log(`[tts-gc] 异常：${error?.message ?? error}`);
+    } finally {
+      ttsGcBusy = false;
+    }
   }
 
   function setupSleepTimerV2(key) {
