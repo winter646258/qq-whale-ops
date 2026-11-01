@@ -34,6 +34,10 @@ export const PACING_DEFAULTS = Object.freeze({
     phoneFocused: 1.4,   // 正在用手机、刚说完话
     available: 1,        // 空闲
     occupied: 0.7,       // 上课/干活
+    // MARKER: focused-rhythm —— 作者在生活线上显式标了「这段真在专注」。
+    // 必须比 occupied 更低：否则 focused 会掉进下面按时间戳的 available(1.0)，
+    // 比 occupied(0.7) 更爱说话，等于标了专注反而更吵。
+    focused: 0.4,
     resting: 0.5,        // 躺着、低能量
     asleep: 0.15         // 睡了
   }),
@@ -162,8 +166,12 @@ export function rhythmOf({ lastIncomingAt = 0, now = Date.now(), hour, attention
   // 两小时没人说话就被判成 resting；反过来「躺在床上没睡着」本来就和 asleep 同频。
   // 只认 occupied/asleep 两档（其余交给下面按时间戳的判定），半夜睡着那条仍然最硬。
   const att = String(attention || '');
-  if (att === 'occupied' && !(h >= 23 || h < 8)) {
-    return { level: 'occupied', multiplier: round3(num(table.occupied, 0.7)), idleMs: idle, stale: false, source: 'life' };
+  // focused 与 occupied 同一条分支：都表示「生活线声明她现在腾不出手」，
+  // 区别只在倍率（focused 更慢）。夜里仍然让位给下面的 asleep，睡眠最硬。
+  if ((att === 'focused' || att === 'occupied') && !(h >= 23 || h < 8)) {
+    const level = att === 'focused' ? 'focused' : 'occupied';
+    const fb = level === 'focused' ? 0.4 : 0.7;
+    return { level, multiplier: round3(num(table[level], fb)), idleMs: idle, stale: false, source: 'life' };
   }
   if (h >= 23 || h < 8) return { level: 'asleep', multiplier: round3(num(table.asleep, 0.15)), idleMs: idle, stale: false };
   if (idle > ttl) return { level: 'resting', multiplier: round3(num(table.resting, 0.5)), idleMs: idle, stale: true };

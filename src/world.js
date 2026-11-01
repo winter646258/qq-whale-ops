@@ -125,6 +125,16 @@ function timeOr(value, fallback) {
   return HHMM.test(s) ? s : fallback;
 }
 
+// MARKER: world-attention-band
+// 只做「是不是这四个词」的类型检查；「这个结束点落不落在这格里」是
+// life-timeline.expandSlots 的事 —— 世界层不知道格子的边界。
+const ATTENTION_BANDS = new Set(['asleep', 'focused', 'occupied', 'available']);
+function bandOr(value, fallback = '') {
+  const s = str(value, 12).toLowerCase();
+  if (s === 'sleep') return 'asleep';
+  return ATTENTION_BANDS.has(s) ? s : fallback;
+}
+
 /** 每分钟数，只用来比较顺序；非法返回 -1。 */
 export function minuteOf(hhmm) {
   const s = str(hhmm, 5);
@@ -205,7 +215,9 @@ export function normalizeWorld(raw) {
         where,
         doing: str(b.doing, 60),
         body: str(b.body, 60),
-        interruptible: num(b.interruptible, 0.8, { min: 0, max: 1 })
+        interruptible: num(b.interruptible, 0.8, { min: 0, max: 1 }),
+        attentionBand: bandOr(b.attentionBand),
+        busyUntil: timeOr(b.busyUntil, '')
       });
       if (blocks.length >= 24) break;
     }
@@ -217,7 +229,9 @@ export function normalizeWorld(raw) {
         where: str(insertIn.where, 12),
         doing: str(insertIn.doing, 60),
         body: str(insertIn.body, 60),
-        interruptible: num(insertIn.interruptible, 0.9, { min: 0, max: 1 })
+        interruptible: num(insertIn.interruptible, 0.9, { min: 0, max: 1 }),
+        attentionBand: bandOr(insertIn.attentionBand),
+        busyUntil: timeOr(insertIn.busyUntil, '')
       }
       : null;
     regimes.push({

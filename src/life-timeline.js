@@ -254,6 +254,8 @@ export function expandSlots(world, regime, dayKey) {
       interruptible: num(b.interruptible, 0.8, { min: 0, max: 1 }),
       reason: '',
       unfinished: false,
+      attentionBand: normalizeAttentionBand(b.attentionBand),
+      busyUntil: normalizeBusyUntil(b.busyUntil, from, to),
       ...extra
     });
     return true;
@@ -286,7 +288,9 @@ export function expandSlots(world, regime, dayKey) {
       body: str(e.patch.body, 60),
       interruptible: num(e.patch.interruptible, 0.8, { min: 0, max: 1 }),
       reason: str(e.reason, 60),
-      unfinished: false
+      unfinished: false,
+      attentionBand: normalizeAttentionBand(e.patch?.attentionBand),
+      busyUntil: normalizeBusyUntil(e.patch?.busyUntil, from, to)
     });
     raw.length = 0;
     raw.push(...keep.sort((a, b) => a.fromMin - b.fromMin));
@@ -807,20 +811,85 @@ export function lifeMomentLine(day, now = Date.now()) {
  * 这里把生活线声明翻成一个档位，桥那边当 override 传给 rhythmOf。
  * 只覆盖白天：phoneFocused（有人刚说话）和 asleep（半夜）仍由时间戳决定，优先级更高。
  */
-export function attentionOf(day, now = Date.now()) {
+/**
+ * 生活线可选的「注意力标注」。
+ * MARKER: attention-band
+ *
+ * 为什么要有它：attentionOf() 只返回一个字符串 —— 它能说「现在忙」，
+ * 但说不出「忙到几点」。入站门控（三态注意力）需要知道结束时间，
+ * 只调 interruptible 阈值永远补不出这个事实。所以由作者在 regime block
+ * 上显式写 attentionBand / busyUntil，代码只负责校验与透传，
+ * 绝不从 doing 文本里猜「真忙」。
+ */
+export const ATTENTION_BANDS = ['asleep', 'focused', 'occupied', 'available'];
+
+export function normalizeAttentionBand(value) {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (v === 'sleep') return 'asleep'; // 兼容另一套拼法
+  return ATTENTION_BANDS.includes(v) ? v : '';
+}
+
+/**
+ * busyUntil 只允许落在本格 [fromMin, toMin] 内，且必须晚于起始。
+ * 返回分钟数（跨零点时可能 >1440）；任何非法输入一律返回 0，
+ * 0 的语义是「没有显式结束点」—— 不虚构。
+ */
+export function normalizeBusyUntil(value, fromMin, slotToMin) {
+  // 形参不能叫 toMin —— 那会遮蔽模块级同名帮助函数，调用时直接 TypeError。
+  const raw = String(value ?? '').trim();
+  if (!raw) return 0;
+  let m = toMin(raw);
+  if (!Number.isFinite(m) || m < 0) return 0;
+  if (m < fromMin) m += 1440;                  // 21:00 的格写 00:10 → 跨零点
+  if (m <= fromMin || m > slotToMin) return 0; // 越界或写反 → 丢弃
+  return m;
+}
+
+/**
+ * 三态注意力快照。MARKER: attention-snapshot
+ *
+ * 优先级：作者显式写的 attentionBand 高于按 interruptible 推算；
+ * focused 必须还没过 busyUntil 才算数，过了就降级成 occupied
+ * （格还没结束，只是「专注段」结束了）。
+ */
+export function attentionSnapshot(day, now = Date.now()) {
+  const empty = { band: '', source: 'none', busyUntil: 0, fromMin: 0, toMin: 0 };
   try {
     const slot = slotAt(day, now);
-    if (!slot) return '';
+    if (!slot) return empty;
+    const d = new Date(now);
+    let min = d.getHours() * 60 + d.getMinutes();
+    const fromMin = Number.isFinite(slot.fromMin) ? slot.fromMin : toMin(slot.from);
+    let toEnd = Number.isFinite(slot.toMin) ? slot.toMin : toMin(slot.to);
+    if (toEnd <= fromMin) toEnd += 1440;
+    if (toEnd > 1440 && min < fromMin) min += 1440;
+    const busyUntil = Number(slot.busyUntil) || 0;
+    const base = { busyUntil, fromMin, toMin: toEnd };
+
+    const declared = normalizeAttentionBand(slot.attentionBand);
+    if (declared) {
+      if (declared === 'focused' && busyUntil > 0 && min >= busyUntil) {
+        return { ...base, band: 'occupied', source: 'band-expired' };
+      }
+      return { ...base, band: declared, source: 'band' };
+    }
     const doing = str(slot.doing, 60);
     const where = str(slot.where, 12);
-    if (/睡|赖着|午睡/.test(doing) && where === '里间') return 'asleep';
+    if (/睡|赖着|午睡/.test(doing) && where === '里间') {
+      return { ...base, band: 'asleep', source: 'heuristic' };
+    }
     const it = num(slot.interruptible, 0.8, { min: 0, max: 1 });
-    if (it <= 0.45) return 'occupied';
-    if (it <= 0.65) return 'available';
-    return 'available';
+    if (it <= 0.45) return { ...base, band: 'occupied', source: 'heuristic' };
+    return { ...base, band: 'available', source: 'heuristic' };
   } catch {
-    return '';
+    return empty;
   }
+}
+
+export function attentionOf(day, now = Date.now()) {
+  // 保持旧签名与旧返回值（'' / asleep / occupied / available），
+  // 新增的 focused 只有在 regime block 显式标注时才会出现。
+  return attentionSnapshot(day, now).band || '';
 }
 /** 给调试脚本看的一行摘要。 */
 export function summarizeDay(day) {
