@@ -4965,6 +4965,13 @@ async function main() {
       setTimeout(() => { void ttsGcTick(); }, 3 * 60 * 1000).unref?.();
       log(`[tts-gc] 定时器已排上（每 ${Math.round(gcIv / 60000)} 分钟）`);
     }
+    // MARKER: diary-art-recover-boot —— 启动 90 秒后补做上次没画完的日记配图，
+    // 之后每 15 分钟扫一遍（账本通常为空，扫一下几乎零成本）。
+    {
+      setTimeout(() => { void diaryArtRecoverTick(); }, 90 * 1000).unref?.();
+      setInterval(() => { void diaryArtRecoverTick(); }, 15 * 60 * 1000).unref?.();
+      log('[日记配图] 补做定时器已排上（启动 90 秒后首扫，之后每 15 分钟）');
+    }
     // MARKER: attention-shadow-boot —— 启动 2 分钟后先算一次报告（确认判据在真数据上跑得动），
     // 之后每 6 小时一次。频率低是因为判据窗口是 3 天，跑太勤没有新信息。
     {
@@ -11876,13 +11883,69 @@ function queueDiaryArt(key, entry, { artPrompt = '' } = {}) {
     character: c.character,
     maxChars: c.maxPromptChars
   });
-  diaryArtInflight.set(entry.id, Date.now());
-  log(`[日记配图] 开始画 ${entry.id}（提示词 ${prompt.length} 字）`);
-  void (async () => {
+  return startDiaryArt(key, entry, prompt, c);
+}
+
+  // MARKER: diary-art-persist
+  // 画图任务落盘待办账本。原来是游离 Promise：2026-10-31 01:07:50 画到一半进程重启，
+  // 那条日记的图就永远没了，连「画失败」都没来得及打。落盘之后启动补做 + 超时重排。
+  const DIARY_ART_PENDING_FILE = path.join(STATE_DIR, 'diary-art-pending.json');
+  const DIARY_ART_MAX_ATTEMPTS = 3;
+  const DIARY_ART_RETRY_AFTER_MS = 10 * 60 * 1000;
+  let diaryArtRecoverBusy = false;
+
+  function readDiaryArtPending() {
+    const raw = readJsonSafe(DIARY_ART_PENDING_FILE, null);
+    const list = raw && Array.isArray(raw.items) ? raw.items : [];
+    return { version: 1, updatedAt: Number(raw?.updatedAt) || 0, items: list.filter((x) => x && x.id) };
+  }
+
+  function writeDiaryArtPending(store) {
+    try {
+      atomicWriteJson(DIARY_ART_PENDING_FILE, { version: 1, updatedAt: Date.now(), items: store.items.slice(-50) });
+    } catch (error) {
+      log(`[日记配图] 待办账本落盘失败：${error?.message ?? error}`);
+    }
+  }
+
+  function upsertDiaryArtPending(item) {
+    const store = readDiaryArtPending();
+    const i = store.items.findIndex((x) => x.id === item.id);
+    if (i >= 0) store.items[i] = { ...store.items[i], ...item };
+    else store.items.push(item);
+    writeDiaryArtPending(store);
+  }
+
+  function dropDiaryArtPending(id) {
+    const store = readDiaryArtPending();
+    const next = store.items.filter((x) => x.id !== id);
+    if (next.length !== store.items.length) {
+      store.items = next;
+      writeDiaryArtPending(store);
+    }
+  }
+
+  async function runDiaryArt(key, entry, prompt) {
+    const c = artCfg(cfg);
+    diaryArtInflight.set(entry.id, Date.now());
+    upsertDiaryArtPending({
+      id: entry.id,
+      day: String(entry.day || ''),
+      key: String(key || ''),
+      prompt,
+      size: c.size,
+      style: c.style,
+      attempts: Number((readDiaryArtPending().items.find((x) => x.id === entry.id)?.attempts) || 0),
+      startedAt: Date.now(),
+      lastError: ''
+    });
+    log(`[日记配图] 开始画 ${entry.id}（提示词 ${prompt.length} 字）`);
     try {
       const result = await generateImageNow({ prompt, size: c.size });
-      fs.mkdirSync(DIARY_ART_DIR, { recursive: true });
       const dest = path.join(DIARY_ART_DIR, artFileName(entry));
+      // **必须建 dest 的父目录**：artFileName 自 2c336a3 起按月分子目录（2026-11/xxx.png），
+      // 只建 DIARY_ART_DIR 的话跨月就 ENOENT —— 11-01 那张图就是这么丢的。
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.copyFileSync(result.path, dest);
       const art = {
         file: path.relative(path.join(ROOT, 'diary'), dest),
@@ -11892,23 +11955,112 @@ function queueDiaryArt(key, entry, { artPrompt = '' } = {}) {
         at: Date.now()
       };
       const fresh = readDiary(DIARY_ART_FILE);
-      if (setDiaryArt(fresh, { id: entry.id, art })) {
+      const hit = setDiaryArt(fresh, { id: entry.id, art });
+      // setDiaryArt 在 id 找不到时会**回落到最后一条**，不校验 id 就会把图挂到别人头上。
+      if (hit && String(hit.id) === String(entry.id)) {
         writeDiary(DIARY_ART_FILE, fresh);
         log(`[日记配图] 完成 ${entry.id} -> ${art.file}`);
+      } else {
+        // 日记条目可能已被删改，图还是留下，但不污染别的条目
+        log(`[日记配图] 写回失败（条目已不在）${entry.id}，图已存 ${art.file}`);
       }
       const target = diaryTargetFromKey(key);
       if (target && shouldSendArt(c.sendToChat, key)) {
         await onebotSend(target.kind, target.id, '', null, null, [dest]);
         log(`[日记配图] 已发到 ${key}`);
       }
+      dropDiaryArtPending(entry.id);
+      return true;
     } catch (error) {
-      log(`[日记配图] 画失败 ${entry.id}：${error?.message ?? error}`);
+      const msg = String(error?.message ?? error);
+      const store = readDiaryArtPending();
+      const item = store.items.find((x) => x.id === entry.id);
+      const attempts = (Number(item?.attempts) || 0) + 1;
+      if (attempts >= DIARY_ART_MAX_ATTEMPTS) {
+        log(`[日记配图] 画失败 ${entry.id}（第 ${attempts} 次，放弃）：${msg}`);
+        dropDiaryArtPending(entry.id);
+      } else {
+        log(`[日记配图] 画失败 ${entry.id}（第 ${attempts} 次，稍后重试）：${msg}`);
+        upsertDiaryArtPending({ id: entry.id, attempts, lastError: msg, startedAt: Date.now() });
+      }
+      return false;
     } finally {
       diaryArtInflight.delete(entry.id);
     }
-  })();
-  return true;
-}
+  }
+
+  function startDiaryArt(key, entry, prompt, c) {
+    // 意图记录：先记再画，进程半路退出也能在下次启动补回来。
+    upsertDiaryArtPending({
+      id: entry.id,
+      day: String(entry.day || ''),
+      key: String(key || ''),
+      prompt,
+      size: c.size,
+      style: c.style,
+      attempts: 0,
+      startedAt: Date.now(),
+      lastError: ''
+    });
+    void runDiaryArt(key, entry, prompt);
+    return true;
+  }
+
+  // 补做：启动后扫账本，把没画完的重排。日记条目还在、还没图、今天额度还有才补。
+  async function diaryArtRecoverTick() {
+    if (diaryArtRecoverBusy) return;
+    diaryArtRecoverBusy = true;
+    try {
+      const store = readDiaryArtPending();
+      if (!store.items.length) return;
+      const art = artCfg(cfg);
+      if (!art.enabled) return;
+      const now = Date.now();
+      let launched = 0;
+      for (const item of store.items) {
+        if (diaryArtInflight.has(item.id)) continue;
+        if (now - Number(item.startedAt || 0) < DIARY_ART_RETRY_AFTER_MS) continue;
+        if ((Number(item.attempts) || 0) >= DIARY_ART_MAX_ATTEMPTS) {
+          log(`[日记配图] 补做放弃 ${item.id}（已试 ${item.attempts} 次）`);
+          dropDiaryArtPending(item.id);
+          continue;
+        }
+        // readDiary 返回的是数组（不是 {entries}），别写错。
+        const entries = readDiary(DIARY_ART_FILE);
+        const entry = entries.find((e) => e && e.id === item.id);
+        if (!entry) {
+          log(`[日记配图] 补做跳过 ${item.id}（日记条目已不在）`);
+          dropDiaryArtPending(item.id);
+          continue;
+        }
+        if (entry.art && entry.art.file) {
+          log(`[日记配图] 补做跳过 ${item.id}（已有图 ${entry.art.file}）`);
+          dropDiaryArtPending(item.id);
+          continue;
+        }
+        const used = countArtInDay(readDiary(DIARY_ART_FILE), entry.day || '');
+        if (!artAllowed({ entriesToday: used, cfg })) {
+          log(`[日记配图] 补做跳过 ${item.id}（当天额度已满 ${used}/${art.maxPerDay}）`);
+          dropDiaryArtPending(item.id);
+          continue;
+        }
+        if (!item.prompt) {
+          dropDiaryArtPending(item.id);
+          continue;
+        }
+        launched += 1;
+        log(`[日记配图] 补做 ${item.id}（第 ${(Number(item.attempts) || 0) + 1} 次）`);
+        void runDiaryArt(item.key || '', entry, String(item.prompt));
+        if (launched >= 2) break; // 一次最多补两张，别跟实时画图抢额度
+      }
+      if (launched) log(`[日记配图] 补做已启动 ${launched} 张`);
+    } catch (error) {
+      log(`[日记配图] 补做出错：${error?.message ?? error}`);
+    } finally {
+      diaryArtRecoverBusy = false;
+    }
+  }
+
 
   // MARKER: selfie-runtime
   // 自拍/合照：走 /images/edits（multipart 带参考图）。

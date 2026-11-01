@@ -64,6 +64,22 @@ export function hasEntryOnDay(entries, day) {
   });
 }
 
+// MARKER: diary-daily-count
+/** 某天已经写了几条（day 字段优先，老条目用 t 兜底）。 */
+export function countEntriesOnDay(entries, day) {
+  const want = String(day ?? '');
+  if (!want) return 0;
+  const list = Array.isArray(entries) ? entries : [];
+  let n = 0;
+  for (const entry of list) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (String(entry.day ?? '') === want) { n += 1; continue; }
+    const t = Number(entry.t);
+    if ((!entry.day) && Number.isFinite(t) && t > 0 && localDayOf(t) === want) n += 1;
+  }
+  return n;
+}
+
 export function inQuiet(hour, cfg = DIARY_DAILY_DEFAULTS) {
   const h = Number(hour);
   if (!Number.isFinite(h)) return false;
@@ -109,7 +125,12 @@ export function decideDailyDiary({ entries = [], now = Date.now(), hour = null, 
   const result = (nudged, reason, extra) => ({ nudged, reason, state: next, dirty, count: rec.count, ...(extra || {}) });
 
   if (c.enabled === false) return result(false, 'disabled');
-  if (hasEntryOnDay(entries, day)) return result(false, 'done');
+  // MARKER: diary-daily-multi —— 一天可以写多条。
+  // 原来这里是 `if (hasEntryOnDay(entries, day)) return done;`，一条就停，
+  // maxPerDay 那个配置等于没用。改成按当天**实际条数**判断：写满 maxPerDay 才停，
+  // 中间靠 cooldownMs 拉开间隔（默认 3 小时），免得一天追着念。
+  const wroteToday = countEntriesOnDay(entries, day);
+  if (wroteToday >= c.maxPerDay) return result(false, 'done', { wroteToday });
   if (inQuiet(hh, c)) return result(false, 'quiet');
   if (rec.count >= c.maxPerDay) return result(false, 'capped');
   const lastAt = Number(rec.lastAt) || 0;
@@ -122,13 +143,22 @@ export function decideDailyDiary({ entries = [], now = Date.now(), hour = null, 
     state: { days: { ...pruned.days, [day]: updated } },
     dirty: true,
     count: updated.count,
-    line: dailyDiaryLine({ hour: hh, count: updated.count, cfg: c })
+    wroteToday,
+    line: dailyDiaryLine({ hour: hh, count: updated.count, wroteToday, cfg: c })
   };
 }
 
-export function dailyDiaryLine({ hour = 12, count = 1, cfg = DIARY_DAILY_DEFAULTS } = {}) {
+export function dailyDiaryLine({ hour = 12, count = 1, wroteToday = 0, cfg = DIARY_DAILY_DEFAULTS } = {}) {
   const c = { ...DIARY_DAILY_DEFAULTS, ...(cfg && typeof cfg === 'object' ? cfg : {}) };
   const again = Number(count) > 1 ? '（再提醒一次）' : '';
+  const already = Number(wroteToday) || 0;
+  // 已经写过就别再说「今天还没写」—— 那是事实错误，她会照着演。
+  if (already > 0) {
+    if (Number(hour) >= c.strongAfterHour) {
+      return `【今天已经写了 ${already} 条，还能再写一条】${again}要是有想记下来的事，趁现在记一句（qq_diary，写具体的：谁说了什么、你当时怎么想的）。没有就不用写，别硬凑。\n\n`;
+    }
+    return `【今天写了 ${already} 条】${again}又想起什么了？可以再记一条（qq_diary，一两句具体的）。没想起就跳过，别为了凑数写。\n\n`;
+  }
   if (Number(hour) >= c.strongAfterHour) {
     return `【今天快过完了，日记还没写】${again}先补一条今天的事（qq_diary，一两句具体的：发生了什么、你当时怎么想），写完再去聊别的。别等明天——明天写不出今天的感觉。\n\n`;
   }
