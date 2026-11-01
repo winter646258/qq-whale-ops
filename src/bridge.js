@@ -144,6 +144,13 @@ import { homeBrief, readWorld } from './world.js';
 import { decideRearm, planBatchWindow, resolveBatchPolicy } from './batch-window.js';
 // MARKER: tts-gc-import —— audio/tts/ 过期清理（纯函数 + fs 壳）
 import { gcTtsDir, planTtsGc } from './tts-gc.js';
+// MARKER: breeze-claim-import —— 每日 400 credits 签到（观测 + 可选自动领取）
+import {
+  buildAlertText as breezeAlertText,
+  nextCheckDelayMs as breezeNextDelay,
+  normalizeClaimCfg as breezeClaimCfg,
+  runClaimTick as breezeRunTick,
+} from './breeze-claim.js';
 import { riceEchoLine } from './speech-habit.js';
 import { attentionOf, attentionSnapshot, ensureDay, lifeMomentLine, readTimeline } from './life-timeline.js';
 // MARKER: attention-shadow-import —— 三态注意力的影子观测层。只记样本，不做任何调度决策。
@@ -291,6 +298,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 // TTS 的 key 放在仓库根的 .env（600，不入 git），代码自己读，不依赖 systemd。
 const TTS_ENV_PATH = path.resolve('.env');
+// MARKER: breeze-claim-state
+// 这里只能放「不需要 STATE_DIR/ROOT」的东西。
+// 教训：写成 const BREEZE_CLAIM_STATE_FILE = path.join(STATE_DIR, ...) 会 TDZ
+// （Cannot access 'STATE_DIR' before initialization），服务直接起不来、systemd 无限重启。
+// 路径一律在 breezeClaimTick 内部现算 —— 那时模块顶层早就初始化完了。
+let breezeClaimBusy = false;
 let ttsEnvText = '';
 try { if (fs.existsSync(TTS_ENV_PATH)) ttsEnvText = fs.readFileSync(TTS_ENV_PATH, 'utf8'); } catch { ttsEnvText = ''; }
 const STATE_DIR = path.join(ROOT, 'state');
@@ -4981,6 +4994,19 @@ async function main() {
       setTimeout(() => { try { attentionShadowReport({ days: 3 }); } catch (e) { log(`[attention-shadow] 报告失败：${e?.message ?? e}`); } }, 2 * 60 * 1000).unref?.();
       setInterval(() => { try { attentionShadowReport({ days: 3 }); } catch (e) { log(`[attention-shadow] 报告失败：${e?.message ?? e}`); } }, 6 * 3600 * 1000).unref?.();
       log('[attention-shadow] 已排上（启动 2 分钟后首报，之后每 6 小时）');
+    }
+    // MARKER: breeze-claim-boot —— Breeze 每日签到：启动 3 分钟先看一次，之后按 checkHours（默认 6 小时）。
+    // 用 readConfigObject 现读配置，不依赖 loadConfig 的 cfg 字面量（当年 cfg.vision 就是这个坑）。
+    {
+      setTimeout(() => { void breezeClaimTick(); }, 3 * 60 * 1000).unref?.();
+      const claimIv = (() => {
+        try {
+          const f = readConfigObject(path.join(ROOT, 'config.json'));
+          return breezeNextDelay(breezeClaimCfg(f.breezeClaim ?? {}));
+        } catch { return 6 * 3600 * 1000; }
+      })();
+      setInterval(() => { void breezeClaimTick(); }, claimIv).unref?.();
+      log(`[breeze-claim] 定时器已排上（启动 3 分钟后首查，之后每 ${Math.round(claimIv / 60000)} 分钟）`);
     }
     topicsTimer.unref?.();
     setTimeout(() => { void topicTick(); }, 90 * 1000).unref?.();
@@ -15619,6 +15645,76 @@ async function generateImageNow({ prompt, size }) {
   // MARKER: tts-gc-tick —— 清 audio/tts/ 下的过期临时音频。
   // 只扫 tts 子目录，绝不碰 audio/ 根下的语音库（那是资产，不是缓存）。
   let ttsGcBusy = false;
+  // MARKER: breeze-claim-tick
+  /**
+   * Breeze 每日 400 credits 签到。
+   *
+   * 分两段，互不依赖：
+   *   ① 观测：只读 GET /v1/balance，看 topups 里最后一次 "daily claim credits" 是什么时候，
+   *      距上次超过 alertAfterHours（默认 20 小时）就提醒主人。零风险，无条件跑。
+   *   ② 自动领取：**只有 state/breeze-session.json 存在且 cookie 看起来可用时才会发生**。
+   *      cookie 缺失或失效一律退回 ①，绝不用开发者 key 硬试（web BFF 不认 xi-api-key，实测 401）。
+   *
+   * 为什么用「间隔」而不是「日历日」判断：官方没公开重置时刻（UTC 还是东八区日界未确认），
+   * 间隔判断对日界免疫 —— 每天领一次时间隔约 24 小时，> 20 小时必然命中。
+   */
+  async function breezeClaimTick() {
+    if (breezeClaimBusy) return;
+    let claimCfg;
+    try {
+      const file = readConfigObject(path.join(ROOT, 'config.json'));
+      claimCfg = breezeClaimCfg(file.breezeClaim ?? {});
+    } catch (error) {
+      log(`[breeze-claim] 读配置失败：${error?.message ?? error}`);
+      return;
+    }
+    if (!claimCfg.enabled) return;
+
+    breezeClaimBusy = true;
+    try {
+      const stateFile = path.join(STATE_DIR, 'breeze-claim.json');
+      const sessionFile = path.join(STATE_DIR, 'breeze-session.json');
+      const state = readJsonSafe(stateFile, {}) || {};
+      const session = readJsonSafe(sessionFile, null);
+      const apiKey = String(process.env.BREEZE_API_KEY || readTtsEnvValue(ttsEnvText, 'BREEZE_API_KEY') || '').trim();
+
+      const result = await breezeRunTick({
+        state,
+        cfg: claimCfg,
+        apiKey,
+        session,
+        now: Date.now(),
+      });
+
+      if (result.changed) {
+        try {
+          atomicWriteJson(stateFile, result.state);
+        } catch (error) {
+          log(`[breeze-claim] 写账本失败：${error?.message ?? error}`);
+        }
+      }
+      log(`[breeze-claim] ${result.actions.join(' ') || 'nothing'}`);
+
+      if (result.alert?.text) {
+        const ownerKey = cfg.ownerQQ ? `private:${String(cfg.ownerQQ)}` : '';
+        if (!ownerKey) {
+          log('[breeze-claim] 要提醒但没配 ownerQQ，只能写日志');
+        } else {
+          try {
+            await sendPlainToQQ(ownerKey, result.alert.text);
+            log(`[breeze-claim] 已提醒管理员（${result.alert.text.length} 字）`);
+          } catch (error) {
+            log(`[breeze-claim] 提醒发送失败：${error?.message ?? error}`);
+          }
+        }
+      }
+    } catch (error) {
+      log(`[breeze-claim] 跑挂了：${error?.message ?? error}`);
+    } finally {
+      breezeClaimBusy = false;
+    }
+  }
+
   async function ttsGcTick() {
     if (ttsGcBusy) return;
     const vc = voiceCfg();
