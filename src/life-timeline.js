@@ -584,6 +584,71 @@ function tailByInterruptible(x) {
 }
 
 /**
+ * 「来路」—— 今天早些时候她在哪、在做什么。
+ * MARKER: trace-line
+ *
+ * 为什么要有它：lifeMomentLine 只讲当前这一格。她 17:00 在堤坝的时候，
+ * 不知道自己 12:40 才躺过、也不知道 18:30 翻冰箱是刚从堤上回来——
+ * 她只有「此刻」，没有来路。HDSI 那份注入是「过去 + 现在 + 未来」，
+ * 我们只有现在。
+ *
+ * 只讲已经过去的格子，不编未来；一格一句，最多 maxSlots 句，整体不超过 maxChars。
+ * 同一地点连着几格只留最近那次，免得「在书房…在书房…在书房」。
+ */
+export function traceLine(day, now = Date.now(), { maxSlots = 3, maxChars = 90, doingChars = 18, maxAgeMs = 8 * 3600 * 1000 } = {}) {
+  try {
+    if (!day || !Array.isArray(day.slots) || !day.slots.length) return '';
+    const d = new Date(now);
+    const min = d.getHours() * 60 + d.getMinutes();
+    const first = day.slots[0];
+    const firstFrom = Number.isFinite(first.fromMin) ? first.fromMin : toMin(first.from);
+    // 凌晨且还没到今天第一格 → 今天还没开始，没有「来路」可言
+    if (min < firstFrom) return '';
+
+    const done = [];
+    for (const s of day.slots) {
+      const from = Number.isFinite(s.fromMin) ? s.fromMin : toMin(s.from);
+      let to = Number.isFinite(s.toMin) ? s.toMin : toMin(s.to);
+      if (to <= from) to += 1440;
+      if (to > min) break; // 还没走完的格子不算来路
+      const doing = str(s.doing, doingChars);
+      if (!doing) continue;
+      // 太旧的别提：23:10 说「早些时候 13:40 在书房」既不像话也没用
+      const startedAt = Number.isFinite(from) ? from : null;
+      if (startedAt != null && maxAgeMs > 0) {
+        const ageMin = min - startedAt;
+        if (ageMin > 0 && ageMin * 60000 > maxAgeMs) continue;
+      }
+      done.push({ from: str(s.from, 5), where: str(s.where, 8), doing });
+    }
+    if (!done.length) return '';
+
+    // 从最近的往前取，同地点只留最近一次
+    const picked = [];
+    const seen = new Set();
+    for (let i = done.length - 1; i >= 0 && picked.length < maxSlots; i -= 1) {
+      const s = done[i];
+      if (seen.has(s.where)) continue;
+      seen.add(s.where);
+      picked.unshift(s);
+    }
+    if (!picked.length) return '';
+
+    const render = (list) => `早些时候：${list.map((s) => `${s.from} 在${s.where}，${s.doing}`).join('；')}。`;
+    // 超长就从最旧的那个开始丢（保留离现在最近的）
+    let list = picked.slice();
+    let text = render(list);
+    while (text.length > maxChars && list.length > 1) {
+      list = list.slice(1);
+      text = render(list);
+    }
+    return text.length > maxChars ? '' : text;
+  } catch {
+    return '';
+  }
+}
+
+/**
  * 生活线注入文本（约 180~230 字）。**这是 P2a 唯一的对外出口**。
  * 出问题一律返回空串，让调用方回落 lifeLineFor —— 宁可没有这一句，也不要一句假的。
  */
@@ -605,6 +670,10 @@ export function lifeMomentLine(day, now = Date.now()) {
     parts.push(`现在是 ${range}，你在${whereNote}${note ? `（${note}）` : ''}。`);
     if (slot.doing) parts.push(`手上：${slot.doing}。`);
     if (slot.body) parts.push(`身上：${slot.body}。`);
+
+    // 来路：今天早些时候在哪、做了什么（只有过去，不编未来）
+    const trace = traceLine(day, now);
+    if (trace) parts.push(trace);
 
     // 现场：天气 / 光线 / 气味 —— 只给一条，别堆
     const env = day.env || {};

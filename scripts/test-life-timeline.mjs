@@ -10,6 +10,7 @@ import {
   envOf,
   expandSlots,
   lifeMomentLine,
+  traceLine,
   nightOwlOf,
   periodOf,
   pickRegime,
@@ -134,6 +135,46 @@ ok('日型不带括号注释', line.indexOf('（') === -1 || line.indexOf('（')
 ok('文本里有地点', line.includes('你'));
 ok('结尾有「别把整段念出来」', line.includes('别把整段念出来'));
 ok('长度在 120~320 之间（别太长）', line.length >= 120 && line.length <= 320, `实得 ${line.length}`);
+
+console.log('\u3010\u3016\u6765\u8def\u3017\u53ea\u8bb2\u5df2\u7ecf\u8fc7\u53bb\u7684\u683c\u5b50\u3011');
+{
+  const at = (h, m = 10) => new Date(2026, 9, 30, h, m, 0).getTime();
+  // \u4eca\u5929\u7b2c\u4e00\u683c\u90fd\u8fd8\u6ca1\u7ed3\u675f \u2192 \u6ca1\u6709\u6765\u8def
+  const t0 = traceLine(day, at(6, 5));
+  ok('\u521a\u8d77\u5e8a\u6ca1\u6709\u6765\u8def', t0 === '', `\u5b9e\u5f97 ${t0}`);
+
+  // \u4e0a\u5348 10 \u70b9 \u2192 \u9802\u591a\u4e09\u683c\uff0c\u4e14\u90fd\u662f\u8d70\u5b8c\u7684
+  const t1 = traceLine(day, at(10));
+  ok('10 \u70b9\u6709\u6765\u8def', t1.length > 0, `\u5b9e\u5f97 ${t1}`);
+  ok('\u6765\u8def\u4ee5\u300c\u65e9\u4e9b\u65f6\u5019\uff1a\u300d\u5f00\u5934', t1.startsWith('\u65e9\u4e9b\u65f6\u5019\uff1a'), t1);
+  ok('\u6765\u8def\u4e0d\u63d0\u672a\u6765\uff08\u65e0\u300c\u7a0d\u540e/\u4e00\u4f1a\u513f/\u5f85\u4f1a\u300d\uff09', !/\u7a0d\u540e|\u4e00\u4f1a\u513f|\u5f85\u4f1a|\u63a5\u4e0b\u6765/.test(t1), t1);
+
+  // \u5f53\u524d\u683c\u4e0d\u80fd\u51fa\u73b0\u5728\u6765\u8def\u91cc\uff08\u5b83\u8fd8\u6ca1\u5b8c\uff09
+  const cur = slotAt(day, at(10));
+  ok('\u6765\u8def\u4e0d\u542b\u5f53\u524d\u683c', cur && !t1.includes(`${cur.from} `), `cur=${cur?.from} / ${t1}`);
+
+  // \u540c\u4e00\u5730\u70b9\u53ea\u7559\u6700\u8fd1\u4e00\u6b21
+  const t2 = traceLine(day, at(14));
+  const whereCount = {};
+  for (const m of t2.matchAll(/\u5728([^\uff0c\uff1b\u3002]+)\uff0c/g)) whereCount[m[1]] = (whereCount[m[1]] || 0) + 1;
+  ok('\u540c\u4e00\u5730\u70b9\u4e0d\u91cd\u590d\u51fa\u73b0', Object.values(whereCount).every((n) => n === 1), JSON.stringify(whereCount));
+
+  // \u592a\u65e7\u7684\u683c\u5b50\u4e0d\u63d0\uff08\u9ed8\u8ba4 8 \u5c0f\u65f6\uff09
+  const t3 = traceLine(day, new Date(2026, 9, 30, 23, 10, 0).getTime());
+  ok('23 \u70b9\u4e0d\u63d0\u5341\u5c0f\u65f6\u524d\u7684\u4e66\u623f', !/\u4e66\u623f/.test(t3) || /1[6-9]:\d\d \u5728\u4e66\u623f/.test(t3), t3);
+
+  // \u8d85\u957f\u4ece\u6700\u65e7\u7684\u5f00\u59cb\u4e22
+  const t4 = traceLine(day, at(14), { maxChars: 40 });
+  ok('\u8d85\u957f\u65f6\u622a\u65ad\u800c\u4e0d\u8d85\u9650', t4.length === 0 || t4.length <= 40, `\u5b9e\u5f97 ${t4.length}`);
+
+  // \u7a7a\u65e5\u4e0d\u70b8
+  ok('\u7a7a\u65e5\u8fd4\u56de\u7a7a\u4e32', traceLine(null) === '' && traceLine({}) === '' && traceLine({ slots: [] }) === '');
+
+  // \u6574\u6bb5\u6ce8\u5165\u91cc\u771f\u7684\u5e26\u4e0a\u4e86
+  const line10 = lifeMomentLine(day, at(10));
+  ok('\u6ce8\u5165\u6587\u672c\u91cc\u6709\u6765\u8def\u90a3\u53e5', line10.includes('\u65e9\u4e9b\u65f6\u5019\uff1a'), `\u957f\u5ea6 ${line10.length}`);
+  ok('\u52a0\u4e86\u6765\u8def\u4ecd\u5728 320 \u5b57\u4ee5\u5185', line10.length <= 320, `\u5b9e\u5f97 ${line10.length}`);
+}
 
 console.log('【7】slotAt 跨零点');
 const early = new Date(2026, 9, 30, 0, 10, 0).getTime();
