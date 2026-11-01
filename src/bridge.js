@@ -4970,7 +4970,10 @@ async function main() {
     {
       setTimeout(() => { void diaryArtRecoverTick(); }, 90 * 1000).unref?.();
       setInterval(() => { void diaryArtRecoverTick(); }, 15 * 60 * 1000).unref?.();
-      log('[日记配图] 补做定时器已排上（启动 90 秒后首扫，之后每 15 分钟）');
+      // 这里不能碰 readDiaryArtQueue：DIARY_ART_QUEUE_FILE 定义在文件下半段（约 11900 行），
+    // 定时器注册在 4970 行，启动期直接调就是 TDZ（Cannot access before initialization）。
+    // 迁移交给 90 秒后的首次 recoverTick —— 那时常量早就初始化好了。
+    log('[日记配图] 补做定时器已排上（启动 90 秒后首扫，之后每 15 分钟）');
     }
     // MARKER: attention-shadow-boot —— 启动 2 分钟后先算一次报告（确认判据在真数据上跑得动），
     // 之后每 6 小时一次。频率低是因为判据窗口是 3 天，跑太勤没有新信息。
@@ -9590,8 +9593,14 @@ async function stickerLearnTick() {
                   level: levelRaw
                 });
                 if (!r) { sendJson({ ok: false, error: '找不到要改写的那条日记' }, 404); return; }
-                const bytes = writeDiary(DIARY_FILE, entries);
-                if (bytes > DIARY_MAX_BYTES) { sendJson({ ok: false, error: '日记文件已达上限' }, 400); return; }
+                // writeDiary 现在自己就守上限（抛 DIARY_TOO_LARGE），不再「写完再报错」。
+                // 原来那句 `if (bytes > MAX_BYTES)` 是在文件已经落盘之后才比大小，等于先污染再报错。
+                try {
+                  writeDiary(DIARY_FILE, entries);
+                } catch (error) {
+                  sendJson({ ok: false, error: error?.message ?? '日记文件已达上限' }, 400);
+                  return;
+                }
                 sendJson({
                   ok: true, key, mode: 'replace', changed: r.changed,
                   level: normalizeLevel(r.entry.level),
@@ -9608,8 +9617,12 @@ async function stickerLearnTick() {
                 sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
                 return;
               }
-              const bytes = writeDiary(DIARY_FILE, entries);
-              if (bytes > DIARY_MAX_BYTES) { sendJson({ ok: false, error: '日记文件已达上限' }, 400); return; }
+              try {
+                writeDiary(DIARY_FILE, entries);
+              } catch (error) {
+                sendJson({ ok: false, error: error?.message ?? '日记文件已达上限' }, 400);
+                return;
+              }
               log(`[日记] ${key} 写了一条（共 ${entries.length} 条）`);
               // MARKER: diary-art-trigger
               try { queueDiaryArt(key, entry, { artPrompt: body.artPrompt }); } catch (error) { log(`[日记配图] 排队失败：${error?.message ?? error}`); }
@@ -11868,7 +11881,7 @@ function queueDiaryArt(key, entry, { artPrompt = '' } = {}) {
   const c = artCfg(cfg);
   if (!c.enabled) return false;
   if (!entry || !entry.id) return false;
-  if (diaryArtInflight.has(entry.id)) return false;
+  if (diaryArtInflightOf(entry.id)) return false;
   let used = 0;
   try { used = countArtInDay(readDiary(DIARY_ART_FILE), entry.day || ''); } catch {}
   if (!artAllowed({ entriesToday: used, cfg })) {
@@ -11889,59 +11902,85 @@ function queueDiaryArt(key, entry, { artPrompt = '' } = {}) {
   // MARKER: diary-art-persist
   // 画图任务落盘待办账本。原来是游离 Promise：2026-10-31 01:07:50 画到一半进程重启，
   // 那条日记的图就永远没了，连「画失败」都没来得及打。落盘之后启动补做 + 超时重排。
-  const DIARY_ART_PENDING_FILE = path.join(STATE_DIR, 'diary-art-pending.json');
+  // 「待办」改名「队列」：它已经不只是启动补做的待办单了，还承担超时重排的租约。
+  // 旧文件名 diary-art-pending.json 保留成迁移源，**不删** —— 回滚时还要用。
+  const DIARY_ART_QUEUE_FILE = path.join(STATE_DIR, 'diary-art-queue.json');
+  const DIARY_ART_LEGACY_FILE = path.join(STATE_DIR, 'diary-art-pending.json');
   const DIARY_ART_MAX_ATTEMPTS = 3;
   const DIARY_ART_RETRY_AFTER_MS = 10 * 60 * 1000;
   let diaryArtRecoverBusy = false;
+  // inflight 从「有 id 就算在跑」升级成「带租约」：
+  // 原来 `has(id)` 一旦卡住就永远 skip，只有重启能救（10-31 那张图就这么丢的）。
+  // 现在记 startedAt 与 lease，超过 10 分钟允许重排，旧 promise 靠 lease 失效自我作废。
+  // diaryArtInflight 已在文件上层声明（模块级 Map），这里不再重复声明。
+  let diaryArtLeaseSeq = 0;
+  function diaryArtNewLease() { diaryArtLeaseSeq += 1; return `L${Date.now().toString(36)}${diaryArtLeaseSeq}`; }
+  function diaryArtInflightOf(id) { return diaryArtInflight.get(String(id)) || null; }
 
-  function readDiaryArtPending() {
-    const raw = readJsonSafe(DIARY_ART_PENDING_FILE, null);
+  function readDiaryArtQueue() {
+    let raw = readJsonSafe(DIARY_ART_QUEUE_FILE, null);
+    if (!raw || !Array.isArray(raw.items)) {
+      // 新文件不在或坏了：退到旧文件。只在此时读旧的，之后一律只写新的。
+      const legacy = readJsonSafe(DIARY_ART_LEGACY_FILE, null);
+      if (legacy && Array.isArray(legacy.items)) {
+        raw = legacy;
+        log(`[日记配图] 队列从旧账本迁移（${legacy.items.length} 条）`);
+        try { atomicWriteJson(DIARY_ART_QUEUE_FILE, { version: 1, updatedAt: Date.now(), items: raw.items.slice(-50) }); } catch (error) {
+          log(`[日记配图] 队列迁移落盘失败：${error?.message ?? error}`);
+        }
+      }
+    }
     const list = raw && Array.isArray(raw.items) ? raw.items : [];
     return { version: 1, updatedAt: Number(raw?.updatedAt) || 0, items: list.filter((x) => x && x.id) };
   }
 
-  function writeDiaryArtPending(store) {
+  function writeDiaryArtQueue(store) {
     try {
-      atomicWriteJson(DIARY_ART_PENDING_FILE, { version: 1, updatedAt: Date.now(), items: store.items.slice(-50) });
+      atomicWriteJson(DIARY_ART_QUEUE_FILE, { version: 1, updatedAt: Date.now(), items: store.items.slice(-50) });
     } catch (error) {
-      log(`[日记配图] 待办账本落盘失败：${error?.message ?? error}`);
+      log(`[日记配图] 队列落盘失败：${error?.message ?? error}`);
     }
   }
 
-  function upsertDiaryArtPending(item) {
-    const store = readDiaryArtPending();
+  function upsertDiaryArtQueue(item) {
+    const store = readDiaryArtQueue();
     const i = store.items.findIndex((x) => x.id === item.id);
     if (i >= 0) store.items[i] = { ...store.items[i], ...item };
     else store.items.push(item);
-    writeDiaryArtPending(store);
+    writeDiaryArtQueue(store);
   }
 
-  function dropDiaryArtPending(id) {
-    const store = readDiaryArtPending();
+  function dropDiaryArtQueue(id) {
+    const store = readDiaryArtQueue();
     const next = store.items.filter((x) => x.id !== id);
     if (next.length !== store.items.length) {
       store.items = next;
-      writeDiaryArtPending(store);
+      writeDiaryArtQueue(store);
     }
   }
 
   async function runDiaryArt(key, entry, prompt) {
     const c = artCfg(cfg);
-    diaryArtInflight.set(entry.id, Date.now());
-    upsertDiaryArtPending({
+    const lease = diaryArtNewLease();
+    diaryArtInflight.set(String(entry.id), { lease, startedAt: Date.now() });
+    upsertDiaryArtQueue({
       id: entry.id,
       day: String(entry.day || ''),
       key: String(key || ''),
       prompt,
       size: c.size,
       style: c.style,
-      attempts: Number((readDiaryArtPending().items.find((x) => x.id === entry.id)?.attempts) || 0),
+      attempts: Number((readDiaryArtQueue().items.find((x) => x.id === entry.id)?.attempts) || 0),
       startedAt: Date.now(),
       lastError: ''
     });
-    log(`[日记配图] 开始画 ${entry.id}（提示词 ${prompt.length} 字）`);
+    log(`[日记配图] 开始画 ${entry.id}（提示词 ${prompt.length} 字，租约 ${lease}）`);
     try {
       const result = await generateImageNow({ prompt, size: c.size });
+      // 画完了才检查租约：超时重排会让同一个 id 有第二个请求在跑，
+      // 先落地自己这张、把 decide 交给租约持有者，避免两拨写同一个 art 字段。
+      const stillMine = diaryArtInflightOf(entry.id)?.lease === lease;
+      if (!stillMine) log(`[日记配图] ${entry.id} 租约已失效（超时重排过），本次结果照存但不入账`);
       const dest = path.join(DIARY_ART_DIR, artFileName(entry));
       // **必须建 dest 的父目录**：artFileName 自 2c336a3 起按月分子目录（2026-11/xxx.png），
       // 只建 DIARY_ART_DIR 的话跨月就 ENOENT —— 11-01 那张图就是这么丢的。
@@ -11964,34 +12003,45 @@ function queueDiaryArt(key, entry, { artPrompt = '' } = {}) {
         // 日记条目可能已被删改，图还是留下，但不污染别的条目
         log(`[日记配图] 写回失败（条目已不在）${entry.id}，图已存 ${art.file}`);
       }
-      const target = diaryTargetFromKey(key);
-      if (target && shouldSendArt(c.sendToChat, key)) {
-        await onebotSend(target.kind, target.id, '', null, null, [dest]);
-        log(`[日记配图] 已发到 ${key}`);
+      if (stillMine) {
+        const target = diaryTargetFromKey(key);
+        if (target && shouldSendArt(c.sendToChat, key)) {
+          await onebotSend(target.kind, target.id, '', null, null, [dest]);
+          log(`[日记配图] 已发到 ${key}`);
+        }
+        dropDiaryArtQueue(entry.id);
       }
-      dropDiaryArtPending(entry.id);
       return true;
     } catch (error) {
       const msg = String(error?.message ?? error);
-      const store = readDiaryArtPending();
+      // 租约失效说明这是被超时重排顶掉的旧请求，失败次数不该记在它头上。
+      const stillMine = diaryArtInflightOf(entry.id)?.lease === lease;
+      if (!stillMine) {
+        log(`[日记配图] 旧请求失败 ${entry.id}（租约已失效，忽略）：${msg}`);
+        return false;
+      }
+      const store = readDiaryArtQueue();
       const item = store.items.find((x) => x.id === entry.id);
       const attempts = (Number(item?.attempts) || 0) + 1;
       if (attempts >= DIARY_ART_MAX_ATTEMPTS) {
         log(`[日记配图] 画失败 ${entry.id}（第 ${attempts} 次，放弃）：${msg}`);
-        dropDiaryArtPending(entry.id);
+        dropDiaryArtQueue(entry.id);
       } else {
+        // startedAt 每次失败都刷新是**故意的**：失败后要再等一个完整窗口才重试，
+        // 不然失败一次就会被立刻重排，无限打转。
         log(`[日记配图] 画失败 ${entry.id}（第 ${attempts} 次，稍后重试）：${msg}`);
-        upsertDiaryArtPending({ id: entry.id, attempts, lastError: msg, startedAt: Date.now() });
+        upsertDiaryArtQueue({ id: entry.id, attempts, lastError: msg, startedAt: Date.now() });
       }
       return false;
     } finally {
-      diaryArtInflight.delete(entry.id);
+      // 只有持有当前租约的人才清 map；被顶掉的旧 promise 不能删掉新租约。
+      if (diaryArtInflightOf(entry.id)?.lease === lease) diaryArtInflight.delete(String(entry.id));
     }
   }
 
   function startDiaryArt(key, entry, prompt, c) {
     // 意图记录：先记再画，进程半路退出也能在下次启动补回来。
-    upsertDiaryArtPending({
+    upsertDiaryArtQueue({
       id: entry.id,
       day: String(entry.day || ''),
       key: String(key || ''),
@@ -12011,18 +12061,27 @@ function queueDiaryArt(key, entry, { artPrompt = '' } = {}) {
     if (diaryArtRecoverBusy) return;
     diaryArtRecoverBusy = true;
     try {
-      const store = readDiaryArtPending();
+      const store = readDiaryArtQueue();
       if (!store.items.length) return;
       const art = artCfg(cfg);
       if (!art.enabled) return;
       const now = Date.now();
       let launched = 0;
       for (const item of store.items) {
-        if (diaryArtInflight.has(item.id)) continue;
+        // 关键改动：不再「在跑就跳过」，而是「跑了多久」。
+        // 旧逻辑 `if (diaryArtInflight.has(item.id)) continue;` 一旦某个请求吊死，
+        // 这个 id 就永远跳过，只有重启进程能救；现在超过 10 分钟就判超时、放行重排，
+        // 旧 promise 靠 lease 失效自我作废，不会两拨同时写同一条日记。
+        const inflight = diaryArtInflightOf(item.id);
+        if (inflight) {
+          if (now - Number(inflight.startedAt || 0) < DIARY_ART_RETRY_AFTER_MS) continue;
+          log(`[日记配图] 补做重排 ${item.id}（上次请求已 ${Math.round((now - Number(inflight.startedAt || 0)) / 60000)} 分钟未完成，租约 ${inflight.lease} 作废）`);
+          diaryArtInflight.delete(String(item.id));
+        }
         if (now - Number(item.startedAt || 0) < DIARY_ART_RETRY_AFTER_MS) continue;
         if ((Number(item.attempts) || 0) >= DIARY_ART_MAX_ATTEMPTS) {
           log(`[日记配图] 补做放弃 ${item.id}（已试 ${item.attempts} 次）`);
-          dropDiaryArtPending(item.id);
+          dropDiaryArtQueue(item.id);
           continue;
         }
         // readDiary 返回的是数组（不是 {entries}），别写错。
@@ -12030,22 +12089,22 @@ function queueDiaryArt(key, entry, { artPrompt = '' } = {}) {
         const entry = entries.find((e) => e && e.id === item.id);
         if (!entry) {
           log(`[日记配图] 补做跳过 ${item.id}（日记条目已不在）`);
-          dropDiaryArtPending(item.id);
+          dropDiaryArtQueue(item.id);
           continue;
         }
         if (entry.art && entry.art.file) {
           log(`[日记配图] 补做跳过 ${item.id}（已有图 ${entry.art.file}）`);
-          dropDiaryArtPending(item.id);
+          dropDiaryArtQueue(item.id);
           continue;
         }
         const used = countArtInDay(readDiary(DIARY_ART_FILE), entry.day || '');
         if (!artAllowed({ entriesToday: used, cfg })) {
           log(`[日记配图] 补做跳过 ${item.id}（当天额度已满 ${used}/${art.maxPerDay}）`);
-          dropDiaryArtPending(item.id);
+          dropDiaryArtQueue(item.id);
           continue;
         }
         if (!item.prompt) {
-          dropDiaryArtPending(item.id);
+          dropDiaryArtQueue(item.id);
           continue;
         }
         launched += 1;

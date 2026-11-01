@@ -10,7 +10,13 @@
 export const DIARY_DAILY_DEFAULTS = {
   enabled: true,
   cooldownMs: 3 * 3600 * 1000,
-  maxPerDay: 3,
+  // 两个上限，含义完全不同，不能共用一个：
+  //   maxPerDay       = 她当天**实际写了几条**的上限（写满就不再催）
+  //   maxPromptsPerDay= 系统当天**催了几次**的上限（防止从早念到晚）
+  // 原来两个都用 maxPerDay，结果「她主动写了 1 条」也占掉一次催写额度，
+  // 或者反过来「催了 3 次」就被当成「已经写了 3 条」。语义混在一起算不清。
+  maxPerDay: 5,
+  maxPromptsPerDay: 5,
   quietStart: 23,
   quietEnd: 8,
   strongAfterHour: 20,
@@ -38,6 +44,8 @@ export function dailyCfg(cfg) {
     enabled: raw.enabled !== false,
     cooldownMs: num(raw.cooldownMs, DIARY_DAILY_DEFAULTS.cooldownMs),
     maxPerDay: num(raw.maxPerDay, DIARY_DAILY_DEFAULTS.maxPerDay),
+    // 没配就跟着 maxPerDay 走（默认都是 5）——单独配了才分叉。
+    maxPromptsPerDay: num(raw.maxPromptsPerDay, num(raw.maxPerDay, DIARY_DAILY_DEFAULTS.maxPromptsPerDay)),
     quietStart: hourOf(raw.quietStart, DIARY_DAILY_DEFAULTS.quietStart),
     quietEnd: hourOf(raw.quietEnd, DIARY_DAILY_DEFAULTS.quietEnd),
     strongAfterHour: hourOf(raw.strongAfterHour, DIARY_DAILY_DEFAULTS.strongAfterHour),
@@ -132,7 +140,8 @@ export function decideDailyDiary({ entries = [], now = Date.now(), hour = null, 
   const wroteToday = countEntriesOnDay(entries, day);
   if (wroteToday >= c.maxPerDay) return result(false, 'done', { wroteToday });
   if (inQuiet(hh, c)) return result(false, 'quiet');
-  if (rec.count >= c.maxPerDay) return result(false, 'capped');
+  // 注意这里换成 maxPromptsPerDay：rec.count 是「催了几次」，不是「写了几条」。
+  if (rec.count >= c.maxPromptsPerDay) return result(false, 'capped', { wroteToday });
   const lastAt = Number(rec.lastAt) || 0;
   if (lastAt > 0 && Number(now) - lastAt < c.cooldownMs) return result(false, 'cooldown');
 
@@ -152,17 +161,18 @@ export function dailyDiaryLine({ hour = 12, count = 1, wroteToday = 0, cfg = DIA
   const c = { ...DIARY_DAILY_DEFAULTS, ...(cfg && typeof cfg === 'object' ? cfg : {}) };
   const again = Number(count) > 1 ? '（再提醒一次）' : '';
   const already = Number(wroteToday) || 0;
+  const cap = Math.max(1, Number(c.maxPerDay) || DIARY_DAILY_DEFAULTS.maxPerDay);
   // 已经写过就别再说「今天还没写」—— 那是事实错误，她会照着演。
   if (already > 0) {
     if (Number(hour) >= c.strongAfterHour) {
-      return `【今天已经写了 ${already} 条，还能再写一条】${again}要是有想记下来的事，趁现在记一句（qq_diary，写具体的：谁说了什么、你当时怎么想的）。没有就不用写，别硬凑。\n\n`;
+      return `【今天已经写了 ${already}/${cap} 条】${again}还能再写${already + 1 < cap ? '几' : '一'}条。想记就记，写具体的：谁说了什么、你当时怎么想的、场景是什么样。没有就不用写，别硬凑。\n\n`;
     }
-    return `【今天写了 ${already} 条】${again}又想起什么了？可以再记一条（qq_diary，一两句具体的）。没想起就跳过，别为了凑数写。\n\n`;
+    return `【今天写了 ${already}/${cap} 条】${again}又想起什么了？可以再记一条（qq_diary，写具体的事，几百字也行，分段也行）。没想起就跳过，别为了凑数写。\n\n`;
   }
   if (Number(hour) >= c.strongAfterHour) {
-    return `【今天快过完了，日记还没写】${again}先补一条今天的事（qq_diary，一两句具体的：发生了什么、你当时怎么想），写完再去聊别的。别等明天——明天写不出今天的感觉。\n\n`;
+    return `【今天快过完了，日记还没写】${again}先补一条今天的事（qq_diary，写具体的：发生了什么、你当时怎么想、周围什么样；几百字也行，分段也行），写完再去聊别的。别等明天——明天写不出今天的感觉。\n\n`;
   }
-  return `【今天还没写日记】${again}先把今天写下来（qq_diary，一两句具体的：谁说了什么、你当时怎么想的），写完再聊别的。别写成总结，也别在聊天里汇报「我写了日记」。\n\n`;
+  return `【今天还没写日记】${again}先把今天写下来（qq_diary，写具体的事：谁说了什么、你当时怎么想的、旁边是什么样；可以写长，可以分几段），写完再聊别的。别写成总结，也别在聊天里汇报「我写了日记」。\n\n`;
 }
 
 // MARKER: diary-draft
@@ -171,7 +181,7 @@ export function dailyDiaryLine({ hour = 12, count = 1, wroteToday = 0, cfg = DIA
 // 系统替她写进去，那份「她自己写的」就不成立了。草稿放着，她改两句再发。
 export const DIARY_DRAFT_DEFAULTS = {
   keepHours: 20,
-  textChars: 200,
+  textChars: 400,
   moodChars: 20,
   eveningHour: 23,
   eveningMinute: 20,
@@ -189,7 +199,7 @@ export function draftCfg(cfg) {
   };
   return {
     keepHours: pick(src.draftKeepHours, DIARY_DRAFT_DEFAULTS.keepHours, 1, 72),
-    textChars: pick(src.draftTextChars, DIARY_DRAFT_DEFAULTS.textChars, 20, 400),
+    textChars: pick(src.draftTextChars, DIARY_DRAFT_DEFAULTS.textChars, 20, 800),
     moodChars: pick(src.draftMoodChars, DIARY_DRAFT_DEFAULTS.moodChars, 2, 40),
     eveningHour: pick(src.eveningHour, DIARY_DRAFT_DEFAULTS.eveningHour, 0, 23),
     eveningMinute: pick(src.eveningMinute, DIARY_DRAFT_DEFAULTS.eveningMinute, 0, 59),
@@ -200,12 +210,13 @@ export function draftCfg(cfg) {
 export function normalizeDraft(raw, cfg = null) {
   const c = { ...DIARY_DRAFT_DEFAULTS, ...(cfg && typeof cfg === 'object' ? cfg : {}) };
   if (!raw || typeof raw !== 'object') return null;
-  const text = String(raw.text ?? '').replace(/\s+/g, ' ').trim();
+  // 保留换行（草稿可能是一段场景，压成一行就只剩流水账）；只压横向空白。
+  const text = String(raw.text ?? '').replace(/\r\n?/g, '\n').replace(/[^\S\n]+/g, ' ').trim();
   if (!text) return null;
   return {
     day: String(raw.day ?? '').slice(0, 10),
     text: text.length > c.textChars ? text.slice(0, Math.max(1, c.textChars - 1)) + '…' : text,
-    mood: String(raw.mood ?? '').replace(/\s+/g, ' ').trim().slice(0, c.moodChars),
+    mood: String(raw.mood ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, c.moodChars),
     at: Number(raw.at) > 0 ? Number(raw.at) : Date.now(),
   };
 }

@@ -291,11 +291,13 @@ export function parseSettleJSON(text) {
   // 纪念日也不在这里洗（规则在 dates.js，带单测）。
   const dates = Array.isArray(parsed.dates) ? parsed.dates.slice(0, 10) : [];
   // 日记草稿：只认对象 + 有正文；截长，别让它把提示词和文件撑大。
+  // 400 字：草稿是「提醒她想起来」的引子，不是正文，比正文（1200）短一截才合理。
+  // 换行保留 —— 她想起的可能是一段场景，压成一行就只剩流水账。
   let diary = null;
   if (parsed.diary && typeof parsed.diary === 'object' && !Array.isArray(parsed.diary)) {
-    const text = String(parsed.diary.text ?? '').replace(/\s+/g, ' ').trim();
-    const mood = String(parsed.diary.mood ?? '').replace(/\s+/g, ' ').trim().slice(0, 20);
-    if (text) diary = { text: text.slice(0, 200), mood };
+    const text = String(parsed.diary.text ?? '').replace(/\r\n?/g, '\n').trim();
+    const mood = String(parsed.diary.mood ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, 20);
+    if (text) diary = { text: text.slice(0, 400), mood };
   }
   return { ok: true, value: { mood, impressions, portraits, notes, life, threads, wishes, doneWishes, resolvedThreads, dates, diary } };
 }
@@ -362,7 +364,7 @@ export function planSettleWrites(
   const selfList = Array.isArray(value.portraits) ? value.portraits : [];
   const selfCap = num(maxPortraits, SETTLE_DEFAULTS.maxPortraits, { min: 0, max: 6 });
   const diary = value.diary && typeof value.diary === 'object' && !Array.isArray(value.diary) && value.diary.text
-    ? { text: String(value.diary.text).slice(0, 200), mood: String(value.diary.mood ?? '').slice(0, 20) }
+    ? { text: String(value.diary.text).replace(/\r\n?/g, '\n').slice(0, 400), mood: String(value.diary.mood ?? '').replace(/[\r\n]+/g, ' ').slice(0, 20) }
     : null;
   const noteList = Array.isArray(value.notes) ? value.notes : [];
   const noteCap = num(maxNotes, SETTLE_DEFAULTS.maxNotes, { min: 0, max: 4 });

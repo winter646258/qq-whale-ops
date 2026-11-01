@@ -32,10 +32,14 @@ import crypto from 'node:crypto';
 export const DIARY_JSONL = '日记.jsonl';
 export const DIARY_LEGACY_MD = '日记.md';
 
-export const MAX_ENTRIES = 2000;
-export const MAX_TEXT_CHARS = 200;
+// 上限三兄弟是一套的，改一个必须一起看：
+//   一天最多 5 条（diary-daily 的 maxPerDay），单条 1200 字 ≈ 3.6KB（UTF-8 中文）。
+//   2000 条上限在「一天 5 条」下 0.91 年就满，满了 appendDiaryEntry 直接抛错 ⇒ 日记会静默停写。
+//   所以条数放到 6000（约 3.3 年）、字节放到 16MiB（6000 × 平均 800 字 ≈ 14MB）。
+export const MAX_ENTRIES = 6000;
+export const MAX_TEXT_CHARS = 1200;
 export const MAX_MOOD_CHARS = 20;
-export const MAX_BYTES = 2 * 1024 * 1024;
+export const MAX_BYTES = 16 * 1024 * 1024;
 
 /** 三档，从轻到重。顺序有意义：索引越大越难忘。 */
 export const LEVELS = ['normal', 'important', 'critical'];
@@ -100,11 +104,27 @@ export function isFaded(entry, now = Date.now()) {
   return diaryWeight(entry, now) < FADE_THRESHOLD;
 }
 
-function cleanText(raw, max = MAX_TEXT_CHARS) {
-  return String(raw ?? '')
-    .replace(/[\r\n]+/g, ' ')     // 换行压成空格：一条日记就该是一行
-    .trim()
-    .slice(0, max);
+/**
+ * 正文归一化。
+ *
+ * 两条路子必须分开，否则会互相打架：
+ *   写入（strict=true）：超长直接抛错，**绝不静默截断** —— 截断等于替她删字，
+ *     她还以为自己写完了。让她收到「超过 1200 字」重写一遍，比默默丢掉后半段好。
+ *   读取（strict=false）：超长只切到上限，不抛错。老条目不因为新规则变坏行 ——
+ *     读不出来的日记等于没了，那比截断更糟。
+ *
+ * 换行保留：一条日记可以分几段。JSONL 是「一个 JSON 对象一行」，
+ * JSON.stringify 会把 \n 转义成 \\n，物理上仍是一行，所以格式不用改。
+ */
+function cleanText(raw, max = MAX_TEXT_CHARS, { strict = false } = {}) {
+  const s = String(raw ?? '')
+    .replace(/\r\n?/g, '\n')   // CRLF / CR 统一成 LF，别让不同来源的换行打架
+    .trim();
+  if (!strict) return s.length > max ? s.slice(0, max) : s;
+  // 按 Unicode 码点算，别用 .length（emoji 会被算成两个）
+  const chars = [...s].length;
+  if (chars > max) throw new Error(`日记内容超过 ${max} 字（这条 ${chars} 字），删一点再写`);
+  return s;
 }
 
 function cleanMood(raw) {
@@ -158,6 +178,9 @@ export function readDiary(file) {
   return out;
 }
 
+/** 配图提示词上限。跟 diary-art.js 的 maxPromptChars 默认值对齐，不跟正文字数联动。 */
+export const MAX_ART_PROMPT_CHARS = 700;
+
 /** 原子写全部日记（临时文件 + rename），权限 600。 */
 export function writeDiary(file, entries) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -177,6 +200,13 @@ export function writeDiary(file, entries) {
       ...(e.art && e.art.file ? { art: e.art } : {})
     }));
   const payload = lines.join('\n') + (lines.length ? '\n' : '');
+  // **写之前算字节，不是写完再算**。原来调用方是 `writeDiary()` 之后再比大小，
+  // 超限时磁盘上已经是超限内容了 —— 原子写等于先把文件污染了再报错。
+  // 这里提前拒，原文件一个字节都不动。
+  const size = Buffer.byteLength(payload, 'utf8');
+  if (size > MAX_BYTES) {
+    throw Object.assign(new Error(`日记文件超过上限（${Math.round(size / 1024)}KB > ${Math.round(MAX_BYTES / 1024)}KB）`), { code: 'DIARY_TOO_LARGE', size });
+  }
   try {
     fs.writeFileSync(tmp, payload, { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmp, file);
@@ -184,7 +214,7 @@ export function writeDiary(file, entries) {
     try { fs.unlinkSync(tmp); } catch {}
     throw error;
   }
-  return Buffer.byteLength(payload, 'utf8');
+  return size;
 }
 
 /**
@@ -198,7 +228,7 @@ function cleanArt(raw) {
   const source = String(raw.source ?? '').trim().slice(0, 20);
   return {
     file,
-    prompt: String(raw.prompt ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, MAX_TEXT_CHARS * 2),
+    prompt: String(raw.prompt ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, MAX_ART_PROMPT_CHARS),
     ...(style ? { style } : {}),
     ...(source ? { source } : {}),
     at: Number(raw.at) > 0 ? Number(raw.at) : 0
@@ -244,7 +274,8 @@ function newId(taken) {
  * mood / level 都可选 —— 不传就不写这个字段（不给个默认值，省得每条都带个假心情）。
  */
 export function appendDiaryEntry(entries, { text, mood, level, now = Date.now() } = {}) {
-  const t = cleanText(text);
+  // strict：超长抛错，不截断。调用方（HTTP 路由 / 工具）把它映射成 400 让她重写。
+  const t = cleanText(text, MAX_TEXT_CHARS, { strict: true });
   if (!t) throw new Error('日记内容不能为空');
   const list = Array.isArray(entries) ? entries : [];
   if (list.length >= MAX_ENTRIES) throw new Error(`日记条数已达上限（${MAX_ENTRIES} 条）`);
@@ -294,7 +325,7 @@ export function updateDiaryEntry(entries, { id, oldText, text, mood, level, now 
 
   let changed = false;
   if (text !== undefined && text !== null && String(text).trim() !== '') {
-    const next = cleanText(text);
+    const next = cleanText(text, MAX_TEXT_CHARS, { strict: true });
     if (next && next !== hit.text) { hit.text = next; changed = true; }
   }
   if (mood !== undefined && mood !== null) {
@@ -390,7 +421,7 @@ export function parseLegacyMarkdown(file) {
     if (!s.startsWith('- ')) continue;
     const m = /^-\s*\[([^\]]+)\]\s*(.*)$/.exec(s);
     const stamp = m ? m[1].trim() : '';
-    const body = cleanText(m ? m[2] : s.slice(2));
+    const body = cleanText(m ? m[2] : s.slice(2));   // legacy：读取路径，不 strict
     if (!body) continue;
     // 旧时间戳是 UTC，这里只做展示迁移，不去纠时区（历史数据保持原样，不假装精确）
     out.push({ id: null, t: 0, time: stamp, day: (stamp || '').slice(0, 10), mood: '', level: DEFAULT_LEVEL, text: body, editedAt: 0 });

@@ -1400,7 +1400,9 @@ server.tool(
 // 存储格式不进工具描述 —— 她不需要知道文件长什么样。
 server.tool(
   'qq_diary',
-  '你自己的日记。只看不传 text；想写就带 text。想写的时候才写，一天几条就够，一两句、具体的小事，别写总结句，也别在聊天里汇报你写了日记。'
+  '你自己的日记。只看不传 text；想写就带 text。想写的时候才写，一天最多五条。'
+  + '**可以写长**：写具体的经历——谁说了什么、你当时怎么想、周围什么样、后来怎么收的，几百字都行，也可以分几段（正文里用换行分开）。'
+  + '写长的意义是把细节留住，不是为了凑字数：别写总结句，别写一整天的流水账，也别在聊天里汇报你写了日记。'
   + '想给某条标一下当时的心情就带 mood（随便几个字，不想标就不标）。'
   + 'level 是这条字能记多久：critical=非常重要，永远不会淡；important=重要，两三周慢慢淡；不传=普通，几天就淡了（淡了不等于删，是以后翻的时候不再浮出来）。'
   + '大部分人大部分事都是普通的，别把什么都标成 critical —— 标滥了这条分档就没意义了。'
@@ -1408,9 +1410,9 @@ server.tool(
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    text: z.string().optional().describe('要写的内容（不传则查看最近的日记）'),
+    text: z.string().optional().describe('要写的内容（不传则查看最近的日记）。可以写长：几百字、分几段都行，上限 1200 字。写具体的经历和当时的想法，别写总结句。'),
     mood: z.string().optional().describe('当时的心情，几个字就够（例：有点累 / 还行 / 挺高兴）。不想标就不传，别硬凑'),
-    artPrompt: z.string().optional().describe('可选：给这条日记配的那张手绘插画想画什么，一句话就够（例：蹲在门口看猫 / 抱着一大碗白饭）。不传就按心情自动挑一个场面'),
+    artPrompt: z.string().optional().describe('可选：给这条日记配的那张手绘插画想画什么，一句话就够（例：蹲在门口看猫 / 抱着一大碗白饭）。不传就按心情自动挑一个场面。提示词上限 700 字，正文写多长都不会按比例放大它。'),
     mode: z.enum(['append', 'replace']).optional().describe('append=追加一条（默认）；replace=改写某一条，用 oldText 或 id 指定'),
     oldText: z.string().optional().describe('mode=replace 时：要改写的那一条里的一段原文'),
     id: z.string().optional().describe('mode=replace 时：那条日记的 id（查看时有）'),

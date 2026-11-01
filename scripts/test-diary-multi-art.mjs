@@ -39,10 +39,13 @@ eq(one.nudged, true, '已写 1 条时仍会提醒（原来一条就 done）');
 eq(one.wroteToday, 1, 'wroteToday=1');
 eq(one.reason, 'nudge', 'reason=nudge');
 
-const three = decideDailyDiary({ entries: [mk('a', DAY), mk('b', DAY), mk('c', DAY)], now: T0, hour: 14, state: noState, cfg: {} });
-eq(three.nudged, false, '写满 3 条就停');
-eq(three.reason, 'done', 'reason=done');
-eq(three.wroteToday, 3, 'wroteToday=3');
+// maxPerDay 已从 3 提到 5（一天可以多写几条）
+const five = decideDailyDiary({ entries: [mk('a', DAY), mk('b', DAY), mk('c', DAY), mk('d', DAY), mk('e', DAY)], now: T0, hour: 14, state: noState, cfg: {} });
+eq(five.nudged, false, '写满 5 条就停');
+eq(five.reason, 'done', 'reason=done');
+eq(five.wroteToday, 5, 'wroteToday=5');
+const threeStillOk = decideDailyDiary({ entries: [mk('a', DAY), mk('b', DAY), mk('c', DAY)], now: T0, hour: 14, state: noState, cfg: {} });
+eq(threeStillOk.nudged, true, '只写 3 条时还能再催');
 
 const custom = decideDailyDiary({ entries: [mk('a', DAY), mk('b', DAY)], now: T0, hour: 14, state: noState, cfg: { maxPerDay: 2 } });
 eq(custom.nudged, false, 'maxPerDay=2 时写满 2 条就停');
@@ -67,17 +70,18 @@ eq(stale.nudged, true, '4 小时前提醒过 → 可以再提醒');
 console.log('\n【4】静默期 / 开关 / 上限都还在');
 eq(decideDailyDiary({ entries: [], now: T0, hour: 2, state: noState, cfg: {} }).reason, 'quiet', '凌晨 2 点静默');
 eq(decideDailyDiary({ entries: [], now: T0, hour: 14, state: noState, cfg: { enabled: false } }).reason, 'disabled', '关掉时不催');
-eq(decideDailyDiary({ entries: [mk('a', DAY)], now: T0, hour: 14, state: { days: { [DAY]: { count: 3, lastAt: 0 } } }, cfg: {} }).reason, 'capped', '提醒次数达上限');
+// 催写次数上限是独立的 maxPromptsPerDay（默认 5），不再跟 maxPerDay 混用
+eq(decideDailyDiary({ entries: [mk('a', DAY)], now: T0, hour: 14, state: { days: { [DAY]: { count: 5, lastAt: 0 } } }, cfg: {} }).reason, 'capped', '催满 5 次达上限（哪怕只写了 1 条）');
 
 console.log('\n【5】文案不能说假话');
 const l0 = dailyDiaryLine({ hour: 14, count: 1, wroteToday: 0, cfg: {} });
 ok(l0.includes('今天还没写日记'), '没写过时说「还没写」');
 const l1 = dailyDiaryLine({ hour: 14, count: 2, wroteToday: 1, cfg: {} });
 ok(!l1.includes('今天还没写'), '写过 1 条时不能说「今天还没写」');
-ok(l1.includes('写了 1 条'), '写过 1 条时说「写了 1 条」');
+ok(l1.includes('1/5'), '写过 1 条时显示 1/5');
 const l2 = dailyDiaryLine({ hour: 21, count: 2, wroteToday: 2, cfg: {} });
 ok(!l2.includes('今天还没写'), '晚 9 点写过 2 条时也不能说「今天还没写」');
-ok(l2.includes('还能再写一条'), '晚 9 点提示还能再写');
+ok(/还能再写[几一]条/.test(l2), '晚 9 点提示还能再写');
 ok(l2.includes('别硬凑'), '明确允许不写');
 const l3 = dailyDiaryLine({ hour: 21, count: 1, wroteToday: 0, cfg: {} });
 ok(l3.includes('快过完了'), '晚 9 点没写过 → 强提醒');
@@ -104,7 +108,8 @@ console.log('\n【8】bridge 里确实改成建父目录 + 落账本');
 const bridge = fs.readFileSync('/opt/qq-bridge/src/bridge.js', 'utf8');
 ok(bridge.includes('fs.mkdirSync(path.dirname(dest), { recursive: true });'), 'bridge 建的是 dest 的父目录');
 ok(!/fs\.mkdirSync\(DIARY_ART_DIR, \{ recursive: true \}\);\n      const dest/.test(bridge), '不再只建 DIARY_ART_DIR');
-ok(bridge.includes('DIARY_ART_PENDING_FILE'), '有待办账本');
+ok(bridge.includes('DIARY_ART_QUEUE_FILE'), '有队列账本');
+ok(bridge.includes('DIARY_ART_LEGACY_FILE'), '保留旧账本做迁移源');
 ok(bridge.includes('diaryArtRecoverTick'), '有补做函数');
 ok(bridge.includes('补做定时器已排上'), '启动时排了补做');
 ok(bridge.includes('DIARY_ART_MAX_ATTEMPTS'), '有重试上限');
