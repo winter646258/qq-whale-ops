@@ -4,6 +4,8 @@
 import { normalizeWorld, minuteOf } from '../src/world.js';
 import {
   buildLocalDay,
+  periodIndex,
+  PERIOD_ORDER,
   dayKeyOf,
   dayStartOf,
   ensureDay,
@@ -357,6 +359,67 @@ for (let i = 0; i < 14; i += 1) {
 }
 ok('十四天骨架无空洞、无断缝、每天都有日型', bad.length === 0);
 if (bad.length) console.log('   → ' + bad.join('；'));
+
+// ---- 【15】计划时段自洽：说「晚上早点睡」就不能排在早上六点 ----------
+// 实测暴露（2026-11-02）：`{period:'晚上', text:'多摆几个角度比新头像，早点睡'}`
+// 落在 06:00 清晨那一格。根因是 weavePlans 的「同地点优先」不管时段，
+// 加上该时段已无空格时没有纠偏。这里用真 world + 真计划日期做回归。
+console.log('\n【15】计划时段自洽');
+{
+  const WANT = { 上午: '10:00', 下午: '14:00', 晚上: '19:00' };
+  const realPlanDays = ['2026-10-29', '2026-10-30', '2026-10-31', '2026-11-01', '2026-11-02'];
+  const REAL_PLANS = {
+    '2026-10-29': [
+      { period: '上午', text: '再看一眼生图修好没有，试一张空场子' },
+      { period: '下午', text: '把表情库里存的表情翻一遍，挑几张出来用' },
+      { period: '晚上', text: '看半场CS比赛，等他讲压了谁' },
+    ],
+    '2026-10-30': [
+      { period: '上午', text: '煮一锅白饭配咸菜，慢慢吃完' },
+      { period: '下午', text: '把窗边那几样挪去晒太阳，顺手发会儿呆' },
+      { period: '晚上', text: '翻几页旧书，不赶着画图' },
+    ],
+    '2026-10-31': [
+      { period: '上午', text: '把田里的作物收一轮，攒钱换大背包' },
+      { period: '下午', text: '窝在沙发角落看雨，把厚毯子翻出来' },
+      { period: '晚上', text: '裹着毯子接着种田，早点睡' },
+    ],
+    '2026-11-01': [
+      { period: '上午', text: '去公园再看一盘棋，这回站边上' },
+      { period: '下午', text: '把毯子晒一晒，顺手把手柄擦干净' },
+      { period: '晚上', text: '早点煮面吃完，躺平接着种田' },
+    ],
+    '2026-11-02': [
+      { period: '上午', text: '把窗子擦一遍，顺手翻两页相册' },
+      { period: '下午', text: '煮一锅番茄鸡蛋汤面，边吃边看雨' },
+      { period: '晚上', text: '多摆几个角度比新头像，早点睡' },
+    ],
+  };
+  const drifting = [];
+  let missing = 0;
+  for (const dk of realPlanDays) {
+    const plans = REAL_PLANS[dk];
+    const day = buildLocalDay(WORLD_V4, { dayKey: dk, plans });
+    for (const p of plans) {
+      const slot = day.slots.find((s) => s.planText === p.text);
+      if (!slot) { missing += 1; continue; }
+      const gap = Math.abs(periodIndex(slot.from) - periodIndex(WANT[p.period]));
+      if (gap > 1) drifting.push(`${dk} ${p.period}「${p.text}」落到了 ${slot.from}`);
+    }
+  }
+  ok('每一条计划都落进了某格（没有静默丢弃）', missing === 0, `missing=${missing}`);
+  ok('没有计划偏两档以上', drifting.length === 0, drifting.join(' / '));
+
+  // 单点回归：11-02 那条「晚上早点睡」
+  const d1102 = buildLocalDay(WORLD_V4, { dayKey: '2026-11-02', plans: REAL_PLANS['2026-11-02'] });
+  const sleepEarly = d1102.slots.find((s) => (s.planText || '').includes('早点睡'));
+  ok('「晚上早点睡」不在清晨', Boolean(sleepEarly) && periodIndex(sleepEarly.from) >= 3, sleepEarly ? sleepEarly.from : '(缺失)');
+  ok('「晚上早点睡」也不是早上（<09:00）', Boolean(sleepEarly) && minuteOf(sleepEarly.from) >= 9 * 60, sleepEarly ? sleepEarly.from : '(缺失)');
+
+  // 时段顺序常量本身
+  ok('PERIOD_ORDER 是 清晨→夜里', PERIOD_ORDER.join(',') === '清晨,上午,下午,傍晚,夜里', PERIOD_ORDER.join(','));
+  ok('periodIndex 单调', periodIndex('06:00') < periodIndex('10:00') && periodIndex('10:00') < periodIndex('14:00') && periodIndex('14:00') < periodIndex('19:00') && periodIndex('19:00') < periodIndex('23:00'));
+}
 
 console.log(`\n结果：${pass} 过 / ${fail} 挂`);
 process.exit(fail ? 1 : 0);

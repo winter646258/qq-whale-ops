@@ -887,6 +887,44 @@ function normalizeIdList(value) {
 }
 
 // ── 配置 ────────────────────────────────────────────────────────────────────
+// 默认 wake 配置抽成常量：既给 cfg 用，也给下面的深合并兜底用。
+// MARKER: default-wake-const
+const DEFAULT_WAKE_CFG = {
+        defaultMode: 'diving',
+        preSleepWaitEnabled: true,      // 沉睡前强制观察窗口开关：防止 AI 聊两句就潜水
+        preSleepWaitMs: 90000,           // 默认沉睡前至少等待/观察 90 秒（后台可调）
+        // 原来写 5 分钟：群里 1~2 分钟就有人说话，5 分钟窗口永远等不到，preSleepWaitSatisfied 恒为 false，
+        // 模型据此以为「不能睡」，于是反复 wait 到天荒地老。90 秒才有概率满足。
+        recommendedDefaultInfinite: true, // 默认下一次唤醒是否无限期（true=永久潜水等条件；false=有限时长）
+        sleepMinMs: 60000,
+        sleepMaxMs: 0,
+        recommendedSleepMinMs: 300000,
+        recommendedSleepMaxMs: 7200000,
+        recommendedProbability: 0.05,
+        recommendedKeywords: ['小鲸鱼', '大肥鱼', '鲸鱼'],
+        recommendedAtMention: true,
+        recommendedNameMention: true,
+        recommendedQuestion: true,
+        recommendedPoke: true,
+        recommendedHint: '想潜水就调 qq_wait_for_messages(timeoutMs=90000) 等一次。等完不管 satisfied 是真是假都可以直接设 sleepUntil 睡'
+          + '——satisfied 只表示群里确实安静过一阵，不是睡觉的前置条件。有人说话但你不想接，也可以直接睡，不用继续等。'
+          + '潜水时长推荐 5~120 分钟，普通消息概率 0.05；@/名字/关键词/提问唤醒建议保持开启。'
+          + '需要等特定某人/某几人时，可额外设置 triggers.speakerIds。',
+        batchWindowMs: 8000,
+        maxWakePerMinute: 1,
+        maxWakePerHour: 12,
+        // 群聊专用唤醒上限（可选）。不配则回退到上面的全局值。
+        // 群聊通常更热闹，需要更慢，但私聊不该被拖慢。
+        maxWakePerHourInGroup: null,
+        maxWakePerQuarterHour: 0,          // 0 = 不限；默认关，只在群聊开
+        maxWakePerQuarterHourInGroup: 2,   // 15 分钟最多 2 条，别 8 分钟把整小时额度烧光
+        // 高优先级唤醒（private / atMention / question）是否豁免频率上限。
+        // 默认 true：额度只服务弱触发，用户明确叫她永远放行。
+        exemptHighPriorityFromLimit: true,
+        noActionLimit: 3,
+        maxWakeConfigReminders: 2
+};
+
 function loadConfig() {
   const p = path.join(ROOT, 'config.json');
   const file = readJsonSafe(p, null, true);
@@ -1032,41 +1070,7 @@ function loadConfig() {
         schedule: true,
         portrait: true
       },
-      wake: {
-        defaultMode: 'diving',
-        preSleepWaitEnabled: true,      // 沉睡前强制观察窗口开关：防止 AI 聊两句就潜水
-        preSleepWaitMs: 90000,           // 默认沉睡前至少等待/观察 90 秒（后台可调）
-        // 原来写 5 分钟：群里 1~2 分钟就有人说话，5 分钟窗口永远等不到，preSleepWaitSatisfied 恒为 false，
-        // 模型据此以为「不能睡」，于是反复 wait 到天荒地老。90 秒才有概率满足。
-        recommendedDefaultInfinite: true, // 默认下一次唤醒是否无限期（true=永久潜水等条件；false=有限时长）
-        sleepMinMs: 60000,
-        sleepMaxMs: 0,
-        recommendedSleepMinMs: 300000,
-        recommendedSleepMaxMs: 7200000,
-        recommendedProbability: 0.05,
-        recommendedKeywords: ['小鲸鱼', '大肥鱼', '鲸鱼'],
-        recommendedAtMention: true,
-        recommendedNameMention: true,
-        recommendedQuestion: true,
-        recommendedPoke: true,
-        recommendedHint: '想潜水就调 qq_wait_for_messages(timeoutMs=90000) 等一次。等完不管 satisfied 是真是假都可以直接设 sleepUntil 睡'
-          + '——satisfied 只表示群里确实安静过一阵，不是睡觉的前置条件。有人说话但你不想接，也可以直接睡，不用继续等。'
-          + '潜水时长推荐 5~120 分钟，普通消息概率 0.05；@/名字/关键词/提问唤醒建议保持开启。'
-          + '需要等特定某人/某几人时，可额外设置 triggers.speakerIds。',
-        batchWindowMs: 8000,
-        maxWakePerMinute: 1,
-        maxWakePerHour: 12,
-        // 群聊专用唤醒上限（可选）。不配则回退到上面的全局值。
-        // 群聊通常更热闹，需要更慢，但私聊不该被拖慢。
-        maxWakePerHourInGroup: null,
-        maxWakePerQuarterHour: 0,          // 0 = 不限；默认关，只在群聊开
-        maxWakePerQuarterHourInGroup: 2,   // 15 分钟最多 2 条，别 8 分钟把整小时额度烧光
-        // 高优先级唤醒（private / atMention / question）是否豁免频率上限。
-        // 默认 true：额度只服务弱触发，用户明确叫她永远放行。
-        exemptHighPriorityFromLimit: true,
-        noActionLimit: 3,
-        maxWakeConfigReminders: 2
-      },
+      wake: DEFAULT_WAKE_CFG,
       send: {
         burstEnabled: true,
         burstMaxMessages: 8,
@@ -1156,6 +1160,24 @@ function loadConfig() {
       ...(file.socialV2 ?? {})
     }
   };
+
+  // socialV2.wake 需要与默认值深度合并：`wake: {...(file.socialV2 ?? {})}` 是浅覆盖，
+  // config.json 里只要有 wake 块，整个默认值对象就被替换掉了。
+  // MARKER: wake-deep-merge —— 实测后果：maxWakePerQuarterHourInGroup 的默认值 2
+  // 从来没生效过，15 分钟短窗口上线后一直是关着的（拦截日志 0 条）。
+  // 注意只在「配置里没写」时补默认值，显式写 0 / null 仍尊重（0 = 不限）。
+  {
+    const FILE_WAKE = cfg.socialV2?.wake;
+    const DEF_WAKE = DEFAULT_WAKE_CFG;
+    if (DEF_WAKE && FILE_WAKE && typeof FILE_WAKE === 'object') {
+      const merged = { ...DEF_WAKE };
+      for (const [k, v] of Object.entries(FILE_WAKE)) {
+        // overrides 这种按群的对象整体替换，不做深合并
+        merged[k] = v;
+      }
+      cfg.socialV2.wake = merged;
+    }
+  }
 
   // socialV2.tools 需要与默认值深度合并：旧 config.json 若缺少新增工具开关，
   // 不能因为外层 spread 覆盖而丢失默认开关。

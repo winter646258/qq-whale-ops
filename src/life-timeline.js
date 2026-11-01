@@ -179,6 +179,20 @@ export function periodOf(hhmm) {
 }
 
 /**
+ * 时段在一天里的先后顺序 —— 只用来比较「两格差多远」，不参与展示。
+ * MARKER: period-order
+ * 起因（2026-11-01 实测）：11-02「晚上 多摆几个角度比新头像，早点睡」
+ * 被排到了 06:00 清晨那一格。查下来是 weavePlans 的兜底「同地点优先」
+ * 无条件让路，哪怕时段差了三档 —— 地点对了，时间荒谬，一样是错的。
+ */
+export const PERIOD_ORDER = ['清晨', '上午', '下午', '傍晚', '夜里'];
+
+export function periodIndex(hhmm) {
+  const i = PERIOD_ORDER.indexOf(periodOf(hhmm));
+  return i < 0 ? 1 : i;
+}
+
+/**
  * 今天用哪个日程模式。
  *
  * 顺序：先按星期几筛候选；常驻型（chance >= 1）优先；
@@ -306,18 +320,42 @@ export function weavePlans(world, slots, plans) {
       if (out[i].interruptible < 0.4) continue;
       pool.push(i);
     }
+    // 该时段一格可用的都没有（比如夜里只剩睡着的格子）就让位给别的时段，
+    // 而不是把这条计划整句丢掉。
+    if (!pool.length) {
+      for (let i = 0; i < out.length; i += 1) {
+        if (used.has(i)) continue;
+        if (out[i].interruptible < 0.4) continue;
+        pool.push(i);
+      }
+    }
     if (!pool.length) continue;
+    const wantIdx = periodIndex(
+      wantPeriod === '夜里' ? '23:00' : wantPeriod === '清晨' ? '06:00' : wantPeriod === '上午' ? '10:00' : wantPeriod === '下午' ? '14:00' : '19:00',
+    );
     let idx = -1;
     if (hintedPlace) {
-      // 同地点优先；其次同地点的任何格子（哪怕时段差一点，也比在书房煮饭强）
-      idx = pool.find((i) => out[i].where === hintedPlace);
-      if (idx === undefined) idx = -1;
-      if (idx < 0) {
-        for (let i = 0; i < out.length; i += 1) {
-          if (used.has(i) || out[i].where !== hintedPlace) continue;
-          if (out[i].interruptible < 0.3) continue;
+      // MARKER: plan-period-first —— 同地点只在「时段偏一档以内」时才让路。
+      // 实测教训：旧实现无条件优先同地点，把「晚上早点睡」排进清晨六点。
+      let best = Infinity;
+      for (const i of pool) {
+        if (out[i].where !== hintedPlace) continue;
+        const d = Math.abs(periodIndex(out[i].from) - wantIdx);
+        if (d > 1) continue;
+        if (d < best) {
+          best = d;
           idx = i;
-          break;
+        }
+      }
+    }
+    if (idx < 0) {
+      // 没有可用的同地点格：取时段最接近的一格，地点随后由 movedForPlan 搬过去。
+      let bestDist = Infinity;
+      for (const i of pool) {
+        const d = Math.abs(periodIndex(out[i].from) - wantIdx);
+        if (d < bestDist) {
+          bestDist = d;
+          idx = i;
         }
       }
     }
@@ -480,6 +518,70 @@ export function nightOwlOf(world, dayKey) {
 }
 
 /** 生成本地骨架的完整一天。纯函数，不写盘、不调模型。 */
+/**
+ * 计划落格后的最后一道纠偏：谁的时段离得最远，谁就让给还在等的人。
+ * MARKER: plan-period-swap
+ * 为什么还要这一道：weavePlans 里「同地点优先」已经限制在一档以内，但真实数据里
+ * 仍会出现「晚上 早点睡」落在 06:00 清晨 —— 因为夜里那一格（20:00–00:30 书房）
+ * 被另一条计划占着，pool 里剩下的只有清晨的里间。这不是选格算错，
+ * 是「该时段已经没格子了」，只能靠交换解决，不能靠挑选解决。
+ *
+ * 规则：
+ *   - 时段偏 ≥2 档才算错位
+ *   - 找一格时段正好、且没被计划占的（可能是无用格的骨架格），把两条计划互换
+ *   - 找不到就放弃，宁可留着错位也不丢计划
+ */
+export function fixPlanPeriods(slots, plans) {
+  const want = { 上午: '10:00', 下午: '14:00', 晚上: '19:00' };
+  const out = slots.map((s) => ({ ...s }));
+  const list = Array.isArray(plans) ? plans : [];
+  if (!list.length) return out;
+
+  for (let round = 0; round < list.length; round += 1) {
+    let moved = false;
+    for (let i = 0; i < out.length; i += 1) {
+      const s = out[i];
+      if (!s.planText) continue;
+      const p = list.find((x) => x.text === s.planText);
+      if (!p || !want[p.period]) continue;
+      const gap = Math.abs(periodIndex(s.from) - periodIndex(want[p.period]));
+      if (gap <= 1) continue;
+      // 找一格时段对得上、且现在没被计划占的
+      const target = out.findIndex((o, j) => {
+        if (j === i) return false;
+        if (o.planText) return false;
+        return Math.abs(periodIndex(o.from) - periodIndex(want[p.period])) === 0;
+      });
+      if (target < 0) continue;
+      const t = out[target];
+      // 只换「人此刻在哪、在做什么」，不换时间与时段
+      const keep = { doing: t.doing, body: t.body, where: t.where, whereNote: t.whereNote, noise: t.noise, interruptible: t.interruptible, planText: t.planText, planPlace: t.planPlace, movedForPlan: t.movedForPlan };
+      t.doing = s.doing;
+      t.planText = s.planText;
+      t.planPlace = s.planPlace;
+      t.where = s.where;
+      t.whereNote = s.whereNote;
+      t.noise = s.noise;
+      t.body = s.body;
+      t.interruptible = s.interruptible;
+      t.movedForPlan = s.movedForPlan;
+      s.doing = keep.doing;
+      s.planText = keep.planText;
+      s.planPlace = keep.planPlace;
+      s.where = keep.where;
+      s.whereNote = keep.whereNote;
+      s.noise = keep.noise;
+      s.body = keep.body;
+      s.interruptible = keep.interruptible;
+      s.movedForPlan = keep.movedForPlan;
+      moved = true;
+      break;
+    }
+    if (!moved) break;
+  }
+  return out;
+}
+
 export function buildLocalDay(world, { dayKey, plans = [], now = Date.now() } = {}) {
   const key = dayKey || dayKeyOf(now);
   const regime = pickRegime(world, key, now);
@@ -491,6 +593,9 @@ export function buildLocalDay(world, { dayKey, plans = [], now = Date.now() } = 
     s.noise = hit ? hit.noise : '';
   }
   slots = weavePlans(world, slots, plans);
+  // MARKER: plan-period-call —— 选格只解决「挑哪一格」，解决不了「该时段已无空格」。
+  // 所以占完格再跑一次纠偏，把时段偏两档以上的计划换到对得上的格子里去。
+  slots = fixPlanPeriods(slots, plans);
   slots = weaveIdle(world, slots, key);
   if (owl.isOwl && slots.length) {
     const last = slots[slots.length - 1];
