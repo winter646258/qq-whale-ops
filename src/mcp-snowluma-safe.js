@@ -1155,11 +1155,11 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
       text: z.string().optional().describe('要「说」出来的那句话（推荐用法）。传了它就不用管 voice，系统会现场合成语音。60 字以内最自然，超过 600 字只念前面一段。'),
       voice: z.string().optional().describe('语音库里的文件名（来自 qq_list_voices 的 name）。只想发库存音频时才用；想说话请用 text。'),
-      label: z.string().optional().describe('可选：写进会话记录里的说明，如「说了句晚安」'),
+      tone: z.string().optional().describe('可选：**怎么念**这句话（不是要念的内容），用中文写，如「用撒娇又带点生气的语气，语速放慢」「很轻很轻的耳语」「压低声音，有点困」。留空就按字面平铺直叙。系统会按这个改音色表现——想说得意、委屈、困倦、想笑的时候用它，比在 text 里塞括号好用。'),
       verify: z.boolean().optional().describe('是否回读校验语音已落地（默认 true，建议保持开启）'),
       readback: z.boolean().optional().describe('是否额外索取 QQ 转写文本（自己发的语音通常没有，默认 false）')
     },
-    async ({ key, token, text, voice, label, verify, readback }) => {
+    async ({ key, token, text, voice, label, tone, verify, readback }) => {
       try {
         if (!text && !voice) {
           return { content: [{ type: 'text', text: '要么给 text（想说的话），要么给 voice（库存文件名），两个都是空的就没法发。' }], isError: true };
@@ -1170,6 +1170,7 @@ if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !==
             key,
             text: text ? String(text) : '',
             voice: voice ? String(voice) : '',
+            tone: tone ? String(tone) : '',
             label: label || '',
             verify: verify !== false,
             readback: readback === true,

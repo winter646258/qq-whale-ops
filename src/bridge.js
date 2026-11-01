@@ -35,7 +35,7 @@ import { createBiliDirect } from './bili-direct.js';
 import { WATCH_DEFAULTS, watchBiliVideo } from './bili-watch.js';
 import { browseRound, browsePromptLine, readBrowse, writeBrowse } from './bili-browse.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
-import { TTS_DEFAULTS as TTS_DEF, readEnvValue as readTtsEnvValue, splitSpeechText as splitTtsText, synthesize as ttsSynthesize, downloadTtsAudio as ttsDownload } from './tts.js';
+import { TTS_DEFAULTS as TTS_DEF, BREEZE_DEFAULTS as BREEZE_DEF, BREEZE_VOICES, readEnvValue as readTtsEnvValue, splitSpeechText as splitTtsText, synthesize as ttsSynthesize, synthesizeBreeze as ttsSynthesizeBreeze, downloadTtsAudio as ttsDownload } from './tts.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
@@ -2235,11 +2235,25 @@ async function main() {
       // key 优先走 .env 的 DASHSCOPE_API_KEY（代码里读），apiKey 只作临时覆盖。
       tts: {
         enabled: v.tts?.enabled !== false,
+        // provider：'breeze'（默认，能改语气）或 'dashscope'（老通道，只能念字）。
+        // 换渠道必须显式配，不做隐式猜测 —— 两个渠道的 key、音色命名、返回形状都不同。
+        provider: String(v.tts?.provider || 'breeze').toLowerCase() === 'dashscope' ? 'dashscope' : 'breeze',
         model: v.tts?.model || 'qwen3-tts-flash',
         voice: v.tts?.voice || 'Cherry',
         languageType: v.tts?.languageType || 'Chinese',
+        // breeze 专用：模型 / 音色 id / 语言 / 输出格式 / 语气默认值
+        breezeModel: v.tts?.breezeModel || BREEZE_DEF.model,
+        breezeVoice: v.tts?.breezeVoice || BREEZE_DEF.voice,
+        breezeLanguageCode: v.tts?.breezeLanguageCode || BREEZE_DEF.languageCode,
+        breezeOutputFormat: v.tts?.breezeOutputFormat || BREEZE_DEF.outputFormat,
+        guidanceScale: Number(v.tts?.guidanceScale) >= 1 ? Number(v.tts.guidanceScale) : 1,
+        speed: Number(v.tts?.speed) >= 0.5 && Number(v.tts?.speed) <= 2 ? Number(v.tts.speed) : 1,
+        // 默认语气：留空 = 不指挥，按她写的字本身念。只有显式配了才注入。
+        defaultTone: String(v.tts?.defaultTone ?? ''),
+        // breeze 挂了要不要退回 dashscope。默认退，因为语音是「能发就行」的小事。
+        fallbackDashscope: v.tts?.fallbackDashscope !== false,
         maxChars: Number(v.tts?.maxChars) > 0 ? Number(v.tts.maxChars) : 600,
-        timeoutMs: Number(v.tts?.timeoutMs) > 0 ? Number(v.tts.timeoutMs) : 30000,
+        timeoutMs: Number(v.tts?.timeoutMs) > 0 ? Number(v.tts.timeoutMs) : 60000,
         downloadTimeoutMs: Number(v.tts?.downloadTimeoutMs) > 0 ? Number(v.tts.downloadTimeoutMs) : 30000,
         apiKey: String(v.tts?.apiKey ?? '')
       }
@@ -2593,25 +2607,72 @@ async function main() {
   async function ttsSpeakV2(text, opts = {}) {
     const vc = voiceCfg();
     const t = vc.tts ?? {};
-    const apiKey = String(t.apiKey || process.env.DASHSCOPE_API_KEY || readTtsEnvValue(ttsEnvText, 'DASHSCOPE_API_KEY') || '').trim();
-    if (!apiKey) return { ok: false, error: 'TTS 未配置 key（.env 里没有 DASHSCOPE_API_KEY）' };
-    const maxChars = Number(t.maxChars) || TTS_DEF.maxChars;
+    const provider = t.provider === 'dashscope' ? 'dashscope' : 'breeze';
+    const dsKey = String(t.apiKey || process.env.DASHSCOPE_API_KEY || readTtsEnvValue(ttsEnvText, 'DASHSCOPE_API_KEY') || '').trim();
+    const bzKey = String(t.breezeApiKey || process.env.BREEZE_API_KEY || readTtsEnvValue(ttsEnvText, 'BREEZE_API_KEY') || '').trim();
+    if (provider === 'breeze' ? !bzKey : !dsKey) {
+      return {
+        ok: false,
+        error: provider === 'breeze'
+          ? 'TTS 未配置 key（.env 里没有 BREEZE_API_KEY）'
+          : 'TTS 未配置 key（.env 里没有 DASHSCOPE_API_KEY）'
+      };
+    }
+    const maxChars = Number(t.maxChars) || (provider === 'breeze' ? BREEZE_DEF.maxChars : TTS_DEF.maxChars);
     const segs = splitTtsText(text, maxChars);
     if (!segs.length) return { ok: false, error: '要合成的文本为空' };
     const spoken = segs[0];
-    const syn = await ttsSynthesize(spoken, {
-      apiKey,
-      voice: t.voice || TTS_DEF.voice,
-      model: t.model || TTS_DEF.model,
-      languageType: t.languageType || TTS_DEF.languageType,
-      maxChars,
-      timeoutMs: Number(t.timeoutMs) || TTS_DEF.timeoutMs,
-    });
-    if (!syn.ok) { log(`[tts] 合成失败：${syn.error}`); return syn; }
-    const dl = await ttsDownload(syn.url, {
-      maxBytes: Number(vc.maxBytes) || TTS_DEF.downloadMaxBytes,
-      timeoutMs: Number(t.downloadTimeoutMs) || TTS_DEF.downloadTimeoutMs,
-    });
+    // tone：她（或调用方）描述「怎么念」，不是要念的内容。空 = 不指挥。
+    const tone = String(opts.tone ?? t.defaultTone ?? '').trim().slice(0, 200);
+    const toneMs = Number(t.speed) > 0 && Number(t.speed) !== 1 ? Number(t.speed) : 1;
+
+    // 先把音频拿成 {buffer} 或 {url}，两条渠道形状不同，这里归一。
+    let audioBuffer = null;
+    let audioUrl = '';
+    let usedProvider = provider;
+    if (provider === 'breeze') {
+      const syn = await ttsSynthesizeBreeze(spoken, {
+        apiKey: bzKey,
+        voice: t.breezeVoice || BREEZE_DEF.voice,
+        model: t.breezeModel || BREEZE_DEF.model,
+        languageCode: t.breezeLanguageCode || BREEZE_DEF.languageCode,
+        outputFormat: t.breezeOutputFormat || BREEZE_DEF.outputFormat,
+        instructions: tone,
+        guidanceScale: Number(t.guidanceScale) || 1,
+        speed: toneMs,
+        maxChars,
+        maxBytes: Number(vc.maxBytes) || BREEZE_DEF.downloadMaxBytes,
+        timeoutMs: Number(t.timeoutMs) || BREEZE_DEF.timeoutMs,
+        // opts.instructions 允许调用方直接覆盖（测试用）
+        ...(opts.instructions ? { instructions: String(opts.instructions) } : {})
+      });
+      if (syn.ok) {
+        audioBuffer = syn.buffer;
+      } else {
+        log(`[tts] breeze 合成失败：${syn.error}`);
+        if (t.fallbackDashscope === false || !dsKey) return syn;
+        log('[tts] 退回 dashscope 再试一次');
+        usedProvider = 'dashscope';
+      }
+    }
+    if (!audioBuffer && usedProvider === 'dashscope') {
+      const syn = await ttsSynthesize(spoken, {
+        apiKey: dsKey,
+        voice: t.voice || TTS_DEF.voice,
+        model: t.model || TTS_DEF.model,
+        languageType: t.languageType || TTS_DEF.languageType,
+        maxChars: Math.min(maxChars, TTS_DEF.maxChars),
+        timeoutMs: Number(t.timeoutMs) || TTS_DEF.timeoutMs,
+      });
+      if (!syn.ok) { log(`[tts] 合成失败：${syn.error}`); return syn; }
+      audioUrl = syn.url;
+    }
+    const dl = audioBuffer
+      ? { ok: true, buffer: audioBuffer, bytes: audioBuffer.length }
+      : await ttsDownload(audioUrl, {
+        maxBytes: Number(vc.maxBytes) || TTS_DEF.downloadMaxBytes,
+        timeoutMs: Number(t.downloadTimeoutMs) || TTS_DEF.downloadTimeoutMs,
+      });
     if (!dl.ok) { log(`[tts] 下载失败：${dl.error}`); return dl; }
     const dir = path.join(vc.dir, 'tts');
     try {
@@ -2626,14 +2687,17 @@ async function main() {
     } catch (error) {
       return { ok: false, error: `写 TTS 文件失败：${error?.message ?? error}` };
     }
-    log(`[tts] 合成完成 ${name}（${spoken.length} 字 / ${dl.bytes} 字节${segs.length > 1 ? '，原文更长只念了第一段' : ''}）`);
+    log(`[tts] 合成完成 ${name}（${usedProvider} / ${spoken.length} 字 / ${dl.bytes} 字节${tone ? ' / 语气 ' + tone.slice(0, 20) : ''}${segs.length > 1 ? '，原文更长只念了第一段' : ''}）`);
     return {
       ok: true,
       file: `tts/${name}`,
       absPath,
       bytes: dl.bytes,
-      characters: syn.characters || spoken.length,
+      characters: spoken.length,
       text: spoken,
+      tone: tone || null,
+      provider: usedProvider,
+      voice: usedProvider === 'breeze' ? (t.breezeVoice || BREEZE_DEF.voice) : (t.voice || TTS_DEF.voice),
       truncated: segs.length > 1,
       totalSegments: segs.length,
     };
@@ -9412,10 +9476,10 @@ async function stickerLearnTick() {
             // 只给 text 就现场合成（TTS）；给了 voice/file 就走语音库，两者互斥。
             wantVoiceRef = body.voice ?? body.file ?? '';
             if (!wantVoiceRef && typeof body.text === 'string' && body.text.trim()) {
-              const made = await ttsSpeakV2(body.text, {});
+              const made = await ttsSpeakV2(body.text, { tone: body.tone });
               if (!made.ok) { sendJson({ ok: false, error: made.error }, 400); return; }
               wantVoiceRef = made.file;
-              ttsMeta = { text: made.text, characters: made.characters, truncated: made.truncated, segments: made.totalSegments };
+              ttsMeta = { text: made.text, characters: made.characters, truncated: made.truncated, segments: made.totalSegments, tone: made.tone ?? null, provider: made.provider ?? null, voice: made.voice ?? null };
               if (body.dryRun === true) {
                 // 顺序要紧：先探测，再删 —— 反过来会对着一个已经删掉的文件 inspect。
                 const probe2 = await inspectAudio(made.absPath, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds }).catch(() => null);

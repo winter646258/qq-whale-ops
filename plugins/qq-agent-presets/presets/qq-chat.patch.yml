@@ -45,10 +45,27 @@
               - id: compaction-basic
                 name: '@deepseek-ai/dsh-compaction-basic'
                 config:
-                  thresholdRatio: 0.55
-                  retainRatio: 0.06
+                  thresholdRatio: 0.3
+                  retainRatio: 0.05
                   headroomTokens: 4000
                   compactionRetries: 0
+                  modelPolicies:
+                    - provider: our-free-model
+                      model: deepseek/deepseek-v4.1-flash
+                      thresholdRatio: 0.12
+                      retainRatio: 0.05
+                    - provider: loomy
+                      model: DeepSeek-V4.1-Flash
+                      thresholdRatio: 0.5
+                      retainRatio: 0.05
+                    - provider: trae
+                      model: deepseek-v4.1-flash
+                      thresholdRatio: 0.5
+                      retainRatio: 0.05
+                    - provider: raccoon
+                      model: sn-deepseek-v4-1-flash
+                      thresholdRatio: 0.5
+                      retainRatio: 0.05
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               - id: tool-result-pruner
